@@ -63,24 +63,14 @@ if(flags.help) {
 }
 
 
-// no entrypoint
-if(!flags.entry) {
+// no entrypoint or outdir
+if(!flags.entry || !flags.outdir) {
     console.log("");
-    console.log("No entrypoint provided: "+theme.flags('bimba file.imba --outdir public'));
+    console.log("You should provide entrypoint and the output dir: "+theme.flags('bimba file.imba --outdir public'));
     console.log("For more information: "+theme.flags('--help'));
     console.log("");
     process.exit(1);
 }
-
-// no outdir
-if(flags.outdir){
-    console.log("");
-    console.log("No output dir is provided: "+theme.flags('bimba file.imba --outdir public'));
-    console.log("For more information: "+theme.flags('--help'));
-    console.log("");
-    process.exit(1);
-}
-
 
 // build
 bundle();
