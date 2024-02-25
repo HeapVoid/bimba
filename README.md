@@ -4,7 +4,7 @@ It includes the plugin for Bun to compile .imba files and also the CLI tool for 
 
 First of all install this tool like any other npm package:
 ```bash
-bun add bimba-cli
+bun add bimba-cli -d
 ```
 
 Then create a `bunfig.toml` file in the root folder of your project, and add only one line in it (I could not find any workaround to do this automatically):
