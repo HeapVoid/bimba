@@ -1,13 +1,15 @@
 #!/usr/bin/env bun
 
 import { parseArgs } from "util";
-import ansis from 'ansis';
-import { imbaPlugin, stats } from './plugin.ts'
+import { imbaPlugin, stats, cache } from './plugin.js'
+import {theme} from './utils.ts';
 import fs from 'fs'
 import path from 'path';
+import { rmSync } from "node:fs";
 
-let flags = {};
-let folders = {};
+
+let flags = {}
+let entrypoint = ''
 
 try {
     const { values, positionals } = parseArgs({
@@ -16,6 +18,7 @@ try {
             watch: { type: 'boolean' },
             outdir: { type: 'string' },
             help: { type: 'boolean' },
+            clearcache: { type: 'boolean' },
             minify: { type: 'boolean' },
             target: { type: 'string' },
             sourcemap: { type: 'string' },
@@ -24,28 +27,15 @@ try {
         allowPositionals: true,
     });
     flags = values;
-    flags.entry = Bun.argv[2];
-    folders = positionals;
+    entrypoint = Bun.argv[2];
 }
 catch (error) {
     if (error instanceof Error)
         console.log(error.message);
     else
         console.log("Could not resolve CLI arguments. Read help to know them: " + theme.flags('--entry file.imba'));
-    process.exit(1);
+    process.exit(0);
 }
-
-const theme = {
-    flags: ansis.fg(5),
-    count: ansis.fg(15).bold,
-	start: ansis.fg(252).bg(233),
-	filedir: ansis.fg(15),
-	success: ansis.fg(40),
-	failure: ansis.fg(196),
-	time: ansis.fg(41),
-	link: ansis.fg(15),
-	online: ansis.fg(40).bg(22)
-};
 
 // help: more on bun building params here: https://bun.sh/docs/bundler
 if(flags.help) {
@@ -58,13 +48,14 @@ if(flags.help) {
     console.log("   "+theme.flags('--sourcemap <inline|external|none>')+"    How should sourcemap files be included in the .js");
     console.log("   "+theme.flags('--platform <browser|node>')+"             Flag that will be passed to Imba compiler ('node' value does not work in Bun)");
     console.log("   "+theme.flags('--watch')+"                               Watch for changes in the entrypoint folder");
+    console.log("   "+theme.flags('--clearcache')+"                          Clear cache on exit, works only when in watch mode");
     console.log("");
-    process.exit(1);
+    process.exit(0);
 }
 
 
 // no entrypoint or outdir
-if(!flags.entry || !flags.outdir) {
+if(!entrypoint || !flags.outdir) {
     console.log("");
     console.log("You should provide entrypoint and the output dir: "+theme.flags('bimba file.imba --outdir public'));
     console.log("For more information: "+theme.flags('--help'));
@@ -78,9 +69,11 @@ watch(bundle);
 
 function watch(callback) {
     if (flags.watch) {
-        const watcher = fs.watch(path.dirname(flags.entry), {recursive: true}, async (event, filename) => ( callback() ));
+        const watcher = fs.watch(path.dirname(entrypoint), {recursive: true}, async (event, filename) => ( callback() ));
     
         process.on("SIGINT", () => {
+            if(flags.clearcache) rmSync(cache, { recursive: true, force: true });
+
             if(watcher) {
                 watcher.close();
                 process.exit(0);
@@ -90,12 +83,10 @@ function watch(callback) {
 }
 
 async function bundle() {
-    if (!fs.existsSync(flags.entry)) {
-        console.log(theme.failure('Error.') + ` The specified entrypoint does not exist: ${theme.filedir(flags.entry)}`);
-        process.exit(1);
+    if (!fs.existsSync(entrypoint)) {
+        console.log(theme.failure('Error.') + ` The specified entrypoint does not exist: ${theme.filedir(entrypoint)}`);
+        process.exit(0);
     }
-
-    //if (!fs.existsSync(flags.bundle)){ fs.mkdirSync(flags.bundle);}
 
     stats.failed = 0
     stats.compiled = 0
@@ -105,10 +96,10 @@ async function bundle() {
     const start = Date.now();
 
     console.log("──────────────────────────────────────────────────────────────────────");
-    console.log(theme.start(`Start building the Imba entrypoint: ${theme.filedir(flags.entry)}`));
+    console.log(theme.start(`Start building the Imba entrypoint: ${theme.filedir(entrypoint)}`));
 
     const result = await Bun.build({
-        entrypoints: [flags.entry],
+        entrypoints: [entrypoint],
         outdir: flags.outdir,
         target: flags.target || 'browser',
         sourcemap: flags.sourcemap || 'none',

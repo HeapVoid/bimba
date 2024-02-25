@@ -1,17 +1,16 @@
 {
   "name": "bimba-cli",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "repository": "github:HeapVoid/bimba",
-  "module": "index.ts",
+  "module": "index.js",
   "bin": {
-    "bimba": "./index.ts"
+    "bimba": "./index.js"
   },
   "description": "The CLI tool to run Imba projects under Bun",
   "keywords": ["imba", "bun", "plugin"],
   "license": "MIT",
   "type": "module",
-  "dependencies": {
-    "ansis": "^2.2.0",
+  "devDependencies": {
     "imba": "^2.0.0-alpha.234"
   }
 }
