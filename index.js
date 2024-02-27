@@ -2,7 +2,7 @@
 
 import { parseArgs } from "util";
 import { imbaPlugin, stats, cache } from './plugin.js'
-import {theme} from './utils.ts';
+import {theme} from './utils.js';
 import fs from 'fs'
 import path from 'path';
 import { rmSync } from "node:fs";

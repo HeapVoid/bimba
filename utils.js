@@ -7,22 +7,6 @@ function colorize(text:string, fg?:number, bg?:number) {
     return result
 }
 
-// const theme = {
-//     action: ansis.fg(237),
-//     folder: ansis.fg(240),
-//     filename: ansis.fg(15),
-//     success: ansis.fg(40),
-//     failure: ansis.fg(15).bg(124),
-//   };
-
-//   // set color theme for an error message
-//   const colors = {
-//     code: ansis.fg(252).bg(238),
-//     margin: ansis.fg(229).bg(145),
-//     error: ansis.fg(196).bg(52),
-//     ecode: ansis.fg(196).bg(238).bold,
-//   };
-
 // theme for messages printed in terminal
 // https://i.stack.imgur.com/KTSQa.png
 export const theme = {

@@ -1,5 +1,5 @@
 import { plugin } from "bun";
-import {theme} from './utils.ts';
+import {theme} from './utils.js';
 import * as compiler from 'imba/compiler'
 import dir from 'path'
 import fs from 'fs'
@@ -86,7 +86,7 @@ export const imbaPlugin = {
 
       // clear previous cached version
       const glob = new Glob(Bun.hash(path) + '_' + "*.js");
-      for await (const file of glob.scan(cache)) unlink(cache + '/' + file);
+      for await (const file of glob.scan(cache)) unlink(cache + file);
 
       // if no cached version read and compile it with the imba compiler
       const file = await Bun.file(path).text();
