@@ -86,7 +86,7 @@ export const imbaPlugin = {
 
       // clear previous cached version
       const glob = new Glob(Bun.hash(path) + '_' + "*.js");
-      for await (const file of glob.scan(cache)) unlink(cache + file);
+      for await (const file of glob.scan(cache)) if (fs.existsSync(cache + file)) unlink(cache + file);
 
       // if no cached version read and compile it with the imba compiler
       const file = await Bun.file(path).text();
