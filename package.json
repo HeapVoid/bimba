@@ -1,6 +1,6 @@
 {
   "name": "bimba-cli",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "repository": "github:HeapVoid/bimba",
   "module": "index.js",
   "bin": {
