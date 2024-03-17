@@ -77,7 +77,6 @@ export const imbaPlugin = {
       const time_hash = Bun.hash(fs.statSync(path).mtimeMs)
       const cached = join(cache, path_hash + '_' + time_hash + '.js');
       if (fs.existsSync(cached)) {
-        console.log('from cache')
         stats.bundled++;
         stats.cached++;
         return {
