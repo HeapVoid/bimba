@@ -1,12 +1,12 @@
 import { plugin } from "bun";
 import {theme} from './utils.js';
 import * as compiler from 'imba/compiler'
-import dir from 'path'
+import {resolve, join, dirname, parse} from 'path'
 import fs from 'fs'
 import { Glob } from "bun";
 import { unlink } from "node:fs/promises";
 
-export const cache = process.cwd() + '/.cache/';
+export const cache = join(process.cwd(),'.cache');
 if (!fs.existsSync(cache)){ fs.mkdirSync(cache);}
 
 // this should be reset from outside to get results of entrypoint building
@@ -27,7 +27,7 @@ export const imbaPlugin = {
       
       let filename = path;
       // resolve relative path
-      if (path.startsWith('.')) { filename = dir.resolve(dir.dirname(importer), filename) };
+      if (path.startsWith('.')) { filename = resolve(dirname(importer), filename) };
 
       // assume that the file is .js
       try { return {path: Bun.resolveSync(filename + '.js', '.')}}
@@ -45,13 +45,13 @@ export const imbaPlugin = {
               filename += '.imba';
               
               // assume that the relative path should be resolved relative to importer
-              let fn = dir.resolve(dir.dirname(importer), filename);
+              let fn = resolve(dirname(importer), filename);
               if (fs.existsSync(fn)) return {path: fn};
               // assume that the relative path should be resolved relative to node_modules
-              fn = dir.resolve('./node_modules', filename);
+              fn = resolve('./node_modules', filename);
               if (fs.existsSync(fn)) return {path: fn};
               // assume that the relative path should be resolved relative to project root
-              fn = dir.resolve(process.cwd(), filename);
+              fn = resolve(process.cwd(), filename);
               if (fs.existsSync(fn)) return {path: fn};
               
               // if the path still is unresolved throw error and leave the further resolution on Bun's resolver
@@ -69,15 +69,17 @@ export const imbaPlugin = {
     // when an .imba file is imported...
     build.onLoad({ filter: /\.imba$/ }, async ({ path }) => {
       
-      const f = dir.parse(path)
+      const f = parse(path)
       let contents = '';
       
       // return the cached version if it exists
-      const cached = cache + Bun.hash(path) + '_' + fs.statSync(path).mtimeMs + '.js';
+      const path_hash = Bun.hash(path)
+      const time_hash = Bun.hash(fs.statSync(path).mtimeMs)
+      const cached = join(cache, path_hash + '_' + time_hash + '.js');
       if (fs.existsSync(cached)) {
+        console.log('from cache')
         stats.bundled++;
         stats.cached++;
-        //console.log(theme.action("cached: ") + theme.folder(f.dir + '/') + theme.filename(f.base) + " - " + theme.success("ok"));
         return {
           contents: await Bun.file(cached).text(),
           loader: "js",
@@ -85,8 +87,11 @@ export const imbaPlugin = {
       }
 
       // clear previous cached version
-      const glob = new Glob(Bun.hash(path) + '_' + "*.js");
-      for await (const file of glob.scan(cache)) if (fs.existsSync(cache + file)) unlink(cache + file);
+      const glob = new Glob(path_hash + '_' + "*.js");
+      for await (const file of glob.scan(cache)) {
+        const prev_cached = join(cache, file);
+        if (fs.existsSync(prev_cached)) unlink(prev_cached);
+      }
 
       // if no cached version read and compile it with the imba compiler
       const file = await Bun.file(path).text();
