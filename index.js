@@ -64,6 +64,7 @@ if(!entrypoint || !flags.outdir) {
 }
 
 // build
+let bundling = false;
 bundle();
 watch(bundle);
 
@@ -83,6 +84,9 @@ function watch(callback) {
 }
 
 async function bundle() {
+    if (bundling) return;
+    bundling = true;
+
     if (!fs.existsSync(entrypoint)) {
         console.log(theme.failure('Error.') + ` The specified entrypoint does not exist: ${theme.filedir(entrypoint)}`);
         process.exit(0);
@@ -106,7 +110,7 @@ async function bundle() {
         minify: flags.minify || true,
         plugins: [imbaPlugin]
     });
-
+    
     if(stats.failed)
         console.log(theme.start(theme.failure("Failure.") +` Imba compiler failed to proceed ${theme.count(stats.failed)} file${stats.failed > 1 ? 's' : ''}`));
     else
@@ -117,4 +121,6 @@ async function bundle() {
             console.log(log);
         }
     }
+    
+    bundling = false;
 }

@@ -1,12 +1,12 @@
 import { plugin } from "bun";
 import {theme} from './utils.js';
 import * as compiler from 'imba/compiler'
-import {resolve, join, dirname, parse} from 'path'
+import dir from 'path'
 import fs from 'fs'
 import { Glob } from "bun";
 import { unlink } from "node:fs/promises";
 
-export const cache = join(process.cwd(),'.cache');
+export const cache = process.cwd() + '/.cache/';
 if (!fs.existsSync(cache)){ fs.mkdirSync(cache);}
 
 // this should be reset from outside to get results of entrypoint building
@@ -22,63 +22,62 @@ export const imbaPlugin = {
   name: "imba",
   async setup(build) {
 
-      // when there is import without file extension
-      build.onResolve({filter: /^.*[^.]{5}$/ }, ({ path, importer }) => {
+    //   // when there is import without file extension
+    //   build.onResolve({filter: /^.*[^.]{5}$/ }, ({ path, importer }) => {
       
-      let filename = path;
-      // resolve relative path
-      if (path.startsWith('.')) { filename = resolve(dirname(importer), filename) };
+    //   let filename = path;
+    //   // resolve relative path
+    //   if (path.startsWith('.')) { filename = dir.resolve(dir.dirname(importer), filename) };
 
-      // assume that the file is .js
-      try { return {path: Bun.resolveSync(filename + '.js', '.')}}
-      catch (error) {
-        // assume that the file is .mjs
-        try { return {path: Bun.resolveSync(filename + '.mjs', '.')}}
-        catch (error) {
-          // assume that the file is .cs
-          try { return {path: Bun.resolveSync(filename + '.cjs', '.')}}
-          catch (error) {
-            // assume that the file is .imba
-            try { return {path: Bun.resolveSync(filename + '.imba', '.')}}
-            catch (error) {
-              // if direct resolution failed
-              filename += '.imba';
+    //   // assume that the file is .js
+    //   try { return {path: Bun.resolveSync(filename + '.js', '.')}}
+    //   catch (error) {
+    //     // assume that the file is .mjs
+    //     try { return {path: Bun.resolveSync(filename + '.mjs', '.')}}
+    //     catch (error) {
+    //       // assume that the file is .cs
+    //       try { return {path: Bun.resolveSync(filename + '.cjs', '.')}}
+    //       catch (error) {
+    //         // assume that the file is .imba
+    //         try { return {path: Bun.resolveSync(filename + '.imba', '.')}}
+    //         catch (error) {
+    //           // if direct resolution failed
+    //           filename += '.imba';
               
-              // assume that the relative path should be resolved relative to importer
-              let fn = resolve(dirname(importer), filename);
-              if (fs.existsSync(fn)) return {path: fn};
-              // assume that the relative path should be resolved relative to node_modules
-              fn = resolve('./node_modules', filename);
-              if (fs.existsSync(fn)) return {path: fn};
-              // assume that the relative path should be resolved relative to project root
-              fn = resolve(process.cwd(), filename);
-              if (fs.existsSync(fn)) return {path: fn};
+    //           // assume that the relative path should be resolved relative to importer
+    //           let fn = dir.resolve(dir.dirname(importer), filename);
+    //           if (fs.existsSync(fn)) return {path: fn};
+    //           // assume that the relative path should be resolved relative to node_modules
+    //           fn = dir.resolve('./node_modules', filename);
+    //           if (fs.existsSync(fn)) return {path: fn};
+    //           // assume that the relative path should be resolved relative to project root
+    //           fn = dir.resolve(process.cwd(), filename);
+    //           if (fs.existsSync(fn)) return {path: fn};
               
-              // if the path still is unresolved throw error and leave the further resolution on Bun's resolver
-              if (error instanceof Error) {
-                throw new Error(error.message);
-              }
-              else
-                throw new Error('Could not resolve file: ' + path);
-            }
-          }
-        }
-      }
-    })
+    //           // if the path still is unresolved throw error and leave the further resolution on Bun's resolver
+    //           if (error instanceof Error) {
+    //             throw new Error(error.message);
+    //           }
+    //           else
+    //             throw new Error('Could not resolve file: ' + path);
+    //         }
+    //       }
+    //     }
+    //   }
+    // })
 
     // when an .imba file is imported...
     build.onLoad({ filter: /\.imba$/ }, async ({ path }) => {
       
-      const f = parse(path)
+      const f = dir.parse(path)
       let contents = '';
       
       // return the cached version if it exists
-      const path_hash = Bun.hash(path)
-      const time_hash = Bun.hash(fs.statSync(path).mtimeMs)
-      const cached = join(cache, path_hash + '_' + time_hash + '.js');
+      const cached = cache + Bun.hash(path) + '_' + fs.statSync(path).mtimeMs + '.js';
       if (fs.existsSync(cached)) {
         stats.bundled++;
         stats.cached++;
+        //console.log(theme.action("cached: ") + theme.folder(f.dir + '/') + theme.filename(f.base) + " - " + theme.success("ok"));
         return {
           contents: await Bun.file(cached).text(),
           loader: "js",
@@ -86,11 +85,8 @@ export const imbaPlugin = {
       }
 
       // clear previous cached version
-      const glob = new Glob(path_hash + '_' + "*.js");
-      for await (const file of glob.scan(cache)) {
-        const prev_cached = join(cache, file);
-        if (fs.existsSync(prev_cached)) unlink(prev_cached);
-      }
+      const glob = new Glob(Bun.hash(path) + '_' + "*.js");
+      for await (const file of glob.scan(cache)) if (fs.existsSync(cache + file)) unlink(cache + file);
 
       // if no cached version read and compile it with the imba compiler
       const file = await Bun.file(path).text();
@@ -100,19 +96,19 @@ export const imbaPlugin = {
       })
       
       // print about file complitaion
-      console.write(theme.action("compiling: ") + theme.folder(f.dir + '/') + theme.filename(f.base) + " - ");
+      
 
       // the file has been successfully compiled
       if (!out.errors || !out.errors.length) {
+        console.log(theme.action("compiling: ") + theme.folder(dir.join(f.dir,'/')) + theme.filename(f.base) + " - " + theme.success("cached"));
         stats.bundled++;
         stats.compiled++;
         contents = out.js;
         await Bun.write(cached, contents);
-        console.write(theme.success("cached" + "\n"));
       }
       // there were errors during compilation
       else {
-        console.write(theme.failure(" fail ") + "\n");
+        console.log(theme.action("compiling: ") + theme.folder(dir.join(f.dir,'/')) + theme.filename(f.base) + " - " + theme.failure(" fail "));
         stats.failed++;
         for (let i = 0; i < out.errors.length; i++) {
           if(out.errors[i]) printerr(out.errors[i]);
