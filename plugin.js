@@ -22,57 +22,13 @@ export const imbaPlugin = {
   name: "imba",
   async setup(build) {
 
-    //   // when there is import without file extension
-    //   build.onResolve({filter: /^.*[^.]{5}$/ }, ({ path, importer }) => {
-      
-    //   let filename = path;
-    //   // resolve relative path
-    //   if (path.startsWith('.')) { filename = dir.resolve(dir.dirname(importer), filename) };
-
-    //   // assume that the file is .js
-    //   try { return {path: Bun.resolveSync(filename + '.js', '.')}}
-    //   catch (error) {
-    //     // assume that the file is .mjs
-    //     try { return {path: Bun.resolveSync(filename + '.mjs', '.')}}
-    //     catch (error) {
-    //       // assume that the file is .cs
-    //       try { return {path: Bun.resolveSync(filename + '.cjs', '.')}}
-    //       catch (error) {
-    //         // assume that the file is .imba
-    //         try { return {path: Bun.resolveSync(filename + '.imba', '.')}}
-    //         catch (error) {
-    //           // if direct resolution failed
-    //           filename += '.imba';
-              
-    //           // assume that the relative path should be resolved relative to importer
-    //           let fn = dir.resolve(dir.dirname(importer), filename);
-    //           if (fs.existsSync(fn)) return {path: fn};
-    //           // assume that the relative path should be resolved relative to node_modules
-    //           fn = dir.resolve('./node_modules', filename);
-    //           if (fs.existsSync(fn)) return {path: fn};
-    //           // assume that the relative path should be resolved relative to project root
-    //           fn = dir.resolve(process.cwd(), filename);
-    //           if (fs.existsSync(fn)) return {path: fn};
-              
-    //           // if the path still is unresolved throw error and leave the further resolution on Bun's resolver
-    //           if (error instanceof Error) {
-    //             throw new Error(error.message);
-    //           }
-    //           else
-    //             throw new Error('Could not resolve file: ' + path);
-    //         }
-    //       }
-    //     }
-    //   }
-    // })
-
     // when an .imba file is imported...
     build.onLoad({ filter: /\.imba$/ }, async ({ path }) => {
       
       const f = dir.parse(path)
       let contents = '';
       
-      // return the cached version if it exists
+      // return the cached version if exists
       const cached = cache + Bun.hash(path) + '_' + fs.statSync(path).mtimeMs + '.js';
       if (fs.existsSync(cached)) {
         stats.bundled++;
@@ -95,9 +51,6 @@ export const imbaPlugin = {
         platform: 'browser'
       })
       
-      // print about file complitaion
-      
-
       // the file has been successfully compiled
       if (!out.errors || !out.errors.length) {
         console.log(theme.action("compiling: ") + theme.folder(dir.join(f.dir,'/')) + theme.filename(f.base) + " - " + theme.success("cached"));

@@ -101,26 +101,33 @@ async function bundle() {
 
     console.log("──────────────────────────────────────────────────────────────────────");
     console.log(theme.start(`Start building the Imba entrypoint: ${theme.filedir(entrypoint)}`));
-
-    const result = await Bun.build({
-        entrypoints: [entrypoint],
-        outdir: flags.outdir,
-        target: flags.target || 'browser',
-        sourcemap: flags.sourcemap || 'none',
-        minify: flags.minify || true,
-        plugins: [imbaPlugin]
-    });
     
-    if(stats.failed)
-        console.log(theme.start(theme.failure("Failure.") +` Imba compiler failed to proceed ${theme.count(stats.failed)} file${stats.failed > 1 ? 's' : ''}`));
-    else
-        console.log(theme.start(theme.success("Success.") +` It took ${theme.time(Date.now() - start)} ms to bundle ${theme.count(stats.bundled)} file${stats.bundled > 1 ? 's' : ''} to the folder: ${theme.filedir(flags.outdir)}`));
+    let result = undefined
+    try {
+        result = await Bun.build({
+            entrypoints: [entrypoint],
+            outdir: flags.outdir,
+            target: flags.target || 'browser',
+            sourcemap: flags.sourcemap || 'none',
+            minify: flags.minify || true,
+            plugins: [imbaPlugin]
+        });
 
-    if(!result.success && !stats.errors){
-        for (const log of result.logs) {
-            console.log(log);
+        if(stats.failed)
+            console.log(theme.start(theme.failure("Failure.") +` Imba compiler failed to proceed ${theme.count(stats.failed)} file${stats.failed > 1 ? 's' : ''}`));
+        else
+            console.log(theme.start(theme.success("Success.") +` It took ${theme.time(Date.now() - start)} ms to bundle ${theme.count(stats.bundled)} file${stats.bundled > 1 ? 's' : ''} to the folder: ${theme.filedir(flags.outdir)}`));
+
+        if(!result.success && !stats.errors){
+            for (const log of result.logs) {
+                console.log(log);
+            }
         }
     }
-    
-    bundling = false;
+    catch {
+        console.log(theme.start(theme.failure("Failure.") +` ${theme.filedir('Unknown error.')} JavaScript was not generated!`));
+    }
+    finally {
+        bundling = false;
+    };
 }
