@@ -15,7 +15,7 @@ export let stats = {
   compiled: 0,
   cached: 0,
   bundled: 0,
-  errors: 0
+  errors: 0,
 };
 
 export const imbaPlugin = {
@@ -24,16 +24,17 @@ export const imbaPlugin = {
 
     // when an .imba file is imported...
     build.onLoad({ filter: /\.imba$/ }, async ({ path }) => {
-      
+
       const f = dir.parse(path)
       let contents = '';
-      
+
       // return the cached version if exists
       const cached = cache + Bun.hash(path) + '_' + fs.statSync(path).mtimeMs + '.js';
       if (fs.existsSync(cached)) {
         stats.bundled++;
         stats.cached++;
         //console.log(theme.action("cached: ") + theme.folder(f.dir + '/') + theme.filename(f.base) + " - " + theme.success("ok"));
+        //console.log(theme.action("compiling: ") + theme.folder(dir.join(f.dir,'/')) + theme.filename(f.base) + " - " + theme.success("from cache"));
         return {
           contents: await Bun.file(cached).text(),
           loader: "js",
@@ -47,12 +48,12 @@ export const imbaPlugin = {
       // if no cached version read and compile it with the imba compiler
       const file = await Bun.file(path).text();
       const out = compiler.compile(file, {
-        sourcePath: path,
-        platform: 'browser'
+          sourcePath: path,
+          platform: 'browser'
       })
       
       // the file has been successfully compiled
-      if (!out.errors || !out.errors.length) {
+      if (!out.errors?.length) {
         console.log(theme.action("compiling: ") + theme.folder(dir.join(f.dir,'/')) + theme.filename(f.base) + " - " + theme.success("cached"));
         stats.bundled++;
         stats.compiled++;

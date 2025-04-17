@@ -124,8 +124,9 @@ async function bundle() {
             }
         }
     }
-    catch {
-        console.log(theme.start(theme.failure("Failure.") +` ${theme.filedir('Unknown error.')} JavaScript was not generated!`));
+    catch(error) {
+        console.log('')
+        console.log(error)
     }
     finally {
         bundling = false;
