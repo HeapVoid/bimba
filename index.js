@@ -99,7 +99,7 @@ async function bundle() {
 
     const start = Date.now();
 
-    console.log("──────────────────────────────────────────────────────────────────────");
+    console.log(theme.folder("──────────────────────────────────────────────────────────────────────"));
     console.log(theme.start(`Start building the Imba entrypoint: ${theme.filedir(entrypoint)}`));
     
     let result = undefined
@@ -114,9 +114,9 @@ async function bundle() {
         });
 
         if(stats.failed)
-            console.log(theme.start(theme.failure("Failure.") +` Imba compiler failed to proceed ${theme.count(stats.failed)} file${stats.failed > 1 ? 's' : ''}`));
+            console.log(theme.start(theme.failure(" Failure ") + theme.filename(` Imba compiler failed to proceed ${stats.failed} file${stats.failed > 1 ? 's' : ''}`)));
         else
-            console.log(theme.start(theme.success("Success.") +` It took ${theme.time(Date.now() - start)} ms to bundle ${theme.count(stats.bundled)} file${stats.bundled > 1 ? 's' : ''} to the folder: ${theme.filedir(flags.outdir)}`));
+            console.log(theme.start(theme.success("Success") +` It took ${theme.time(Date.now() - start)} ms to bundle ${theme.count(stats.bundled)} file${stats.bundled > 1 ? 's' : ''} to the folder: ${theme.filedir(flags.outdir)}`));
 
         if(!result.success && !stats.errors){
             for (const log of result.logs) {
@@ -125,8 +125,11 @@ async function bundle() {
         }
     }
     catch(error) {
+        console.log(theme.folder("──────────────────────────────────────────────────────────────────────"));
         console.log('')
         console.log(error)
+        console.log(theme.folder("──────────────────────────────────────────────────────────────────────"));
+        console.log(theme.failure(" Failure ") + theme.filename(' Bun found an error in the compiled JS file'))
     }
     finally {
         bundling = false;

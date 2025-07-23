@@ -6,7 +6,7 @@ import fs from 'fs'
 import { Glob } from "bun";
 import { unlink } from "node:fs/promises";
 
-export const cache = process.cwd() + '/.cache/';
+export const cache = dir.join(process.cwd(), '.cache')
 if (!fs.existsSync(cache)){ fs.mkdirSync(cache);}
 
 // this should be reset from outside to get results of entrypoint building
@@ -29,7 +29,7 @@ export const imbaPlugin = {
       let contents = '';
 
       // return the cached version if exists
-      const cached = cache + Bun.hash(path) + '_' + fs.statSync(path).mtimeMs + '.js';
+      const cached = dir.join(cache, Bun.hash(path) + '_' + fs.statSync(path).mtimeMs + '.js');
       if (fs.existsSync(cached)) {
         stats.bundled++;
         stats.cached++;
@@ -43,7 +43,7 @@ export const imbaPlugin = {
 
       // clear previous cached version
       const glob = new Glob(Bun.hash(path) + '_' + "*.js");
-      for await (const file of glob.scan(cache)) if (fs.existsSync(cache + file)) unlink(cache + file);
+      for await (const file of glob.scan(cache)) if (fs.existsSync(dir.join(cache, file))) unlink(dir.join(cache, file));
 
       // if no cached version read and compile it with the imba compiler
       const file = await Bun.file(path).text();
