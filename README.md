@@ -1,69 +1,93 @@
 This tool helps to work with [Imba](https://imba.io) projects under [Bun](https://bun.sh). That is why it is called Bun+IMBA = BIMBA 😉
 
-It includes the plugin for Bun to compile .imba files and also the CLI tool for buiding .imba files, since the plugins can't be passed to Bun via shell command `bun build`.
+It includes the plugin for Bun to compile .imba files and also the CLI tool for building .imba files, since the plugins can't be passed to Bun via shell command `bun build`.
 
 First of all install this tool like any other npm package:
 ```bash
 bun add bimba-cli -d
 ```
 
-Then create a `bunfig.toml` file in the root folder of your project, and add only one line in it (I could not find any workaround to do this automatically):
-```bash
+---
+
+## Backend development
+
+To run an .imba file in Bun's environment, create a `bunfig.toml` file in the root folder of your project:
+```toml
 preload = ["bimba-cli/plugin.js"]
 ```
 
-You are done!
-
-### Backend development
-Now to run an .imba file in Bun's environment you can use the usual Bun syntax: 
+Then use the usual Bun syntax:
 ```bash
 bun run src/index.imba
-```
-Or with the watch argument:
-```bash
 bun --watch run src/index.imba
 ```
 
-### Frontend development
-For frontend you will need to compile and bundle your source code from .imba to .js. And here the bimba-cli will help:
-```bash
-bunx bimba src/index.imba --outdir public
-```
-Or with the watch argument: 
-```bash
-bunx bimba src/index.imba --outdir public --watch
-```
+---
 
-Here are all the available argumentsthat you can pass to the bimba:
+## Frontend development
 
-`--watch` - Monitors changes in the directory where the entry point is located, and rebuilds the projects when the change occures. Keep entrypoint file in the subfolder, otherwise Bun will trigger several times since the cache dir update also triggers rebuilding.
+### Dev server (HMR)
 
-`--clearcache` - If is set, the cache directory is deleted when bimba exits. Works only in the watch mode, since when bundling cache will be used next time to speed up the compiling time.
+bimba includes a dev server with Hot Module Replacement for Imba custom elements:
 
 ```bash
-bunx bimba src/index.imba --outdir public --watch --clearcache
+bunx bimba src/index.imba --serve --port 5200 --html public/index.html
 ```
 
-`--sourcemap` - Tells Bun how to inculde sourcemap files in the final .js. It is `none` by default.
+**How it works:**
+- Serves your HTML file and compiles `.imba` files on demand (no bundling step)
+- Watches `src/` for changes and pushes updates over WebSocket
+- Injects an importmap built from your `package.json` dependencies
+- Injects an HMR client that swaps component prototypes without a full page reload
 
+**HTML setup:** add a `data-entrypoint` attribute to the script tag that loads your bundle. The dev server will replace it with your `.imba` entrypoint and inject the importmap above it:
+
+```html
+<script type='module' src="./js/index.js" data-entrypoint></script>
+```
+
+**Dev server flags:**
+
+`--serve` — start dev server instead of bundling
+
+`--port <number>` — port to listen on (default: `5200`)
+
+`--html <path>` — path to your HTML file (auto-detected from `./index.html`, `./public/index.html`, `./src/index.html` if omitted)
+
+Static files are resolved relative to the HTML file's directory first, then from the project root (for `node_modules`, `src`, etc.).
+
+---
+
+### Production bundle
+
+To compile and bundle your source code from .imba to .js:
 ```bash
-bunx bimba src/index.imba --outdir public --sourcemap inline
+bunx bimba src/index.imba --outdir public/js --minify
 ```
 
-`--minify` - If is set the final JS code in the bundle produced by Bun will be minified. It is `false` by default.
-
+With watch:
 ```bash
-bunx bimba src/index.imba --outdir public --minify
+bunx bimba src/index.imba --outdir public/js --watch --clearcache
 ```
 
-`--platform` - The value of this argument will be passed to the Imba compiler. By default it is `browswer`. The value `node` does not work under Bun.
+---
 
-```bash
-bunx bimba src/index.imba --outdir public --platform browser
-```
+### All CLI flags
 
-#### Live reload
-Initially I have implemented the live reload functionality, but then decided to refuse it. There is a pretty good VS Code extension: [Lite Server](https://marketplace.visualstudio.com/items?itemName=ritwickdey.LiveServer).
-It does everything needed out of the box. 
+`--outdir <path>` — output folder for compiled JS (required in bundle mode)
 
-Just let bimba rebuild the sources on change and Lite Server will reload the page in the browser.
+`--watch` — watch the entrypoint directory for changes and rebuild. Keep the entrypoint in a subfolder (e.g. `src/`), otherwise cache updates will trigger extra rebuilds.
+
+`--clearcache` — delete the cache directory on exit (Ctrl+C). Works only in watch mode.
+
+`--minify` — minify the output JS. Enabled by default in bundle mode.
+
+`--sourcemap <inline|external|none>` — how to include source maps in the output (default: `none`).
+
+`--target <browser|node>` — platform flag passed to the Imba compiler (default: `browser`). The `node` value does not work under Bun.
+
+`--serve` — start dev server with HMR instead of bundling.
+
+`--port <number>` — port for the dev server (default: `5200`). Used with `--serve`.
+
+`--html <path>` — custom HTML file path. Used with `--serve`.

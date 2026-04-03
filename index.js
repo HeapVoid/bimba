@@ -6,6 +6,7 @@ import {theme} from './utils.js';
 import fs from 'fs'
 import path from 'path';
 import { rmSync } from "node:fs";
+import { serve } from './serve.js';
 
 
 let flags = {}
@@ -22,6 +23,9 @@ try {
             minify: { type: 'boolean' },
             target: { type: 'string' },
             sourcemap: { type: 'string' },
+            serve: { type: 'boolean' },
+            port: { type: 'string' },
+            html: { type: 'string' },
         },
         strict: true,
         allowPositionals: true,
@@ -37,6 +41,18 @@ catch (error) {
     process.exit(0);
 }
 
+// Ensure bunfig.toml exists and contains the required preload line
+const bunfigPath = path.join(process.cwd(), 'bunfig.toml');
+const preloadLine = 'preload = ["bimba-cli/plugin.js"]';
+if (!fs.existsSync(bunfigPath)) {
+    fs.writeFileSync(bunfigPath, preloadLine + '\n');
+} else {
+    const content = fs.readFileSync(bunfigPath, 'utf8');
+    if (!content.includes(preloadLine)) {
+        fs.appendFileSync(bunfigPath, (content.endsWith('\n') ? '' : '\n') + preloadLine + '\n');
+    }
+}
+
 // help: more on bun building params here: https://bun.sh/docs/bundler
 if(flags.help) {
     console.log("");
@@ -50,23 +66,40 @@ if(flags.help) {
     console.log("   "+theme.flags('--watch')+"                               Watch for changes in the entrypoint folder");
     console.log("   "+theme.flags('--clearcache')+"                          Clear cache on exit, works only when in watch mode");
     console.log("");
+    console.log("Dev server (HMR):");
+    console.log("   "+theme.flags('--serve')+"                               Start dev server with Hot Module Replacement");
+    console.log("   "+theme.flags('--port <number>')+"                       Port for the dev server (default: 5200)");
+    console.log("   "+theme.flags('--html <path>')+"                         Custom HTML file path (auto-detected if omitted)");
+    console.log("");
     process.exit(0);
 }
 
 
+let bundling = false;
+
+// serve mode
+if (flags.serve) {
+    if (!entrypoint) {
+        console.log("");
+        console.log("You should provide entrypoint: "+theme.flags('bimba file.imba --serve'));
+        console.log("");
+        process.exit(1);
+    }
+    serve(entrypoint, { port: parseInt(flags.port) || 5200, html: flags.html });
+}
 // no entrypoint or outdir
-if(!entrypoint || !flags.outdir) {
+else if(!entrypoint || !flags.outdir) {
     console.log("");
     console.log("You should provide entrypoint and the output dir: "+theme.flags('bimba file.imba --outdir public'));
     console.log("For more information: "+theme.flags('--help'));
     console.log("");
     process.exit(1);
 }
-
 // build
-let bundling = false;
-bundle();
-watch(bundle);
+else {
+    bundle();
+    watch(bundle);
+}
 
 function watch(callback) {
     if (flags.watch) {
@@ -82,6 +115,7 @@ function watch(callback) {
         });
     }
 }
+
 
 async function bundle() {
     if (bundling) return;
@@ -101,7 +135,7 @@ async function bundle() {
 
     console.log(theme.folder("──────────────────────────────────────────────────────────────────────"));
     console.log(theme.start(`Start building the Imba entrypoint: ${theme.filedir(entrypoint)}`));
-    
+
     let result = undefined
     try {
         result = await Bun.build({
@@ -118,7 +152,7 @@ async function bundle() {
         else
             console.log(theme.start(theme.success("Success") +` It took ${theme.time(Date.now() - start)} ms to bundle ${theme.count(stats.bundled)} file${stats.bundled > 1 ? 's' : ''} to the folder: ${theme.filedir(flags.outdir)}`));
 
-        if(!result.success && !stats.errors){
+        if (!result.success && !stats.errors) {
             for (const log of result.logs) {
                 console.log(log);
             }
