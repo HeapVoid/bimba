@@ -187,6 +187,7 @@ export function serve(entrypoint, flags) {
 	let _lastLines = 0
 	let _fadeTimers = []
 	let _fadeId = 0
+	let _cursorOnLine = false
 
 	function cancelFade() {
 		_fadeTimers.forEach(t => clearTimeout(t))
@@ -195,45 +196,43 @@ export function serve(entrypoint, flags) {
 
 	function printStatus(file, state, errors) {
 		cancelFade()
-		if (_lastLines > 0) {
+		if (_cursorOnLine) {
+			process.stdout.write('\x1b[1G\x1b[J')
+			_lastLines = 0
+			_cursorOnLine = false
+		} else if (_lastLines > 0) {
 			process.stdout.write(`\x1b[${_lastLines}A\x1b[J`)
 			_lastLines = 0
 		}
 		const now = new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
 		const status = state === 'ok' ? theme.success(' ok ') : theme.failure(' fail ')
-		process.stdout.write(`  ${theme.folder(now)}  ${theme.filename(file)}  ${status}\n`)
-		_lastLines = 1
 		if (errors?.length) {
+			process.stdout.write(`  ${theme.folder(now)}  ${theme.filename(file)}  ${status}\n`)
+			_lastLines = 1
 			for (const err of errors) {
 				printerr(err)
 				_lastLines += 5
 			}
 		} else {
 			const myId = ++_fadeId
-			const c = (text, col) => `\x1b[2;38;5;${col}m${text}\x1b[0m`
-			const steps = [
-				[5000, 255],
-				[5500, 253],
-				[6000, 251],
-				[6500, 249],
-				[7000, 246],
-				[7500, 244],
-				[8000, 242],
-				[9000, null],
-			].map(([delay, col]) => [delay, col !== null
-				? `  ${c(now, col)}  ${c(file, col)}  ${c('ok', col)}`
-				: null
-			])
-			for (const [delay, line] of steps) {
+			const plainLine = `  ${now}  ${file}   ok `
+			const totalLen = plainLine.length
+			const startDelay = 5000
+			const charDelay = 22
+
+			process.stdout.write(`  ${theme.folder(now)}  ${theme.filename(file)}  ${status}`)
+			_lastLines = 1
+			_cursorOnLine = true
+
+			for (let i = 1; i <= totalLen; i++) {
 				_fadeTimers.push(setTimeout(() => {
 					if (_fadeId !== myId || _lastLines !== 1) return
-					if (line !== null) {
-						process.stdout.write(`\x1b[1A\x1b[2K${line}\n`)
-					} else {
-						process.stdout.write(`\x1b[1A\x1b[2K`)
+					process.stdout.write('\x1b[1D\x1b[K')
+					if (i === totalLen) {
 						_lastLines = 0
+						_cursorOnLine = false
 					}
-				}, delay))
+				}, startDelay + i * charDelay))
 			}
 		}
 	}
