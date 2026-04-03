@@ -3,6 +3,7 @@ import * as compiler from 'imba/compiler'
 import { watch, existsSync } from 'fs'
 import path from 'path'
 import { theme } from './utils.js'
+import { printerr } from './plugin.js'
 
 const hmrClient = `
 <script>
@@ -35,34 +36,94 @@ const hmrClient = `
 		el.innerHTML = '';
 	}
 
-	const ws = new WebSocket('ws://' + location.host + '/__hmr__');
-	ws.onmessage = (e) => {
-		const data = JSON.parse(e.data);
-		if (data.type === 'update') {
-			_updated.clear();
-			import('/' + data.file + '?t=' + Date.now()).then(() => {
-				const updatedClasses = [..._updated].map(n => _registry.get(n)).filter(Boolean);
-				const found = [];
-				if (updatedClasses.length) {
-					document.querySelectorAll('*').forEach(el => {
-						for (const cls of updatedClasses) {
-							if (el instanceof cls) { found.push(el); break; }
-						}
-					});
-				}
-				found.forEach(resetElement);
-				_updated.clear();
-				imba.commit();
-			});
-		} else if (data.type === 'reload') {
-			location.reload();
+	let _connected = false;
+	let _overlay = null;
+
+	function showError(file, errors) {
+		if (!_overlay) {
+			_overlay = document.createElement('div');
+			_overlay.id = '__bimba_error__';
+			const s = _overlay.style;
+			s.cssText = 'position:fixed;inset:0;z-index:99999;background:rgba(0,0,0,.85);display:flex;align-items:center;justify-content:center;font-family:monospace;padding:24px;box-sizing:border-box';
+			_overlay.addEventListener('click', (e) => { if (e.target === _overlay) clearError(); });
+			document.body.appendChild(_overlay);
 		}
-	};
+		_overlay.innerHTML = \`
+			<div style="background:#1a1a1a;border:1px solid #ff4444;border-radius:8px;max-width:860px;width:100%;max-height:90vh;overflow:auto;box-shadow:0 0 40px rgba(255,68,68,.3)">
+				<div style="background:#ff4444;color:#fff;padding:10px 16px;font-size:13px;font-weight:600;display:flex;justify-content:space-between;align-items:center">
+					<span>Compile error — \${file}</span>
+					<span onclick="document.getElementById('__bimba_error__').remove();document.getElementById('__bimba_error__')&&(window.__bimba_overlay__=null)" style="cursor:pointer;opacity:.7;font-size:16px">✕</span>
+				</div>
+				\${errors.map(err => \`
+					<div style="padding:16px;border-bottom:1px solid #333">
+						<div style="color:#ff8080;font-size:13px;margin-bottom:10px">\${err.message}\${err.line ? \` <span style="color:#888">line \${err.line}</span>\` : ''}</div>
+						\${err.snippet ? \`<pre style="margin:0;padding:10px;background:#111;border-radius:4px;font-size:12px;line-height:1.6;color:#ccc;overflow-x:auto;white-space:pre">\${err.snippet.replace(/</g,'&lt;')}</pre>\` : ''}
+					</div>
+				\`).join('')}
+			</div>
+		\`;
+	}
+
+	function clearError() {
+		if (_overlay) { _overlay.remove(); _overlay = null; }
+	}
+
+	function connect() {
+		const ws = new WebSocket('ws://' + location.host + '/__hmr__');
+		ws.onopen = () => {
+			if (_connected) {
+				location.reload();
+			} else {
+				_connected = true;
+			}
+		};
+		ws.onmessage = (e) => {
+			const data = JSON.parse(e.data);
+			if (data.type === 'update') {
+				clearError();
+				_updated.clear();
+				import('/' + data.file + '?t=' + Date.now()).then(() => {
+					const updatedClasses = [..._updated].map(n => _registry.get(n)).filter(Boolean);
+					const found = [];
+					if (updatedClasses.length) {
+						document.querySelectorAll('*').forEach(el => {
+							for (const cls of updatedClasses) {
+								if (el instanceof cls) { found.push(el); break; }
+							}
+						});
+					}
+					found.forEach(resetElement);
+					_updated.clear();
+					imba.commit();
+				});
+			} else if (data.type === 'reload') {
+				location.reload();
+			} else if (data.type === 'error') {
+				showError(data.file, data.errors);
+			} else if (data.type === 'clear-error') {
+				clearError();
+			}
+		};
+		ws.onclose = () => {
+			setTimeout(connect, 1000);
+		};
+	}
+
+	connect();
 </script>`
 
+const _compileCache = new Map()
+
 async function compileFile(filepath) {
-	const code = await Bun.file(filepath).text()
-	return compiler.compile(code, { sourcePath: filepath, platform: 'browser' })
+	const file = Bun.file(filepath)
+	const stat = await file.stat()
+	const mtime = stat.mtime.getTime()
+	const cached = _compileCache.get(filepath)
+	if (cached && cached.mtime === mtime) return { ...cached.result, cached: true }
+	const code = await file.text()
+	const result = compiler.compile(code, { sourcePath: filepath, platform: 'browser', sourcemap: 'inline' })
+	_compileCache.set(filepath, { mtime, result })
+	return result
 }
 
 function findHtml(flagHtml) {
@@ -123,10 +184,66 @@ export function serve(entrypoint, flags) {
 	const sockets = new Set()
 	let importMapTag = null
 
+	let _lastLines = 0
+	let _fadeTimers = []
+	let _fadeId = 0
+
+	function cancelFade() {
+		_fadeTimers.forEach(t => clearTimeout(t))
+		_fadeTimers = []
+	}
+
+	function printStatus(file, state, errors) {
+		cancelFade()
+		if (_lastLines > 0) {
+			process.stdout.write(`\x1b[${_lastLines}A\x1b[J`)
+			_lastLines = 0
+		}
+		const now = new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+		const status = state === 'ok' ? theme.success(' ok ') : theme.failure(' fail ')
+		process.stdout.write(`  ${theme.folder(now)}  ${theme.filename(file)}  ${status}\n`)
+		_lastLines = 1
+		if (errors?.length) {
+			for (const err of errors) {
+				printerr(err)
+				_lastLines += 5
+			}
+		} else {
+			const myId = ++_fadeId
+			const c = (text, col) => `\x1b[2;38;5;${col}m${text}\x1b[0m`
+			const steps = [
+				[5000, 255],
+				[5500, 253],
+				[6000, 251],
+				[6500, 249],
+				[7000, 246],
+				[7500, 244],
+				[8000, 242],
+				[9000, null],
+			].map(([delay, col]) => [delay, col !== null
+				? `  ${c(now, col)}  ${c(file, col)}  ${c('ok', col)}`
+				: null
+			])
+			for (const [delay, line] of steps) {
+				_fadeTimers.push(setTimeout(() => {
+					if (_fadeId !== myId || _lastLines !== 1) return
+					if (line !== null) {
+						process.stdout.write(`\x1b[1A\x1b[2K${line}\n`)
+					} else {
+						process.stdout.write(`\x1b[1A\x1b[2K`)
+						_lastLines = 0
+					}
+				}, delay))
+			}
+		}
+	}
+
+	const _debounce = new Map()
 	watch(srcDir, { recursive: true }, (_event, filename) => {
 		if (!filename || !filename.endsWith('.imba')) return
+		if (_debounce.has(filename)) return
+		_debounce.set(filename, setTimeout(() => _debounce.delete(filename), 50))
 		const rel = path.join(path.relative('.', srcDir), filename).replaceAll('\\', '/')
-		// console.log(theme.action('changed: ') + theme.filename(rel))
 		for (const socket of sockets)
 			socket.send(JSON.stringify({ type: 'update', file: rel }))
 	})
@@ -154,8 +271,22 @@ export function serve(entrypoint, flags) {
 			if (pathname.endsWith('.imba')) {
 				try {
 					const out = await compileFile('.' + pathname)
+					const file = pathname.replace(/^\//, '')
+					if (out.errors?.length) {
+						if (!out.cached) {
+							printStatus(file, 'fail', out.errors)
+							const payload = JSON.stringify({ type: 'error', file, errors: out.errors.map(e => ({ message: e.message, line: e.range?.start?.line, snippet: e.toSnippet() })) })
+							for (const socket of sockets) socket.send(payload)
+						}
+						return new Response(out.errors.map(e => e.message).join('\n'), { status: 500 })
+					}
+					if (!out.cached) {
+						printStatus(file, 'ok')
+						for (const socket of sockets) socket.send(JSON.stringify({ type: 'clear-error' }))
+					}
 					return new Response(out.js, { headers: { 'Content-Type': 'application/javascript' } })
 				} catch (e) {
+					console.error(theme.failure('Compile error: ') + theme.filename(pathname) + '\n' + e.message)
 					return new Response(e.message, { status: 500 })
 				}
 			}
@@ -165,6 +296,15 @@ export function serve(entrypoint, flags) {
 			if (await htmlDirFile.exists()) return new Response(htmlDirFile)
 			const file = Bun.file('.' + pathname)
 			if (await file.exists()) return new Response(file)
+
+			// SPA fallback: serve index.html only for URL-like paths (no file extension)
+			const lastSegment = pathname.split('/').pop()
+			if (!lastSegment.includes('.')) {
+				let html = await Bun.file(htmlPath).text()
+				if (!importMapTag) importMapTag = await buildImportMap()
+				html = transformHtml(html, entrypoint, importMapTag)
+				return new Response(html, { headers: { 'Content-Type': 'text/html' } })
+			}
 			return new Response('Not Found', { status: 404 })
 		},
 
