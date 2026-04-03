@@ -49,7 +49,8 @@ export const imbaPlugin = {
       const file = await Bun.file(path).text();
       const out = compiler.compile(file, {
           sourcePath: path,
-          platform: 'browser'
+          platform: 'browser',
+          comments: false
       })
       
       // the file has been successfully compiled

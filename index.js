@@ -21,6 +21,7 @@ try {
             help: { type: 'boolean' },
             clearcache: { type: 'boolean' },
             minify: { type: 'boolean' },
+            splitting: { type: 'boolean' },
             target: { type: 'string' },
             sourcemap: { type: 'string' },
             serve: { type: 'boolean' },
@@ -143,7 +144,8 @@ async function bundle() {
             outdir: flags.outdir,
             target: flags.target || 'browser',
             sourcemap: flags.sourcemap || 'none',
-            minify: flags.minify || true,
+            minify: true,
+            splitting: flags.splitting || false,
             plugins: [imbaPlugin]
         });
 
