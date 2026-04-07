@@ -1,6 +1,6 @@
 import { serve as bunServe } from 'bun'
 import * as compiler from 'imba/compiler'
-import { watch, existsSync } from 'fs'
+import { watch, existsSync, readdirSync, statSync } from 'fs'
 import path from 'path'
 import { theme } from './utils.js'
 import { printerr } from './plugin.js'
@@ -224,6 +224,41 @@ const hmrClientFull = `
 
 const _compileCache = new Map()
 const _versionHistory = new Map()
+let _historyInitialized = false
+
+// Walk directory recursively and compile all .imba files
+function walkDir(dir) {
+	let results = []
+	const list = readdirSync(dir)
+	for (const file of list) {
+		const filepath = path.join(dir, file)
+		const stat = statSync(filepath)
+		if (stat.isDirectory()) {
+			results = results.concat(walkDir(filepath))
+		} else if (file.endsWith('.imba')) {
+			results.push(filepath)
+		}
+	}
+	return results
+}
+
+// Pre-compile all .imba files to establish baseline
+async function initializeHistory(srcDir) {
+	if (_historyInitialized) return
+	console.log('[HMR] Pre-compiling', srcDir, '...')
+	const files = walkDir(srcDir)
+	for (const filepath of files) {
+		try {
+			const code = await Bun.file(filepath).text()
+			const result = compiler.compile(code, { sourcePath: filepath, platform: 'browser', sourcemap: 'inline' })
+			_versionHistory.set(filepath, { css: result.css, js: result.js })
+		} catch(e) {
+			// skip files that can't be compiled
+		}
+	}
+	_historyInitialized = true
+	console.log('[HMR] Baseline established for', files.length, 'files')
+}
 
 async function compileFile(filepath) {
 	const file = Bun.file(filepath)
@@ -388,25 +423,17 @@ export function serve(entrypoint, flags) {
 			if (hmrMode === 'full') {
 				for (const socket of sockets) socket.send(JSON.stringify({ type: 'update', file: rel }))
 			} else {
-				// CSS-only mode
-				if (out.changeType === 'css-only' || out.changeType === 'full') {
-					const oldHistory = _fileHistory.get(filepath)
-					const oldCss = oldHistory?.css || null
-					_fileHistory.set(filepath, { css: out.css, js: out.js })
-					
-					if (!oldCss) {
-						// First change: no baseline yet, reload to establish
-						for (const socket of sockets) socket.send(JSON.stringify({ type: 'reload' }))
-					} else {
-						// Subsequent changes: remap classes + append new CSS
-						for (const socket of sockets) socket.send(JSON.stringify({ 
-							type: 'css-update', 
-							file: rel, 
-							css: out.css,
-							oldCss: oldCss
-						}))
-					}
-				}
+				// CSS-only mode: always send css-update with old and new CSS
+				const oldHistory = _fileHistory.get(filepath)
+				const oldCss = oldHistory?.css || null
+				_fileHistory.set(filepath, { css: out.css, js: out.js })
+				
+				for (const socket of sockets) socket.send(JSON.stringify({ 
+					type: 'css-update', 
+					file: rel, 
+					css: out.css,
+					oldCss: oldCss
+				}))
 			}
 		} catch (e) {
 			printStatus(rel, 'fail', [{ message: e.message }])
@@ -431,6 +458,12 @@ export function serve(entrypoint, flags) {
 				const htmlFile = pathname === '/' ? htmlPath : '.' + pathname
 				let html = await Bun.file(htmlFile).text()
 				if (!importMapTag) importMapTag = await buildImportMap()
+				
+				// Initialize version history on first HTML request
+				if (!_historyInitialized) {
+					await initializeHistory(srcDir)
+				}
+				
 				html = transformHtml(html, entrypoint, importMapTag, hmrMode)
 				return new Response(html, { headers: { 'Content-Type': 'text/html' } })
 			}
