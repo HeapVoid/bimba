@@ -21,7 +21,12 @@ const hmrClientCssOnly = `
 		};
 		ws.onmessage = (e) => {
 			const data = JSON.parse(e.data);
-			if (data.type === 'css-update' || data.type === 'reload') {
+			if (data.type === 'css-update') {
+				// Use Imba's built-in styles API to update CSS at runtime
+				if (imba && imba.styles && imba.styles.register) {
+					imba.styles.register(data.file, data.css);
+				}
+			} else if (data.type === 'reload') {
 				location.reload();
 			} else if (data.type === 'error') {
 				showError(data.file, data.errors);
@@ -176,6 +181,7 @@ const hmrClientFull = `
 </script>`
 
 const _compileCache = new Map()
+const _versionHistory = new Map()
 
 async function compileFile(filepath) {
 	const file = Bun.file(filepath)
@@ -186,8 +192,24 @@ async function compileFile(filepath) {
 	const code = await file.text()
 	const result = compiler.compile(code, { sourcePath: filepath, platform: 'browser', sourcemap: 'inline' })
 	
+	// Track what changed compared to previous version
+	const prev = _versionHistory.get(filepath)
+	let changeType = 'full'
+	if (prev) {
+		const cssChanged = prev.css !== result.css
+		const jsChanged = prev.js !== result.js
+		if (cssChanged && !jsChanged) {
+			changeType = 'css-only'
+		} else if (jsChanged) {
+			changeType = 'full'
+		} else if (!cssChanged && !jsChanged) {
+			changeType = 'none'
+		}
+	}
+	
+	_versionHistory.set(filepath, { css: result.css, js: result.js })
 	_compileCache.set(filepath, { mtime, result })
-	return result
+	return { ...result, changeType }
 }
 
 function findHtml(flagHtml) {
@@ -323,8 +345,14 @@ export function serve(entrypoint, flags) {
 			if (hmrMode === 'full') {
 				for (const socket of sockets) socket.send(JSON.stringify({ type: 'update', file: rel }))
 			} else {
-				// CSS-only mode: any change triggers reload
-				for (const socket of sockets) socket.send(JSON.stringify({ type: 'reload' }))
+				// CSS-only mode
+				if (out.changeType === 'css-only' || out.changeType === 'full') {
+					for (const socket of sockets) socket.send(JSON.stringify({ 
+						type: 'css-update', 
+						file: rel, 
+						css: out.css 
+					}))
+				}
 			}
 		} catch (e) {
 			printStatus(rel, 'fail', [{ message: e.message }])
