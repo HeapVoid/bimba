@@ -30,59 +30,24 @@ const hmrClient = `
 		}
 	};
 
-	// Debounced refresh: first update is instant, subsequent ones within 200ms are batched
-	let _pending = false;
-	let _pendingFiles = new Set();
-
-	function scheduleRefresh(file) {
-		_pendingFiles.add(file);
-		if (_pending) return; // already scheduled
-		_pending = true;
-
-		// First update: immediate
-		requestAnimationFrame(() => {
-			doRefresh();
-			_pending = false;
-
-			// If more files arrived during this frame, schedule another refresh
-			if (_pendingFiles.size > 0) {
-				setTimeout(() => {
-					_pending = true;
-					requestAnimationFrame(() => {
-						doRefresh();
-						_pending = false;
-					});
-				}, 200);
+	function doRefresh() {
+		_updated.clear();
+		if (typeof imba !== 'undefined') {
+			if (imba.scheduler && imba.scheduler.add) {
+				imba.scheduler.add('commit');
+			} else if (imba.commit) {
+				imba.commit();
 			}
-		});
+		}
 	}
 
-	function doRefresh() {
-		if (_pendingFiles.size === 0) return;
-		const files = [..._pendingFiles];
-		_pendingFiles.clear();
+	let _pending = false;
 
-		// Remove old elements from DOM so Imba recreates them
-		const updatedClasses = [..._updated].map(n => _registry.get(n)).filter(Boolean);
-		if (updatedClasses.length) {
-			document.querySelectorAll('*').forEach(el => {
-				for (const cls of updatedClasses) {
-					if (el instanceof cls) {
-						// Remove from parent so Imba can recreate
-						if (el.parentNode) {
-							el.parentNode.removeChild(el);
-						}
-						break;
-					}
-				}
-			});
-		}
-		_updated.clear();
-
-		// Tell Imba to re-render
-		if (typeof imba !== 'undefined' && imba.commit) {
-			imba.commit();
-		}
+	function scheduleRefresh(file) {
+		if (_pending) return;
+		_pending = true;
+		doRefresh();
+		_pending = false;
 	}
 
 	let _connected = false;
