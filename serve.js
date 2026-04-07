@@ -8,7 +8,32 @@ import { printerr } from './plugin.js'
 // HMR client for CSS-only mode (injects styles without reload)
 const hmrClientCssOnly = `
 <script>
+	const _originalDefine = customElements.define.bind(customElements);
+	const _registry = new Map();
+	const _updated = new Set();
+
+	// Intercept re-definitions to avoid CustomElementRegistry errors
+	customElements.define = function(name, cls, opts) {
+		const existing = _registry.get(name);
+		if (existing) {
+			// Update prototype with new methods
+			Object.getOwnPropertyNames(cls.prototype).forEach(key => {
+				if (key === 'constructor') return;
+				try { Object.defineProperty(existing.prototype, key, Object.getOwnPropertyDescriptor(cls.prototype, key)); } catch(e) {}
+			});
+			Object.getOwnPropertyNames(cls).forEach(key => {
+				if (['length','name','prototype','arguments','caller'].includes(key)) return;
+				try { Object.defineProperty(existing, key, Object.getOwnPropertyDescriptor(cls, key)); } catch(e) {}
+			});
+			_updated.add(name);
+		} else {
+			_registry.set(name, cls);
+			_originalDefine(name, cls, opts);
+		}
+	};
+
 	let _connected = false;
+	let _overlay = null;
 
 	function connect() {
 		const ws = new WebSocket('ws://' + location.host + '/__hmr__');
@@ -22,10 +47,14 @@ const hmrClientCssOnly = `
 		ws.onmessage = (e) => {
 			const data = JSON.parse(e.data);
 			if (data.type === 'css-update') {
-				// Use Imba's built-in styles API to update CSS at runtime
-				if (imba && imba.styles && imba.styles.register) {
-					imba.styles.register(data.file, data.css);
-				}
+				// Import the updated file — triggers Imba to register new styles
+				import('/' + data.file + '?t=' + Date.now()).then(() => {
+					// Commit styles only, don't reset elements
+					if (typeof imba !== 'undefined' && imba.commit) {
+						imba.commit();
+					}
+					_updated.clear();
+				});
 			} else if (data.type === 'reload') {
 				location.reload();
 			} else if (data.type === 'error') {
