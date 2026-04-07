@@ -9,7 +9,6 @@ import { printerr } from './plugin.js'
 const hmrClientCssOnly = `
 <script>
 	let _connected = false;
-	let _styleEl = null;
 
 	function connect() {
 		const ws = new WebSocket('ws://' + location.host + '/__hmr__');
@@ -22,14 +21,7 @@ const hmrClientCssOnly = `
 		};
 		ws.onmessage = (e) => {
 			const data = JSON.parse(e.data);
-			if (data.type === 'css-update') {
-				if (!_styleEl) {
-					_styleEl = document.createElement('style');
-					_styleEl.id = '__bimba_hmr_css__';
-					document.head.appendChild(_styleEl);
-				}
-				_styleEl.textContent = data.css;
-			} else if (data.type === 'reload') {
+			if (data.type === 'css-update' || data.type === 'reload') {
 				location.reload();
 			} else if (data.type === 'error') {
 				showError(data.file, data.errors);
@@ -184,8 +176,6 @@ const hmrClientFull = `
 </script>`
 
 const _compileCache = new Map()
-// Store previous versions to detect what changed
-const _versionHistory = new Map()
 
 async function compileFile(filepath) {
 	const file = Bun.file(filepath)
@@ -196,24 +186,8 @@ async function compileFile(filepath) {
 	const code = await file.text()
 	const result = compiler.compile(code, { sourcePath: filepath, platform: 'browser', sourcemap: 'inline' })
 	
-	// Track what changed compared to previous version
-	const prev = _versionHistory.get(filepath)
-	let changeType = 'full' // default
-	if (prev) {
-		const cssChanged = prev.css !== result.css
-		const jsChanged = prev.js !== result.js
-		if (cssChanged && !jsChanged) {
-			changeType = 'css-only'
-		} else if (jsChanged) {
-			changeType = 'full'
-		} else {
-			changeType = 'none'
-		}
-	}
-	
-	_versionHistory.set(filepath, { css: result.css, js: result.js })
 	_compileCache.set(filepath, { mtime, result })
-	return { ...result, changeType }
+	return result
 }
 
 function findHtml(flagHtml) {
@@ -323,13 +297,40 @@ export function serve(entrypoint, flags) {
 	}
 
 	const _debounce = new Map()
-	watch(srcDir, { recursive: true }, (_event, filename) => {
+	
+	watch(srcDir, { recursive: true }, async (_event, filename) => {
 		if (!filename || !filename.endsWith('.imba')) return
 		if (_debounce.has(filename)) return
 		_debounce.set(filename, setTimeout(() => _debounce.delete(filename), 50))
+		
+		const filepath = path.join(srcDir, filename)
 		const rel = path.join(path.relative('.', srcDir), filename).replaceAll('\\', '/')
-		for (const socket of sockets)
-			socket.send(JSON.stringify({ type: 'update', file: rel }))
+		
+		try {
+			const out = await compileFile(filepath)
+			
+			if (out.errors?.length) {
+				printStatus(rel, 'fail', out.errors)
+				const payload = JSON.stringify({ type: 'error', file: rel, errors: out.errors.map(e => ({ message: e.message, line: e.range?.start?.line, snippet: e.toSnippet() })) })
+				for (const socket of sockets) socket.send(payload)
+				return
+			}
+			
+			printStatus(rel, 'ok')
+			for (const socket of sockets) socket.send(JSON.stringify({ type: 'clear-error' }))
+			
+			// Send appropriate update type based on HMR mode and what changed
+			if (hmrMode === 'full') {
+				for (const socket of sockets) socket.send(JSON.stringify({ type: 'update', file: rel }))
+			} else {
+				// CSS-only mode: any change triggers reload
+				for (const socket of sockets) socket.send(JSON.stringify({ type: 'reload' }))
+			}
+		} catch (e) {
+			printStatus(rel, 'fail', [{ message: e.message }])
+			const payload = JSON.stringify({ type: 'error', file: rel, errors: [{ message: e.message, snippet: e.stack || e.message }] })
+			for (const socket of sockets) socket.send(payload)
+		}
 	})
 
 	bunServe({
@@ -357,33 +358,12 @@ export function serve(entrypoint, flags) {
 					const out = await compileFile('.' + pathname)
 					const file = pathname.replace(/^\//, '')
 					if (out.errors?.length) {
-						if (!out.cached) {
-							printStatus(file, 'fail', out.errors)
-							const payload = JSON.stringify({ type: 'error', file, errors: out.errors.map(e => ({ message: e.message, line: e.range?.start?.line, snippet: e.toSnippet() })) })
-							for (const socket of sockets) socket.send(payload)
-						}
+						printStatus(file, 'fail', out.errors)
+						const payload = JSON.stringify({ type: 'error', file, errors: out.errors.map(e => ({ message: e.message, line: e.range?.start?.line, snippet: e.toSnippet() })) })
+						for (const socket of sockets) socket.send(payload)
 						return new Response(out.errors.map(e => e.message).join('\n'), { status: 500 })
 					}
-					if (!out.cached) {
-						printStatus(file, 'ok')
-						for (const socket of sockets) socket.send(JSON.stringify({ type: 'clear-error' }))
-						
-						// Send appropriate update type based on HMR mode and what changed
-						if (hmrMode === 'full') {
-							// Full mode: send 'update' for prototype swapping (CSS is included in JS via runtime)
-							for (const socket of sockets) socket.send(JSON.stringify({ type: 'update', file }))
-						} else {
-							// CSS-only mode
-							if (out.changeType === 'css-only') {
-								// Only CSS changed: inject styles without reload
-								for (const socket of sockets) socket.send(JSON.stringify({ type: 'css-update', file, css: out.css }))
-							} else if (out.changeType === 'full') {
-								// JS changed in CSS-only mode: full page reload
-								for (const socket of sockets) socket.send(JSON.stringify({ type: 'reload' }))
-							}
-							// 'none' change type: do nothing, already up-to-date
-						}
-					}
+					// Don't send HMR events from on-demand requests - only from file watcher
 					return new Response(out.js, { headers: { 'Content-Type': 'application/javascript' } })
 				} catch (e) {
 					const file = pathname.replace(/^\//, '')
