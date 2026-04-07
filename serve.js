@@ -8,32 +8,42 @@ import { printerr } from './plugin.js'
 // HMR client for CSS-only mode (injects styles without reload)
 const hmrClientCssOnly = `
 <script>
-	const _originalDefine = customElements.define.bind(customElements);
-	const _registry = new Map();
-	const _updated = new Set();
-
-	// Intercept re-definitions to avoid CustomElementRegistry errors
-	customElements.define = function(name, cls, opts) {
-		const existing = _registry.get(name);
-		if (existing) {
-			// Update prototype with new methods
-			Object.getOwnPropertyNames(cls.prototype).forEach(key => {
-				if (key === 'constructor') return;
-				try { Object.defineProperty(existing.prototype, key, Object.getOwnPropertyDescriptor(cls.prototype, key)); } catch(e) {}
-			});
-			Object.getOwnPropertyNames(cls).forEach(key => {
-				if (['length','name','prototype','arguments','caller'].includes(key)) return;
-				try { Object.defineProperty(existing, key, Object.getOwnPropertyDescriptor(cls, key)); } catch(e) {}
-			});
-			_updated.add(name);
-		} else {
-			_registry.set(name, cls);
-			_originalDefine(name, cls, opts);
-		}
-	};
-
 	let _connected = false;
 	let _overlay = null;
+
+	// Extract class names from CSS
+	function extractClasses(css) {
+		return css.match(/\\.[a-z0-9]+_[a-z]{2,}\\b/g) || [];
+	}
+
+	// Replace old classes with new ones on DOM elements
+	// Only remap classes that exist in both old and new CSS
+	function remapClasses(oldCss, newCss) {
+		const oldClasses = extractClasses(oldCss);
+		const newClasses = extractClasses(newCss);
+		const map = new Map();
+		const len = Math.min(oldClasses.length, newClasses.length);
+		for (let i = 0; i < len; i++) {
+			const oldC = oldClasses[i].substring(1);
+			const newC = newClasses[i].substring(1);
+			if (oldC !== newC) map.set(oldC, newC);
+		}
+		if (map.size === 0) return;
+		
+		document.querySelectorAll('*').forEach(el => {
+			if (!el.className || typeof el.className !== 'string') return;
+			let changed = false;
+			const parts = el.className.split(' ');
+			for (let i = 0; i < parts.length; i++) {
+				const replacement = map.get(parts[i]);
+				if (replacement) {
+					parts[i] = replacement;
+					changed = true;
+				}
+			}
+			if (changed) el.className = parts.join(' ');
+		});
+	}
 
 	function connect() {
 		const ws = new WebSocket('ws://' + location.host + '/__hmr__');
@@ -47,14 +57,17 @@ const hmrClientCssOnly = `
 		ws.onmessage = (e) => {
 			const data = JSON.parse(e.data);
 			if (data.type === 'css-update') {
-				// Import the updated file — triggers Imba to register new styles
-				import('/' + data.file + '?t=' + Date.now()).then(() => {
-					// Commit styles only, don't reset elements
-					if (typeof imba !== 'undefined' && imba.commit) {
-						imba.commit();
-					}
-					_updated.clear();
-				});
+				// Remap classes from old file CSS to new file CSS
+				if (data.oldCss && data.css) {
+					remapClasses(data.oldCss, data.css);
+				}
+				
+				// Append new CSS as a new style element
+				const style = document.createElement('style');
+				style.setAttribute('data-bimba-hmr', 'true');
+				style.textContent = data.css;
+				document.head.appendChild(style);
+				
 			} else if (data.type === 'reload') {
 				location.reload();
 			} else if (data.type === 'error') {
@@ -348,6 +361,7 @@ export function serve(entrypoint, flags) {
 	}
 
 	const _debounce = new Map()
+	const _fileHistory = new Map() // filepath -> {css, js}
 	
 	watch(srcDir, { recursive: true }, async (_event, filename) => {
 		if (!filename || !filename.endsWith('.imba')) return
@@ -376,11 +390,22 @@ export function serve(entrypoint, flags) {
 			} else {
 				// CSS-only mode
 				if (out.changeType === 'css-only' || out.changeType === 'full') {
-					for (const socket of sockets) socket.send(JSON.stringify({ 
-						type: 'css-update', 
-						file: rel, 
-						css: out.css 
-					}))
+					const oldHistory = _fileHistory.get(filepath)
+					const oldCss = oldHistory?.css || null
+					_fileHistory.set(filepath, { css: out.css, js: out.js })
+					
+					if (!oldCss) {
+						// First change: no baseline yet, reload to establish
+						for (const socket of sockets) socket.send(JSON.stringify({ type: 'reload' }))
+					} else {
+						// Subsequent changes: remap classes + append new CSS
+						for (const socket of sockets) socket.send(JSON.stringify({ 
+							type: 'css-update', 
+							file: rel, 
+							css: out.css,
+							oldCss: oldCss
+						}))
+					}
 				}
 			}
 		} catch (e) {
