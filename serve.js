@@ -5,45 +5,89 @@ import path from 'path'
 import { theme } from './utils.js'
 import { printerr } from './plugin.js'
 
-// HMR client for CSS-only mode (injects styles without reload)
-const hmrClientCssOnly = `
+// HMR client — single mode with debounced updates and element discard
+const hmrClient = `
 <script>
-	let _connected = false;
-	let _overlay = null;
+	const _originalDefine = customElements.define.bind(customElements);
+	const _registry = new Map();
+	const _updated = new Set();
 
-	// Extract class names from CSS
-	function extractClasses(css) {
-		return css.match(/\\.[a-z0-9]+_[a-z]{2,}\\b/g) || [];
-	}
-
-	// Replace old classes with new ones on DOM elements
-	// Only remap classes that exist in both old and new CSS
-	function remapClasses(oldCss, newCss) {
-		const oldClasses = extractClasses(oldCss);
-		const newClasses = extractClasses(newCss);
-		const map = new Map();
-		const len = Math.min(oldClasses.length, newClasses.length);
-		for (let i = 0; i < len; i++) {
-			const oldC = oldClasses[i].substring(1);
-			const newC = newClasses[i].substring(1);
-			if (oldC !== newC) map.set(oldC, newC);
+	customElements.define = function(name, cls, opts) {
+		const existing = _registry.get(name);
+		if (existing) {
+			Object.getOwnPropertyNames(cls.prototype).forEach(key => {
+				if (key === 'constructor') return;
+				try { Object.defineProperty(existing.prototype, key, Object.getOwnPropertyDescriptor(cls.prototype, key)); } catch(e) {}
+			});
+			Object.getOwnPropertyNames(cls).forEach(key => {
+				if (['length','name','prototype','arguments','caller'].includes(key)) return;
+				try { Object.defineProperty(existing, key, Object.getOwnPropertyDescriptor(cls, key)); } catch(e) {}
+			});
+			_updated.add(name);
+		} else {
+			_registry.set(name, cls);
+			_originalDefine(name, cls, opts);
 		}
-		if (map.size === 0) return;
-		
-		document.querySelectorAll('*').forEach(el => {
-			if (!el.className || typeof el.className !== 'string') return;
-			let changed = false;
-			const parts = el.className.split(' ');
-			for (let i = 0; i < parts.length; i++) {
-				const replacement = map.get(parts[i]);
-				if (replacement) {
-					parts[i] = replacement;
-					changed = true;
-				}
+	};
+
+	// Debounced refresh: first update is instant, subsequent ones within 200ms are batched
+	let _pending = false;
+	let _pendingFiles = new Set();
+
+	function scheduleRefresh(file) {
+		_pendingFiles.add(file);
+		if (_pending) return; // already scheduled
+		_pending = true;
+
+		// First update: immediate
+		requestAnimationFrame(() => {
+			doRefresh();
+			_pending = false;
+
+			// If more files arrived during this frame, schedule another refresh
+			if (_pendingFiles.size > 0) {
+				setTimeout(() => {
+					_pending = true;
+					requestAnimationFrame(() => {
+						doRefresh();
+						_pending = false;
+					});
+				}, 200);
 			}
-			if (changed) el.className = parts.join(' ');
 		});
 	}
+
+	function doRefresh() {
+		if (_pendingFiles.size === 0) return;
+		const files = [..._pendingFiles];
+		_pendingFiles.clear();
+
+		// Remove old elements from DOM so Imba recreates them
+		const updatedClasses = [..._updated].map(n => _registry.get(n)).filter(Boolean);
+		if (updatedClasses.length) {
+			document.querySelectorAll('*').forEach(el => {
+				for (const cls of updatedClasses) {
+					if (el instanceof cls) {
+						// Remove from parent so Imba can recreate
+						if (el.parentNode) {
+							el.parentNode.removeChild(el);
+						}
+						break;
+					}
+				}
+			});
+		}
+		_updated.clear();
+
+		// Tell Imba to re-render
+		if (typeof imba !== 'undefined') {
+			if (imba.invalidate) imba.invalidate();
+			else if (imba.commit) imba.commit();
+		}
+	}
+
+	let _connected = false;
+	let _overlay = null;
 
 	function connect() {
 		const ws = new WebSocket('ws://' + location.host + '/__hmr__');
@@ -56,18 +100,12 @@ const hmrClientCssOnly = `
 		};
 		ws.onmessage = (e) => {
 			const data = JSON.parse(e.data);
-			if (data.type === 'css-update') {
-				// Remap classes from old file CSS to new file CSS
-				if (data.oldCss && data.css) {
-					remapClasses(data.oldCss, data.css);
-				}
-				
-				// Append new CSS as a new style element
-				const style = document.createElement('style');
-				style.setAttribute('data-bimba-hmr', 'true');
-				style.textContent = data.css;
-				document.head.appendChild(style);
-				
+			if (data.type === 'update') {
+				clearError();
+				_updated.clear();
+				import('/' + data.file + '?t=' + Date.now()).then(() => {
+					scheduleRefresh(data.file);
+				});
 			} else if (data.type === 'reload') {
 				location.reload();
 			} else if (data.type === 'error') {
@@ -109,114 +147,6 @@ const hmrClientCssOnly = `
 	function clearError() {
 		const overlay = document.getElementById('__bimba_error__');
 		if (overlay) overlay.remove();
-	}
-
-	connect();
-</script>`
-
-// Full HMR client (swaps component prototypes and resets elements)
-const hmrClientFull = `
-<script>
-	const _originalDefine = customElements.define.bind(customElements);
-	const _registry = new Map();
-	const _updated = new Set();
-
-	customElements.define = function(name, cls, opts) {
-		const existing = _registry.get(name);
-		if (existing) {
-			Object.getOwnPropertyNames(cls.prototype).forEach(key => {
-				if (key === 'constructor') return;
-				try { Object.defineProperty(existing.prototype, key, Object.getOwnPropertyDescriptor(cls.prototype, key)); } catch(e) {}
-			});
-			Object.getOwnPropertyNames(cls).forEach(key => {
-				if (['length','name','prototype','arguments','caller'].includes(key)) return;
-				try { Object.defineProperty(existing, key, Object.getOwnPropertyDescriptor(cls, key)); } catch(e) {}
-			});
-			_updated.add(name);
-		} else {
-			_registry.set(name, cls);
-			_originalDefine(name, cls, opts);
-		}
-	};
-
-	function resetElement(el) {
-		Object.getOwnPropertySymbols(el).forEach(s => {
-			try { if (el[s] instanceof Node) el[s] = undefined; } catch(e) {}
-		});
-		el.innerHTML = '';
-	}
-
-	let _connected = false;
-	let _overlay = null;
-
-	function showError(file, errors) {
-		if (!_overlay) {
-			_overlay = document.createElement('div');
-			_overlay.id = '__bimba_error__';
-			const s = _overlay.style;
-			s.cssText = 'position:fixed;inset:0;z-index:99999;background:rgba(0,0,0,.85);display:flex;align-items:center;justify-content:center;font-family:monospace;padding:24px;box-sizing:border-box';
-			_overlay.addEventListener('click', (e) => { if (e.target === _overlay) clearError(); });
-			document.body.appendChild(_overlay);
-		}
-		_overlay.innerHTML = \`
-			<div style="background:#1a1a1a;border:1px solid #ff4444;border-radius:8px;max-width:860px;width:100%;max-height:90vh;overflow:auto;box-shadow:0 0 40px rgba(255,68,68,.3)">
-				<div style="background:#ff4444;color:#fff;padding:10px 16px;font-size:13px;font-weight:600;display:flex;justify-content:space-between;align-items:center">
-					<span>Compile error — \${file}</span>
-					<span onclick="document.getElementById('__bimba_error__').remove();document.getElementById('__bimba_error__')&&(window.__bimba_overlay__=null)" style="cursor:pointer;opacity:.7;font-size:16px">✕</span>
-				</div>
-				\${errors.map(err => \`
-					<div style="padding:16px;border-bottom:1px solid #333">
-						<div style="color:#ff8080;font-size:13px;margin-bottom:10px">\${err.message}\${err.line ? \` <span style="color:#888">line \${err.line}</span>\` : ''}</div>
-						\${err.snippet ? \`<pre style="margin:0;padding:10px;background:#111;border-radius:4px;font-size:12px;line-height:1.6;color:#ccc;overflow-x:auto;white-space:pre">\${err.snippet.replace(/</g,'&lt;')}</pre>\` : ''}
-					</div>
-				\`).join('')}
-			</div>
-		\`;
-	}
-
-	function clearError() {
-		if (_overlay) { _overlay.remove(); _overlay = null; }
-	}
-
-	function connect() {
-		const ws = new WebSocket('ws://' + location.host + '/__hmr__');
-		ws.onopen = () => {
-			if (_connected) {
-				location.reload();
-			} else {
-				_connected = true;
-			}
-		};
-		ws.onmessage = (e) => {
-			const data = JSON.parse(e.data);
-			if (data.type === 'update') {
-				clearError();
-				_updated.clear();
-				import('/' + data.file + '?t=' + Date.now()).then(() => {
-					const updatedClasses = [..._updated].map(n => _registry.get(n)).filter(Boolean);
-					const found = [];
-					if (updatedClasses.length) {
-						document.querySelectorAll('*').forEach(el => {
-							for (const cls of updatedClasses) {
-								if (el instanceof cls) { found.push(el); break; }
-							}
-						});
-					}
-					found.forEach(resetElement);
-					_updated.clear();
-					imba.commit();
-				});
-			} else if (data.type === 'reload') {
-				location.reload();
-			} else if (data.type === 'error') {
-				showError(data.file, data.errors);
-			} else if (data.type === 'clear-error') {
-				clearError();
-			}
-		};
-		ws.onclose = () => {
-			setTimeout(connect, 1000);
-		};
 	}
 
 	connect();
@@ -293,14 +223,12 @@ async function buildImportMap() {
 // - removes existing importmap block
 // - removes <script data-bimba> from its position
 // - injects importmap + entrypoint script + HMR client before </head>
-function transformHtml(html, entrypoint, importMapTag, hmrMode) {
+function transformHtml(html, entrypoint, importMapTag) {
 	html = html.replace(/<script\s+type=["']importmap["'][^>]*>[\s\S]*?<\/script>/gi, '');
 	html = html.replace(/<script([^>]*)\bdata-entrypoint\b([^>]*)><\/script>/gi, '');
 
 	const entryUrl = '/' + entrypoint.replace(/^\.\//, '').replaceAll('\\', '/');
 	const entryScript = `\t\t<script type='module' src='${entryUrl}'></script>`;
-	
-	const hmrClient = hmrMode === 'full' ? hmrClientFull : hmrClientCssOnly;
 
 	html = html.replace('</head>', `${importMapTag}\n${entryScript}\n${hmrClient}\n\t</head>`);
 	return html;
@@ -313,7 +241,6 @@ export function serve(entrypoint, flags) {
 	const srcDir = path.dirname(entrypoint)
 	const sockets = new Set()
 	let importMapTag = null
-	const hmrMode = flags.hmrMode || 'css'
 
 	let _fadeTimers = []
 	let _fadeId = 0
@@ -361,49 +288,34 @@ export function serve(entrypoint, flags) {
 	}
 
 	const _debounce = new Map()
-	const _fileHistory = new Map() // filepath -> {css, js}
-	
+
 	watch(srcDir, { recursive: true }, async (_event, filename) => {
 		if (!filename || !filename.endsWith('.imba')) return
 		if (_debounce.has(filename)) return
 		_debounce.set(filename, setTimeout(() => _debounce.delete(filename), 50))
-		
+
 		const filepath = path.join(srcDir, filename)
 		const rel = path.join(path.relative('.', srcDir), filename).replaceAll('\\', '/')
-		
+
 		try {
 			const out = await compileFile(filepath)
-			
+
 			if (out.errors?.length) {
 				printStatus(rel, 'fail', out.errors)
 				const payload = JSON.stringify({ type: 'error', file: rel, errors: out.errors.map(e => ({ message: e.message, line: e.range?.start?.line, snippet: e.toSnippet() })) })
 				for (const socket of sockets) socket.send(payload)
 				return
 			}
-			
+
 			printStatus(rel, 'ok')
 			for (const socket of sockets) socket.send(JSON.stringify({ type: 'clear-error' }))
-			
-			// Send appropriate update type based on HMR mode and what changed
-			if (hmrMode === 'full') {
-				for (const socket of sockets) socket.send(JSON.stringify({ type: 'update', file: rel }))
-			} else {
-				// CSS-only mode
-				const oldHistory = _fileHistory.get(filepath)
-				const oldCss = oldHistory?.css || null
-				_fileHistory.set(filepath, { css: out.css, js: out.js })
-				
-				// Log to terminal what changed
-				const changeLabel = out.changeType === 'css-only' ? theme.success(' CSS ') : out.changeType === 'full' ? theme.failure(' JS+CSS ') : theme.action(' none ')
-				console.log(`  ${theme.folder(new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit', second: '2-digit' }))}  ${changeLabel}  ${theme.filename(rel)}`)
-				
-				for (const socket of sockets) socket.send(JSON.stringify({ 
-					type: 'css-update', 
-					file: rel, 
-					css: out.css,
-					oldCss: oldCss
-				}))
-			}
+
+			// Log to terminal what changed
+			const changeLabel = out.changeType === 'css-only' ? theme.success(' CSS ') : out.changeType === 'full' ? theme.failure(' JS+CSS ') : theme.action(' none ')
+			console.log(`  ${theme.folder(new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit', second: '2-digit' }))}  ${changeLabel}  ${theme.filename(rel)}`)
+
+			// Always send update — HMR client handles debouncing and element discard
+			for (const socket of sockets) socket.send(JSON.stringify({ type: 'update', file: rel }))
 		} catch (e) {
 			printStatus(rel, 'fail', [{ message: e.message }])
 			const payload = JSON.stringify({ type: 'error', file: rel, errors: [{ message: e.message, snippet: e.stack || e.message }] })
@@ -427,7 +339,7 @@ export function serve(entrypoint, flags) {
 				const htmlFile = pathname === '/' ? htmlPath : '.' + pathname
 				let html = await Bun.file(htmlFile).text()
 				if (!importMapTag) importMapTag = await buildImportMap()
-				html = transformHtml(html, entrypoint, importMapTag, hmrMode)
+				html = transformHtml(html, entrypoint, importMapTag)
 				return new Response(html, { headers: { 'Content-Type': 'text/html' } })
 			}
 
@@ -463,7 +375,7 @@ export function serve(entrypoint, flags) {
 			if (!lastSegment.includes('.')) {
 				let html = await Bun.file(htmlPath).text()
 				if (!importMapTag) importMapTag = await buildImportMap()
-				html = transformHtml(html, entrypoint, importMapTag, hmrMode)
+				html = transformHtml(html, entrypoint, importMapTag)
 				return new Response(html, { headers: { 'Content-Type': 'text/html' } })
 			}
 			return new Response('Not Found', { status: 404 })
