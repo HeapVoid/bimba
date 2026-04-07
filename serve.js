@@ -80,9 +80,8 @@ const hmrClient = `
 		_updated.clear();
 
 		// Tell Imba to re-render
-		if (typeof imba !== 'undefined') {
-			if (imba.invalidate) imba.invalidate();
-			else if (imba.commit) imba.commit();
+		if (typeof imba !== 'undefined' && imba.commit) {
+			imba.commit();
 		}
 	}
 
@@ -309,12 +308,6 @@ export function serve(entrypoint, flags) {
 
 			printStatus(rel, 'ok')
 			for (const socket of sockets) socket.send(JSON.stringify({ type: 'clear-error' }))
-
-			// Log to terminal what changed
-			const changeLabel = out.changeType === 'css-only' ? theme.success(' CSS ') : out.changeType === 'full' ? theme.failure(' JS+CSS ') : theme.action(' none ')
-			console.log(`  ${theme.folder(new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit', second: '2-digit' }))}  ${changeLabel}  ${theme.filename(rel)}`)
-
-			// Always send update — HMR client handles debouncing and element discard
 			for (const socket of sockets) socket.send(JSON.stringify({ type: 'update', file: rel }))
 		} catch (e) {
 			printStatus(rel, 'fail', [{ message: e.message }])
