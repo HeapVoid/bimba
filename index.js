@@ -27,6 +27,7 @@ try {
             serve: { type: 'boolean' },
             port: { type: 'string' },
             html: { type: 'string' },
+            hmrmode: { type: 'string' },
         },
         strict: true,
         allowPositionals: true,
@@ -54,6 +55,14 @@ if (!fs.existsSync(bunfigPath)) {
     }
 }
 
+// Validate hmr-mode flag
+if (flags.hmrmode && !['css', 'full'].includes(flags.hmrmode)) {
+    console.log("");
+    console.log(theme.failure("Invalid value for --hmr-mode. Use 'css' (default) or 'full'."));
+    console.log("");
+    process.exit(0);
+}
+
 // help: more on bun building params here: https://bun.sh/docs/bundler
 if(flags.help) {
     console.log("");
@@ -71,6 +80,7 @@ if(flags.help) {
     console.log("   "+theme.flags('--serve')+"                               Start dev server with Hot Module Replacement");
     console.log("   "+theme.flags('--port <number>')+"                       Port for the dev server (default: 5200)");
     console.log("   "+theme.flags('--html <path>')+"                         Custom HTML file path (auto-detected if omitted)");
+    console.log("   "+theme.flags('--hmr-mode <css|full>')+"                 HMR mode: 'css' = CSS-only reload (default), 'full' = element swap");
     console.log("");
     process.exit(0);
 }
@@ -86,7 +96,7 @@ if (flags.serve) {
         console.log("");
         process.exit(1);
     }
-    serve(entrypoint, { port: parseInt(flags.port) || 5200, html: flags.html });
+    serve(entrypoint, { port: parseInt(flags.port) || 5200, html: flags.html, hmrMode: flags.hmrmode || 'css' });
 }
 // no entrypoint or outdir
 else if(!entrypoint || !flags.outdir) {

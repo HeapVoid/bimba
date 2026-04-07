@@ -54,6 +54,10 @@ bunx bimba src/index.imba --serve --port 5200 --html public/index.html
 
 `--html <path>` — path to your HTML file (auto-detected from `./index.html`, `./public/index.html`, `./src/index.html` if omitted)
 
+`--hmr-mode <css|full>` — HMR mode (default: `css`)
+  - `css` — CSS-only hot reload (injects styles instantly, full reload on JS changes)
+  - `full` — full HMR with element swapping (prototype replacement, no page reload)
+
 Static files are resolved relative to the HTML file's directory first, then from the project root (for `node_modules`, `src`, etc.).
 
 ---
@@ -91,3 +95,7 @@ bunx bimba src/index.imba --outdir public/js --watch --clearcache
 `--port <number>` — port for the dev server (default: `5200`). Used with `--serve`.
 
 `--html <path>` — custom HTML file path. Used with `--serve`.
+
+`--hmr-mode <css|full>` — HMR mode for dev server (default: `css`)
+  - `css` — CSS-only hot reload (injects styles instantly without reload, triggers full reload only when JS changes)
+  - `full` — full HMR with element swapping (swaps component prototypes, no page reload at all)

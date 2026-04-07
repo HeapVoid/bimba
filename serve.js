@@ -5,7 +5,78 @@ import path from 'path'
 import { theme } from './utils.js'
 import { printerr } from './plugin.js'
 
-const hmrClient = `
+// HMR client for CSS-only mode (injects styles without reload)
+const hmrClientCssOnly = `
+<script>
+	let _connected = false;
+	let _styleEl = null;
+
+	function connect() {
+		const ws = new WebSocket('ws://' + location.host + '/__hmr__');
+		ws.onopen = () => {
+			if (_connected) {
+				location.reload();
+			} else {
+				_connected = true;
+			}
+		};
+		ws.onmessage = (e) => {
+			const data = JSON.parse(e.data);
+			if (data.type === 'css-update') {
+				if (!_styleEl) {
+					_styleEl = document.createElement('style');
+					_styleEl.id = '__bimba_hmr_css__';
+					document.head.appendChild(_styleEl);
+				}
+				_styleEl.textContent = data.css;
+			} else if (data.type === 'reload') {
+				location.reload();
+			} else if (data.type === 'error') {
+				showError(data.file, data.errors);
+			} else if (data.type === 'clear-error') {
+				clearError();
+			}
+		};
+		ws.onclose = () => {
+			setTimeout(connect, 1000);
+		};
+	}
+
+	function showError(file, errors) {
+		let overlay = document.getElementById('__bimba_error__');
+		if (!overlay) {
+			overlay = document.createElement('div');
+			overlay.id = '__bimba_error__';
+			overlay.style.cssText = 'position:fixed;inset:0;z-index:99999;background:rgba(0,0,0,.85);display:flex;align-items:center;justify-content:center;font-family:monospace;padding:24px;box-sizing:border-box';
+			overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
+			document.body.appendChild(overlay);
+		}
+		overlay.innerHTML = \`
+			<div style="background:#1a1a1a;border:1px solid #ff4444;border-radius:8px;max-width:860px;width:100%;max-height:90vh;overflow:auto;box-shadow:0 0 40px rgba(255,68,68,.3)">
+				<div style="background:#ff4444;color:#fff;padding:10px 16px;font-size:13px;font-weight:600;display:flex;justify-content:space-between;align-items:center">
+					<span>Compile error — \${file}</span>
+					<span onclick="document.getElementById('__bimba_error__').remove()" style="cursor:pointer;opacity:.7;font-size:16px">✕</span>
+				</div>
+				\${errors.map(err => \`
+					<div style="padding:16px;border-bottom:1px solid #333">
+						<div style="color:#ff8080;font-size:13px;margin-bottom:10px">\${err.message}\${err.line ? \` <span style="color:#888">line \${err.line}</span>\` : ''}</div>
+						\${err.snippet ? \`<pre style="margin:0;padding:10px;background:#111;border-radius:4px;font-size:12px;line-height:1.6;color:#ccc;overflow-x:auto;white-space:pre">\${err.snippet.replace(/</g,'&lt;')}</pre>\` : ''}
+					</div>
+				\`).join('')}
+			</div>
+		\`;
+	}
+
+	function clearError() {
+		const overlay = document.getElementById('__bimba_error__');
+		if (overlay) overlay.remove();
+	}
+
+	connect();
+</script>`
+
+// Full HMR client (swaps component prototypes and resets elements)
+const hmrClientFull = `
 <script>
 	const _originalDefine = customElements.define.bind(customElements);
 	const _registry = new Map();
@@ -113,6 +184,8 @@ const hmrClient = `
 </script>`
 
 const _compileCache = new Map()
+// Store previous versions to detect what changed
+const _versionHistory = new Map()
 
 async function compileFile(filepath) {
 	const file = Bun.file(filepath)
@@ -122,8 +195,25 @@ async function compileFile(filepath) {
 	if (cached && cached.mtime === mtime) return { ...cached.result, cached: true }
 	const code = await file.text()
 	const result = compiler.compile(code, { sourcePath: filepath, platform: 'browser', sourcemap: 'inline' })
+	
+	// Track what changed compared to previous version
+	const prev = _versionHistory.get(filepath)
+	let changeType = 'full' // default
+	if (prev) {
+		const cssChanged = prev.css !== result.css
+		const jsChanged = prev.js !== result.js
+		if (cssChanged && !jsChanged) {
+			changeType = 'css-only'
+		} else if (jsChanged) {
+			changeType = 'full'
+		} else {
+			changeType = 'none'
+		}
+	}
+	
+	_versionHistory.set(filepath, { css: result.css, js: result.js })
 	_compileCache.set(filepath, { mtime, result })
-	return result
+	return { ...result, changeType }
 }
 
 function findHtml(flagHtml) {
@@ -165,12 +255,14 @@ async function buildImportMap() {
 // - removes existing importmap block
 // - removes <script data-bimba> from its position
 // - injects importmap + entrypoint script + HMR client before </head>
-function transformHtml(html, entrypoint, importMapTag) {
+function transformHtml(html, entrypoint, importMapTag, hmrMode) {
 	html = html.replace(/<script\s+type=["']importmap["'][^>]*>[\s\S]*?<\/script>/gi, '');
 	html = html.replace(/<script([^>]*)\bdata-entrypoint\b([^>]*)><\/script>/gi, '');
 
 	const entryUrl = '/' + entrypoint.replace(/^\.\//, '').replaceAll('\\', '/');
 	const entryScript = `\t\t<script type='module' src='${entryUrl}'></script>`;
+	
+	const hmrClient = hmrMode === 'full' ? hmrClientFull : hmrClientCssOnly;
 
 	html = html.replace('</head>', `${importMapTag}\n${entryScript}\n${hmrClient}\n\t</head>`);
 	return html;
@@ -183,6 +275,7 @@ export function serve(entrypoint, flags) {
 	const srcDir = path.dirname(entrypoint)
 	const sockets = new Set()
 	let importMapTag = null
+	const hmrMode = flags.hmrMode || 'css'
 
 	let _fadeTimers = []
 	let _fadeId = 0
@@ -206,7 +299,7 @@ export function serve(entrypoint, flags) {
 		if (errors?.length) {
 			process.stdout.write(`  ${theme.folder(now)}  ${theme.filename(file)}  ${status}\n`)
 			for (const err of errors) {
-				printerr(err)
+				try { printerr(err) } catch(_) { process.stdout.write('  ' + err.message + '\n') }
 			}
 		} else {
 			const myId = ++_fadeId
@@ -255,7 +348,7 @@ export function serve(entrypoint, flags) {
 				const htmlFile = pathname === '/' ? htmlPath : '.' + pathname
 				let html = await Bun.file(htmlFile).text()
 				if (!importMapTag) importMapTag = await buildImportMap()
-				html = transformHtml(html, entrypoint, importMapTag)
+				html = transformHtml(html, entrypoint, importMapTag, hmrMode)
 				return new Response(html, { headers: { 'Content-Type': 'text/html' } })
 			}
 
@@ -274,10 +367,29 @@ export function serve(entrypoint, flags) {
 					if (!out.cached) {
 						printStatus(file, 'ok')
 						for (const socket of sockets) socket.send(JSON.stringify({ type: 'clear-error' }))
+						
+						// Send appropriate update type based on HMR mode and what changed
+						if (hmrMode === 'full') {
+							// Full mode: send 'update' for prototype swapping (CSS is included in JS via runtime)
+							for (const socket of sockets) socket.send(JSON.stringify({ type: 'update', file }))
+						} else {
+							// CSS-only mode
+							if (out.changeType === 'css-only') {
+								// Only CSS changed: inject styles without reload
+								for (const socket of sockets) socket.send(JSON.stringify({ type: 'css-update', file, css: out.css }))
+							} else if (out.changeType === 'full') {
+								// JS changed in CSS-only mode: full page reload
+								for (const socket of sockets) socket.send(JSON.stringify({ type: 'reload' }))
+							}
+							// 'none' change type: do nothing, already up-to-date
+						}
 					}
 					return new Response(out.js, { headers: { 'Content-Type': 'application/javascript' } })
 				} catch (e) {
-					console.error(theme.failure('Compile error: ') + theme.filename(pathname) + '\n' + e.message)
+					const file = pathname.replace(/^\//, '')
+					printStatus(file, 'fail', [{ message: e.message }])
+					const payload = JSON.stringify({ type: 'error', file, errors: [{ message: e.message, snippet: e.stack || e.message }] })
+					for (const socket of sockets) socket.send(payload)
 					return new Response(e.message, { status: 500 })
 				}
 			}
@@ -293,7 +405,7 @@ export function serve(entrypoint, flags) {
 			if (!lastSegment.includes('.')) {
 				let html = await Bun.file(htmlPath).text()
 				if (!importMapTag) importMapTag = await buildImportMap()
-				html = transformHtml(html, entrypoint, importMapTag)
+				html = transformHtml(html, entrypoint, importMapTag, hmrMode)
 				return new Response(html, { headers: { 'Content-Type': 'text/html' } })
 			}
 			return new Response('Not Found', { status: 404 })
