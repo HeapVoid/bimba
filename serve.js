@@ -5,83 +5,138 @@ import path from 'path'
 import { theme } from './utils.js'
 import { printerr } from './plugin.js'
 
-// HMR client — single mode with debounced updates and element discard
+// ─── HMR Client (injected into browser) ──────────────────────────────────────
+
 const hmrClient = `
 <script>
-	const _originalDefine = customElements.define.bind(customElements);
-	const _registry = new Map();
-	const _updated = new Set();
+(function() {
+	// ── Custom element registry with prototype patching ────────────────────────
+	//
+	// On initial page load: tags are not registered yet → call original define,
+	// store the class in _classes map.
+	//
+	// On hot reload: the re-imported module calls customElements.define() again.
+	// The tag is already registered (browser ignores duplicate defines).
+	// Instead of ignoring the new class, we patch the prototype of the original
+	// class with all new methods. This means:
+	//   - Existing element instances immediately get new render/methods
+	//   - Instance properties (el.active, el.count, etc.) are preserved
+	//   - CSS is auto-updated by imba_styles.register() during module execution
+	//
+	const _origDefine = customElements.define.bind(customElements);
+	const _classes = new Map(); // tagName → first-registered constructor
+	let _hotTags = [];          // tags defined during the current hot import
 
 	customElements.define = function(name, cls, opts) {
-		const existing = _registry.get(name);
-		if (existing) {
-			Object.getOwnPropertyNames(cls.prototype).forEach(key => {
-				if (key === 'constructor') return;
-				try { Object.defineProperty(existing.prototype, key, Object.getOwnPropertyDescriptor(cls.prototype, key)); } catch(e) {}
-			});
-			Object.getOwnPropertyNames(cls).forEach(key => {
-				if (['length','name','prototype','arguments','caller'].includes(key)) return;
-				try { Object.defineProperty(existing, key, Object.getOwnPropertyDescriptor(cls, key)); } catch(e) {}
-			});
-			_updated.add(name);
+		_hotTags.push(name);
+		const existing = customElements.get(name);
+		if (!existing) {
+			_origDefine(name, cls, opts);
+			_classes.set(name, cls);
 		} else {
-			_registry.set(name, cls);
-			_originalDefine(name, cls, opts);
+			const target = _classes.get(name);
+			if (target) _patchClass(target, cls);
 		}
 	};
 
-	function doRefresh() {
-		_updated.clear();
-		if (typeof imba !== 'undefined') {
-			if (imba.scheduler && imba.scheduler.add) {
-				imba.scheduler.add('commit');
-			} else if (imba.commit) {
-				imba.commit();
-			}
+	const _skipStatics = new Set(['length', 'name', 'prototype', 'caller', 'arguments']);
+
+	// Copy all own property descriptors from source to target, skipping keys
+	// that match the shouldSkip predicate. Handles both string and symbol keys.
+	function _copyDescriptors(target, source, shouldSkip) {
+		for (const key of Object.getOwnPropertyNames(source)) {
+			if (shouldSkip(key)) continue;
+			const d = Object.getOwnPropertyDescriptor(source, key);
+			if (d) try { Object.defineProperty(target, key, d); } catch(_) {}
+		}
+		for (const key of Object.getOwnPropertySymbols(source)) {
+			const d = Object.getOwnPropertyDescriptor(source, key);
+			if (d) try { Object.defineProperty(target, key, d); } catch(_) {}
 		}
 	}
 
-	let _pending = false;
-
-	function scheduleRefresh(file) {
-		if (_pending) return;
-		_pending = true;
-		doRefresh();
-		_pending = false;
+	function _patchClass(target, source) {
+		_copyDescriptors(target.prototype, source.prototype, k => k === 'constructor');
+		_copyDescriptors(target, source, k => _skipStatics.has(k));
 	}
 
+	// ── HMR update handler ─────────────────────────────────────────────────────
+
+	function _applyUpdate(file) {
+		clearError();
+		_hotTags = [];
+
+		import('/' + file + '?t=' + Date.now()).then(() => {
+			const updatedTags = _hotTags.slice();
+			_hotTags = [];
+
+			// Always remove duplicate root elements. Re-importing a module with a
+			// fresh ?t= query causes top-level code (e.g. imba.mount()) to run again,
+			// which can append a second copy of the root tag to body.
+			const seen = new Set();
+			[...document.body.children].forEach(el => {
+				const tag = el.tagName.toLowerCase();
+				if (seen.has(tag)) el.remove();
+				else seen.add(tag);
+			});
+
+			// JS changed: find all instances of the updated tag types, reset their
+			// render output (innerHTML), then let imba re-render from current state.
+			//
+			// innerHTML = '' removes rendered DOM children but does NOT touch instance
+			// properties — so el.active, el.selectedTab etc. survive.
+			//
+			// We also clear any symbol keys that point to DOM Nodes (Imba's render
+			// cache) so the new render method (which uses new module-scoped symbols)
+			// starts clean and doesn't leave orphaned nodes.
+
+			const toReset = new Set();
+
+			updatedTags.forEach(tagName => {
+				document.querySelectorAll(tagName).forEach(el => {
+					toReset.add(el);
+				});
+			});
+
+			toReset.forEach(el => {
+				// Clear Imba render cache (symbol → Node mappings)
+				Object.getOwnPropertySymbols(el).forEach(s => {
+					try { if (el[s] instanceof Node) el[s] = undefined; } catch(_) {}
+				});
+				el.innerHTML = '';
+			});
+
+			if (toReset.size > 0 && typeof imba !== 'undefined') {
+				imba.commit();
+			}
+		});
+	}
+
+	// ── WebSocket connection ───────────────────────────────────────────────────
+
 	let _connected = false;
-	let _overlay = null;
 
 	function connect() {
 		const ws = new WebSocket('ws://' + location.host + '/__hmr__');
+
 		ws.onopen = () => {
-			if (_connected) {
-				location.reload();
-			} else {
-				_connected = true;
-			}
+			// If we reconnect after a disconnect, reload to get fresh state
+			if (_connected) location.reload();
+			else _connected = true;
 		};
+
 		ws.onmessage = (e) => {
-			const data = JSON.parse(e.data);
-			if (data.type === 'update') {
-				clearError();
-				_updated.clear();
-				import('/' + data.file + '?t=' + Date.now()).then(() => {
-					scheduleRefresh(data.file);
-				});
-			} else if (data.type === 'reload') {
-				location.reload();
-			} else if (data.type === 'error') {
-				showError(data.file, data.errors);
-			} else if (data.type === 'clear-error') {
-				clearError();
-			}
+			const msg = JSON.parse(e.data);
+			if      (msg.type === 'update')      _applyUpdate(msg.file);
+			else if (msg.type === 'reload')      location.reload();
+			else if (msg.type === 'error')       showError(msg.file, msg.errors);
+			else if (msg.type === 'clear-error') clearError();
 		};
-		ws.onclose = () => {
-			setTimeout(connect, 1000);
-		};
+
+		ws.onclose = () => setTimeout(connect, 1000);
 	}
+
+	// ── Error overlay ──────────────────────────────────────────────────────────
 
 	function showError(file, errors) {
 		let overlay = document.getElementById('__bimba_error__');
@@ -89,7 +144,7 @@ const hmrClient = `
 			overlay = document.createElement('div');
 			overlay.id = '__bimba_error__';
 			overlay.style.cssText = 'position:fixed;inset:0;z-index:99999;background:rgba(0,0,0,.85);display:flex;align-items:center;justify-content:center;font-family:monospace;padding:24px;box-sizing:border-box';
-			overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
+			overlay.addEventListener('click', e => { if (e.target === overlay) overlay.remove(); });
 			document.body.appendChild(overlay);
 		}
 		overlay.innerHTML = \`
@@ -114,39 +169,36 @@ const hmrClient = `
 	}
 
 	connect();
+})();
 </script>`
 
-const _compileCache = new Map()
-const _versionHistory = new Map()
+// ─── Server-side compile cache ────────────────────────────────────────────────
+
+const _compileCache = new Map()  // filepath → { mtime, result }
+const _prevJs = new Map()  // filepath → compiled js — for change detection
 
 async function compileFile(filepath) {
 	const file = Bun.file(filepath)
 	const stat = await file.stat()
 	const mtime = stat.mtime.getTime()
+
 	const cached = _compileCache.get(filepath)
-	if (cached && cached.mtime === mtime) return { ...cached.result, cached: true }
+	if (cached && cached.mtime === mtime) return { ...cached.result, changeType: 'cached' }
+
 	const code = await file.text()
-	const result = compiler.compile(code, { sourcePath: filepath, platform: 'browser', sourcemap: 'inline' })
-	
-	// Track what changed compared to previous version
-	const prev = _versionHistory.get(filepath)
-	let changeType = 'full'
-	if (prev) {
-		const cssChanged = prev.css !== result.css
-		const jsChanged = prev.js !== result.js
-		if (cssChanged && !jsChanged) {
-			changeType = 'css-only'
-		} else if (jsChanged) {
-			changeType = 'full'
-		} else if (!cssChanged && !jsChanged) {
-			changeType = 'none'
-		}
-	}
-	
-	_versionHistory.set(filepath, { css: result.css, js: result.js })
+	const result = compiler.compile(code, {
+		sourcePath: filepath,
+		platform: 'browser',
+		sourcemap: 'inline',
+	})
+
+	const changeType = _prevJs.get(filepath) === result.js ? 'none' : 'full'
+	_prevJs.set(filepath, result.js)
 	_compileCache.set(filepath, { mtime, result })
 	return { ...result, changeType }
 }
+
+// ─── HTML helpers ─────────────────────────────────────────────────────────────
 
 function findHtml(flagHtml) {
 	if (flagHtml) return flagHtml;
@@ -154,12 +206,12 @@ function findHtml(flagHtml) {
 	return candidates.find(p => existsSync(p)) || './index.html';
 }
 
-// Build importmap from package.json dependencies.
+// Build an ES import map from package.json dependencies.
 // Packages with an .imba entry point are served locally; others via esm.sh.
 async function buildImportMap() {
 	const imports = {
-		"imba/runtime": "https://esm.sh/imba/runtime",
-		"imba": "https://esm.sh/imba"
+		'imba/runtime': 'https://esm.sh/imba/runtime',
+		'imba': 'https://esm.sh/imba',
 	};
 	try {
 		const pkg = JSON.parse(await Bun.file('./package.json').text());
@@ -168,43 +220,42 @@ async function buildImportMap() {
 			try {
 				const depPkg = JSON.parse(await Bun.file(`./node_modules/${name}/package.json`).text());
 				const entry = depPkg.module || depPkg.main;
-				if (entry && entry.endsWith('.imba')) {
-					imports[name] = `/node_modules/${name}/${entry}`;
-				} else {
-					imports[name] = `https://esm.sh/${name}`;
-				}
-			} catch(e) {
+				imports[name] = (entry && entry.endsWith('.imba'))
+					? `/node_modules/${name}/${entry}`
+					: `https://esm.sh/${name}`;
+			} catch(_) {
 				imports[name] = `https://esm.sh/${name}`;
 			}
 		}
-	} catch(e) { /* no package.json, use defaults */ }
+	} catch(_) { /* no package.json */ }
 
-	const json = JSON.stringify({ imports }, null, '\t\t\t\t');
-	return `\t\t<script type="importmap">\n\t\t\t${json}\n\t\t</script>`;
+	return `\t\t<script type="importmap">\n\t\t\t${JSON.stringify({ imports }, null, '\t\t\t\t')}\n\t\t</script>`;
 }
 
-// Transform production HTML for dev:
-// - removes existing importmap block
-// - removes <script data-bimba> from its position
-// - injects importmap + entrypoint script + HMR client before </head>
+// Rewrite production HTML for the dev server:
+// strips existing importmap + data-entrypoint script, injects importmap +
+// entrypoint module + HMR client before </head>.
 function transformHtml(html, entrypoint, importMapTag) {
 	html = html.replace(/<script\s+type=["']importmap["'][^>]*>[\s\S]*?<\/script>/gi, '');
 	html = html.replace(/<script([^>]*)\bdata-entrypoint\b([^>]*)><\/script>/gi, '');
-
 	const entryUrl = '/' + entrypoint.replace(/^\.\//, '').replaceAll('\\', '/');
-	const entryScript = `\t\t<script type='module' src='${entryUrl}'></script>`;
-
-	html = html.replace('</head>', `${importMapTag}\n${entryScript}\n${hmrClient}\n\t</head>`);
+	html = html.replace('</head>',
+		`${importMapTag}\n\t\t<script type='module' src='${entryUrl}'></script>\n${hmrClient}\n\t</head>`
+	);
 	return html;
 }
 
+// ─── Dev server ───────────────────────────────────────────────────────────────
+
 export function serve(entrypoint, flags) {
-	const port = flags.port || 5200
+	const port    = flags.port || 5200
 	const htmlPath = findHtml(flags.html)
-	const htmlDir = path.dirname(htmlPath)
-	const srcDir = path.dirname(entrypoint)
-	const sockets = new Set()
+	const htmlDir  = path.dirname(htmlPath)
+	const srcDir   = path.dirname(entrypoint)
+	const sockets  = new Set()
 	let importMapTag = null
+
+	// ── Status line (prints current compile result, fades out on success) ──────
 
 	let _fadeTimers = []
 	let _fadeId = 0
@@ -223,8 +274,10 @@ export function serve(entrypoint, flags) {
 		}
 		const now = new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
 		const status = state === 'ok' ? theme.success(' ok ') : theme.failure(' fail ')
+
 		process.stdout.write('\x1b[s')
 		_statusSaved = true
+
 		if (errors?.length) {
 			process.stdout.write(`  ${theme.folder(now)}  ${theme.filename(file)}  ${status}\n`)
 			for (const err of errors) {
@@ -233,22 +286,23 @@ export function serve(entrypoint, flags) {
 		} else {
 			const myId = ++_fadeId
 			const plainLine = `  ${now}  ${file}   ok `
-			const totalLen = plainLine.length
-			const startDelay = 5000
-			const charDelay = 22
-
+			const total = plainLine.length
 			process.stdout.write(`  ${theme.folder(now)}  ${theme.filename(file)}  ${status}`)
-
-			for (let i = 1; i <= totalLen; i++) {
+			for (let i = 1; i <= total; i++) {
 				_fadeTimers.push(setTimeout(() => {
 					if (_fadeId !== myId) return
 					process.stdout.write('\x1b[1D \x1b[1D')
-					if (i === totalLen) {
-						_statusSaved = false
-					}
-				}, startDelay + i * charDelay))
+					if (i === total) _statusSaved = false
+				}, 5000 + i * 22))
 			}
 		}
+	}
+
+	// ── File watcher ───────────────────────────────────────────────────────────
+
+	function broadcast(payload) {
+		const msg = JSON.stringify(payload)
+		for (const socket of sockets) socket.send(msg)
 	}
 
 	const _debounce = new Map()
@@ -266,20 +320,27 @@ export function serve(entrypoint, flags) {
 
 			if (out.errors?.length) {
 				printStatus(rel, 'fail', out.errors)
-				const payload = JSON.stringify({ type: 'error', file: rel, errors: out.errors.map(e => ({ message: e.message, line: e.range?.start?.line, snippet: e.toSnippet() })) })
-				for (const socket of sockets) socket.send(payload)
+				broadcast({ type: 'error', file: rel, errors: out.errors.map(e => ({
+					message: e.message,
+					line: e.range?.start?.line,
+					snippet: e.toSnippet(),
+				})) })
 				return
 			}
 
+			// No change at all — skip
+			if (out.changeType === 'none' || out.changeType === 'cached') return
+
 			printStatus(rel, 'ok')
-			for (const socket of sockets) socket.send(JSON.stringify({ type: 'clear-error' }))
-			for (const socket of sockets) socket.send(JSON.stringify({ type: 'update', file: rel }))
-		} catch (e) {
+			broadcast({ type: 'clear-error' })
+			broadcast({ type: 'update', file: rel })
+		} catch(e) {
 			printStatus(rel, 'fail', [{ message: e.message }])
-			const payload = JSON.stringify({ type: 'error', file: rel, errors: [{ message: e.message, snippet: e.stack || e.message }] })
-			for (const socket of sockets) socket.send(payload)
+			broadcast({ type: 'error', file: rel, errors: [{ message: e.message, snippet: e.stack || e.message }] })
 		}
 	})
+
+	// ── HTTP + WebSocket server ────────────────────────────────────────────────
 
 	bunServe({
 		port,
@@ -289,63 +350,72 @@ export function serve(entrypoint, flags) {
 			const url = new URL(req.url)
 			const pathname = url.pathname
 
+			// WebSocket upgrade for HMR
 			if (pathname === '/__hmr__') {
 				if (server.upgrade(req)) return undefined
 			}
 
+			// HTML: index or any .html file
 			if (pathname === '/' || pathname.endsWith('.html')) {
 				const htmlFile = pathname === '/' ? htmlPath : '.' + pathname
 				let html = await Bun.file(htmlFile).text()
 				if (!importMapTag) importMapTag = await buildImportMap()
-				html = transformHtml(html, entrypoint, importMapTag)
-				return new Response(html, { headers: { 'Content-Type': 'text/html' } })
+				return new Response(transformHtml(html, entrypoint, importMapTag), {
+					headers: { 'Content-Type': 'text/html' },
+				})
 			}
 
+			// Imba files: compile on demand and serve as JS
 			if (pathname.endsWith('.imba')) {
+				const filepath = '.' + pathname
 				try {
-					const out = await compileFile('.' + pathname)
-					const file = pathname.replace(/^\//, '')
+					const out = await compileFile(filepath)
 					if (out.errors?.length) {
+						const file = pathname.replace(/^\//, '')
 						printStatus(file, 'fail', out.errors)
-						const payload = JSON.stringify({ type: 'error', file, errors: out.errors.map(e => ({ message: e.message, line: e.range?.start?.line, snippet: e.toSnippet() })) })
-						for (const socket of sockets) socket.send(payload)
+						broadcast({ type: 'error', file, errors: out.errors.map(e => ({
+							message: e.message,
+							line: e.range?.start?.line,
+							snippet: e.toSnippet(),
+						})) })
 						return new Response(out.errors.map(e => e.message).join('\n'), { status: 500 })
 					}
-					// Don't send HMR events from on-demand requests - only from file watcher
 					return new Response(out.js, { headers: { 'Content-Type': 'application/javascript' } })
-				} catch (e) {
+				} catch(e) {
 					const file = pathname.replace(/^\//, '')
 					printStatus(file, 'fail', [{ message: e.message }])
-					const payload = JSON.stringify({ type: 'error', file, errors: [{ message: e.message, snippet: e.stack || e.message }] })
-					for (const socket of sockets) socket.send(payload)
+					broadcast({ type: 'error', file, errors: [{ message: e.message, snippet: e.stack || e.message }] })
 					return new Response(e.message, { status: 500 })
 				}
 			}
 
-			// Static files: check htmlDir first (assets relative to HTML), then root (node_modules, src, etc.)
-			const htmlDirFile = Bun.file(path.join(htmlDir, pathname))
-			if (await htmlDirFile.exists()) return new Response(htmlDirFile)
-			const file = Bun.file('.' + pathname)
-			if (await file.exists()) return new Response(file)
+			// Static files: check htmlDir first (for assets relative to HTML), then root
+			const inHtmlDir = Bun.file(path.join(htmlDir, pathname))
+			if (await inHtmlDir.exists()) return new Response(inHtmlDir)
+			const inRoot = Bun.file('.' + pathname)
+			if (await inRoot.exists()) return new Response(inRoot)
 
-			// SPA fallback: serve index.html only for URL-like paths (no file extension)
+			// SPA fallback for extension-less paths
 			const lastSegment = pathname.split('/').pop()
 			if (!lastSegment.includes('.')) {
 				let html = await Bun.file(htmlPath).text()
 				if (!importMapTag) importMapTag = await buildImportMap()
-				html = transformHtml(html, entrypoint, importMapTag)
-				return new Response(html, { headers: { 'Content-Type': 'text/html' } })
+				return new Response(transformHtml(html, entrypoint, importMapTag), {
+					headers: { 'Content-Type': 'text/html' },
+				})
 			}
+
 			return new Response('Not Found', { status: 404 })
 		},
 
 		websocket: {
-			open: (ws) => sockets.add(ws),
-			close: (ws) => sockets.delete(ws),
-		}
+			open:    ws => sockets.add(ws),
+			close:   ws => sockets.delete(ws),
+			message: () => {},
+		},
 	})
 
 	console.log(theme.folder('──────────────────────────────────────────────────────────────────────'))
-	console.log(theme.start(`Dev server running at `) + theme.success(`http://localhost:${port}`))
+	console.log(theme.start('Dev server running at ') + theme.success(`http://localhost:${port}`))
 	console.log(theme.folder('──────────────────────────────────────────────────────────────────────'))
 }

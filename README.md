@@ -40,6 +40,18 @@ bunx bimba src/index.imba --serve --port 5200 --html public/index.html
 - Injects an importmap built from your `package.json` dependencies
 - Injects an HMR client that swaps component prototypes without a full page reload
 
+**HMR internals:**
+
+When a file changes, the server recompiles it and sends an `update` message over WebSocket. The browser re-imports the module with a fresh `?t=` cache-bust query.
+
+Since Imba custom elements can't be registered twice (`customElements.define` throws on duplicates), bimba intercepts all `define` calls. On first load the class is registered normally and stored in a map. On hot reload, instead of registering again, bimba copies all methods and static properties from the new class onto the original class prototype — so existing element instances in the DOM immediately get the new `render()` and other methods without losing their state (`el.active`, `el.count`, etc.).
+
+After patching, bimba clears each element's Imba render cache (anonymous `Symbol` keys pointing to DOM nodes) and sets `innerHTML = ''`, so the new render method starts from a clean slate. Then `imba.commit()` triggers a re-render of all mounted components.
+
+CSS is handled automatically: Imba's runtime calls `imba_styles.register()` during module execution, which updates the `<style>` tag in place — no extra DOM work needed.
+
+Duplicate root elements (caused by `imba.mount()` running again on re-import) are removed by a dedup pass over `document.body.children` before any other HMR logic runs.
+
 **HTML setup:** add a `data-entrypoint` attribute to the script tag that loads your bundle. The dev server will replace it with your `.imba` entrypoint and inject the importmap above it:
 
 ```html
@@ -53,10 +65,6 @@ bunx bimba src/index.imba --serve --port 5200 --html public/index.html
 `--port <number>` — port to listen on (default: `5200`)
 
 `--html <path>` — path to your HTML file (auto-detected from `./index.html`, `./public/index.html`, `./src/index.html` if omitted)
-
-`--hmr-mode <css|full>` — HMR mode (default: `css`)
-  - `css` — CSS-only hot reload (injects styles instantly, full reload on JS changes)
-  - `full` — full HMR with element swapping (prototype replacement, no page reload)
 
 Static files are resolved relative to the HTML file's directory first, then from the project root (for `node_modules`, `src`, etc.).
 
@@ -95,7 +103,3 @@ bunx bimba src/index.imba --outdir public/js --watch --clearcache
 `--port <number>` — port for the dev server (default: `5200`). Used with `--serve`.
 
 `--html <path>` — custom HTML file path. Used with `--serve`.
-
-`--hmr-mode <css|full>` — HMR mode for dev server (default: `css`)
-  - `css` — CSS-only hot reload (injects styles instantly without reload, triggers full reload only when JS changes)
-  - `full` — full HMR with element swapping (swaps component prototypes, no page reload at all)
