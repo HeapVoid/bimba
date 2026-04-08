@@ -67,11 +67,10 @@ const hmrClient = `
 		_hotTags = [];
 
 		import('/' + file + '?t=' + Date.now()).then(() => {
-			const updatedTags = _hotTags.slice();
 			_hotTags = [];
 
-			// Always remove duplicate root elements. Re-importing a module with a
-			// fresh ?t= query causes top-level code (e.g. imba.mount()) to run again,
+			// Remove duplicate root elements. Re-importing a module with a fresh
+			// ?t= query causes top-level code (e.g. imba.mount()) to run again,
 			// which can append a second copy of the root tag to body.
 			const seen = new Set();
 			[...document.body.children].forEach(el => {
@@ -80,35 +79,12 @@ const hmrClient = `
 				else seen.add(tag);
 			});
 
-			// JS changed: find all instances of the updated tag types, reset their
-			// render output (innerHTML), then let imba re-render from current state.
-			//
-			// innerHTML = '' removes rendered DOM children but does NOT touch instance
-			// properties — so el.active, el.selectedTab etc. survive.
-			//
-			// We also clear any symbol keys that point to DOM Nodes (Imba's render
-			// cache) so the new render method (which uses new module-scoped symbols)
-			// starts clean and doesn't leave orphaned nodes.
-
-			const toReset = new Set();
-
-			updatedTags.forEach(tagName => {
-				document.querySelectorAll(tagName).forEach(el => {
-					toReset.add(el);
-				});
-			});
-
-			toReset.forEach(el => {
-				// Clear Imba render cache (symbol → Node mappings)
-				Object.getOwnPropertySymbols(el).forEach(s => {
-					try { if (el[s] instanceof Node) el[s] = undefined; } catch(_) {}
-				});
-				el.innerHTML = '';
-			});
-
-			if (toReset.size > 0 && typeof imba !== 'undefined') {
-				imba.commit();
-			}
+			// Let Imba re-render in place from the patched prototypes. We do NOT
+			// touch instance DOM (no innerHTML reset, no symbol cleanup) — that
+			// would destroy rendered children like open popups / dropdowns and
+			// collapse any transient UI state. Prototype patching already makes
+			// the next render use the new methods; imba.commit() triggers it.
+			if (typeof imba !== 'undefined') imba.commit();
 		});
 	}
 
@@ -260,6 +236,7 @@ export function serve(entrypoint, flags) {
 	let _fadeTimers = []
 	let _fadeId = 0
 	let _statusSaved = false
+	const _isTTY = process.stdout.isTTY
 
 	function cancelFade() {
 		_fadeTimers.forEach(t => clearTimeout(t))
@@ -267,6 +244,22 @@ export function serve(entrypoint, flags) {
 	}
 
 	function printStatus(file, state, errors) {
+		// non-TTY (pipes, Claude Code bash, CI): plain newline-terminated output,
+		// no ANSI cursor tricks, no fade-out — so logs stay readable.
+		if (!_isTTY) {
+			const now = new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+			const tag = state === 'ok' ? 'ok' : 'fail'
+			process.stdout.write(`  ${now}  ${file}  ${tag}\n`)
+			if (errors?.length) {
+				for (const err of errors) {
+					const msg = err.message || String(err)
+					const line = err.range?.start?.line
+					process.stdout.write(`    ${msg}${line ? ` (line ${line})` : ''}\n`)
+				}
+			}
+			return
+		}
+
 		cancelFade()
 		if (_statusSaved) {
 			process.stdout.write('\x1b[u\x1b[J')
