@@ -25,6 +25,8 @@ const hmrClient = `
 	//
 	const _origDefine = customElements.define.bind(customElements);
 	const _classes = new Map(); // tagName → first-registered constructor
+	const _newClasses = new Map(); // tagName → latest class from HMR import
+	const _oldNs = new Map();  // tagName → previous _ns_ (saved before _patchClass wipes it)
 	let _collector = null;      // when set, captures tag names defined during one HMR import
 
 	customElements.define = function(name, cls, opts) {
@@ -34,8 +36,13 @@ const hmrClient = `
 			_origDefine(name, cls, opts);
 			_classes.set(name, cls);
 		} else {
+			_newClasses.set(name, cls);
 			const target = _classes.get(name);
-			if (target) _patchClass(target, cls);
+			if (target) {
+				// Save old _ns_ before _patchClass overwrites prototype descriptors
+				if (target.prototype._ns_) _oldNs.set(name, target.prototype._ns_);
+				_patchClass(target, cls);
+			}
 		}
 	};
 
@@ -92,17 +99,10 @@ const hmrClient = `
 	async function _doUpdate(file, slots) {
 		clearError();
 
-		// Snapshot direct body children BEFORE importing the new module, so we
-		// know which elements pre-existed. After commit we only dedupe NEW
-		// elements whose tag also existed before — this preserves legitimate
-		// multi-instance roots like toasts and parallel popups, while still
-		// catching accidental re-mounts from re-running top-level code.
 		const bodyBefore = new Set(document.body.children);
 		const tagsBefore = new Set();
 		for (const el of bodyBefore) tagsBefore.add(el.tagName.toLowerCase());
 
-		// Use a local collector instead of a shared variable so concurrent
-		// imports can't clobber each other's tag lists.
 		const collected = [];
 		const prev = _collector;
 		_collector = collected;
@@ -112,118 +112,76 @@ const hmrClient = `
 			_collector = prev;
 		}
 
-		// Two HMR paths depending on whether render-cache slot symbols are
-		// stable across this re-import:
-		//
-		// 'stable': server-side symbol stabilization made the new module's
-		//   anonymous Symbols identical (by reference) to the previous
-		//   compilation. Live element instances still have valid slot
-		//   references → imba's renderer will diff and update the existing
-		//   DOM in place. We just patch class prototypes (already done in
-		//   the customElements.define hook above) and call imba.commit().
-		//   No DOM destruction, full inner state preserved.
-		//
-		// 'shifted': slot count changed (user added/removed elements), so
-		//   stabilization can't safely reuse symbols. Fall back to the
-		//   destructive path: snapshot own enumerable properties, wipe
-		//   ANONYMOUS symbol slots only (preserve global Symbol.for keys
-		//   that imba's runtime uses for lifecycle), clear innerHTML,
-		//   restore state, re-render. Loses inner DOM state for instances
-		//   of the patched tags, but preserves their instance fields.
-		// Snapshot child counts of the patched tags BEFORE commit. On the
-		// stable path, child count must not grow — if it does, it means slot
-		// stabilization failed for this edit and imba's renderer appended
-		// fresh children alongside the old ones. That's the duplication bug
-		// we cannot recover from in-place → trigger a reload.
-		const childSnap = new Map();
+		// Sync _ns_ (CSS namespace) from the new classes. imba_defineTag sets
+		// _ns_ on NewClass.prototype AFTER register$ calls customElements.define,
+		// so _patchClass missed it. Now that import is done, all _ns_ values are set.
+		// Save old→new mapping for className patching below.
+		const _nsPatches = []; // [{ oldParts, newParts }]
 		for (const tag of collected) {
-			const list = document.querySelectorAll(tag);
-			for (const el of list) childSnap.set(el, el.children.length);
+			const newCls = _newClasses.get(tag);
+			const oldCls = _classes.get(tag);
+			const newNs = newCls?.prototype._ns_;
+			const oldNs = _oldNs.get(tag);
+			if (oldNs && newNs && oldNs !== newNs) {
+				oldCls.prototype._ns_ = newNs;
+				// _ns_ uses '_' separator (z12kthg6_bc), className uses '-' (z12kthg6-bc)
+				_nsPatches.push({
+					oldParts: oldNs.trim().split(/\\s+/).map(s => s.replace(/_/g, '-')),
+					newParts: newNs.trim().split(/\\s+/).map(s => s.replace(/_/g, '-')),
+				});
+			} else if (newNs && oldCls && oldCls.prototype._ns_ !== newNs) {
+				oldCls.prototype._ns_ = newNs;
+			}
+			_oldNs.delete(tag);
 		}
 
-		if (slots === 'shifted') {
-			for (const tag of collected) {
-				document.querySelectorAll(tag).forEach(el => {
-					const state = {};
-					for (const k of Object.keys(el)) state[k] = el[k];
-					_disconnectDescendants(el);
-					for (const sym of Object.getOwnPropertySymbols(el)) {
-						if (Symbol.keyFor(sym) !== undefined) continue;
-						try { delete el[sym]; } catch(_) {}
-					}
-					el.innerHTML = '';
-					Object.assign(el, state);
-					try { el.render && el.render(); } catch(_) {}
-					// Re-fire lifecycle for the top tag itself: imba compiles
-					// "def mount" to a mount() instance method, and standard
-					// connectedCallback may also matter for descendants created
-					// by render(). The element is still attached to its parent,
-					// so we just call them directly.
-					try { el.connectedCallback && el.connectedCallback(); } catch(_) {}
-					try { el.mount && el.mount(); } catch(_) {}
-				});
-			}
+		// Destructive HMR: wipe inner DOM and re-render each collected tag
+		for (const tag of collected) {
+			const els = document.querySelectorAll(tag);
+			els.forEach(el => {
+				const state = {};
+				for (const k of Object.keys(el)) state[k] = el[k];
+				_disconnectDescendants(el);
+				for (const sym of Object.getOwnPropertySymbols(el)) {
+					if (Symbol.keyFor(sym) !== undefined) continue;
+					try { delete el[sym]; } catch(_) {}
+				}
+				el.innerHTML = '';
+				Object.assign(el, state);
+				try { el.render && el.render(); } catch(e) { console.error('[bimba] render error:', e); }
+				try { el.connectedCallback && el.connectedCallback(); } catch(_) {}
+				try { el.mount && el.mount(); } catch(_) {}
+			});
 		}
 
 		if (typeof imba !== 'undefined') imba.commit();
 
-		// Stable-path duplication check.
-		if (slots !== 'shifted') {
-			for (const [el, before] of childSnap) {
-				if (el.children.length > before) {
-					console.warn('[bimba HMR] slot stabilization failed, reloading');
-					location.reload();
-					return;
+		// Patch className on ALL custom elements: replace old CSS namespace
+		// hashes with new ones. Must be global because subclass elements
+		// (e.g. panel-agent < basic-panel) inherit the parent's _ns_ hash
+		// but querySelectorAll('basic-panel') won't find them.
+		if (_nsPatches.length) {
+			document.querySelectorAll('*').forEach(el => {
+				if (!el.tagName.includes('-')) return;
+				let cn = el.className;
+				if (!cn) return;
+				let changed = false;
+				for (const { oldParts, newParts } of _nsPatches) {
+					for (let i = 0; i < Math.min(oldParts.length, newParts.length); i++) {
+						if (cn.includes(oldParts[i])) {
+							cn = cn.split(oldParts[i]).join(newParts[i]);
+							changed = true;
+						}
+					}
 				}
-			}
+				if (changed) el.className = cn;
+			});
 		}
 
-		// Smart body dedupe: remove only elements that were ADDED during this
-		// HMR cycle and whose tag already existed in body before. This catches
-		// accidental re-mounts from top-level imba.mount() re-runs, but
-		// preserves toasts, multiple modals, and devtools-injected siblings.
+		// Smart body dedupe: remove duplicate top-level elements created by re-import
 		for (const el of [...document.body.children]) {
 			if (bodyBefore.has(el)) continue;
 			if (tagsBefore.has(el.tagName.toLowerCase())) el.remove();
-		}
-
-		// Reap orphaned imba style blocks. Each compilation that produces a
-		// different content hash leaves behind a <style> whose rules target
-		// classnames no element in the DOM uses anymore. Walk our tracked
-		// styles and drop the unused ones — keeps head clean and removes
-		// stale rules that would otherwise still apply to live elements with
-		// matching classnames (e.g. a "stuck" old text color).
-		_reapStyles();
-	}
-
-	// ── Style reaper ───────────────────────────────────────────────────────────
-
-	// imba_styles.register inserts <style data-id="<hash>"> blocks into <head>.
-	// Walk them, sample a few class selectors, and check whether any element
-	// in the document still uses one of those classnames. If not, the block
-	// is dead (its tag was hot-replaced with a new content hash and the old
-	// classnames are gone from the DOM) — remove it.
-	function _reapStyles() {
-		const styles = document.head.querySelectorAll('style[data-id]');
-		for (const style of styles) {
-			try {
-				const sheet = style.sheet;
-				if (!sheet || !sheet.cssRules) continue;
-				const probes = [];
-				for (const rule of sheet.cssRules) {
-					if (probes.length >= 4) break;
-					const sel = rule.selectorText;
-					if (!sel) continue;
-					const m = sel.match(/\.(z[a-z0-9_-]+)/i);
-					if (m && !probes.includes(m[1])) probes.push(m[1]);
-				}
-				if (!probes.length) continue;
-				let used = false;
-				for (const cls of probes) {
-					if (document.querySelector('.' + CSS.escape(cls))) { used = true; break; }
-				}
-				if (!used) style.remove();
-			} catch(_) { /* cross-origin or detached */ }
 		}
 	}
 
@@ -235,7 +193,6 @@ const hmrClient = `
 		const ws = new WebSocket('ws://' + location.host + '/__hmr__');
 
 		ws.onopen = () => {
-			// If we reconnect after a disconnect, reload to get fresh state
 			if (_connected) location.reload();
 			else _connected = true;
 		};
@@ -343,14 +300,18 @@ function updateImportGraph(fromAbs, newDeps) {
 	_imports.set(fromAbs, newDeps)
 }
 
-function transitiveImporters(absFile) {
+function transitiveImporters(absFile, skip) {
 	const out = new Set()
 	const stack = [absFile]
 	while (stack.length) {
 		const cur = stack.pop()
 		const ups = _importers.get(cur)
 		if (!ups) continue
-		for (const u of ups) if (!out.has(u)) { out.add(u); stack.push(u) }
+		for (const u of ups) {
+			if (out.has(u) || (skip && skip.has(u))) continue
+			out.add(u)
+			stack.push(u)
+		}
 	}
 	return out
 }
@@ -385,6 +346,19 @@ function stabilizeSymbols(js, filepath) {
 	return { js: bootstrap + out, slotCount: count }
 }
 
+// Imba's compile result puts `errors` on the prototype as a getter, so plain
+// object spread (`{...result}`) silently strips it. We always normalize to a
+// plain shape with `errors` as an own property — otherwise downstream callers
+// see no errors and serve empty 200s for broken files.
+function _normalizeResult(result, extras) {
+	return {
+		js: result.js,
+		errors: result.errors || [],
+		slots: result.slots,
+		...extras,
+	}
+}
+
 async function compileFile(filepath) {
 	const abs = path.resolve(filepath)
 	const file = Bun.file(filepath)
@@ -392,7 +366,7 @@ async function compileFile(filepath) {
 	const mtime = stat.mtime.getTime()
 
 	const cached = _compileCache.get(abs)
-	if (cached && cached.mtime === mtime) return { ...cached.result, changeType: 'cached', slots: cached.slots }
+	if (cached && cached.mtime === mtime) return _normalizeResult(cached.result, { changeType: 'cached' })
 
 	const code = await file.text()
 	const result = compiler.compile(code, {
@@ -401,19 +375,22 @@ async function compileFile(filepath) {
 		sourcemap: 'inline',
 	})
 
-	if (!result.errors?.length && result.js) {
+	const errors = result.errors || []
+	if (!errors.length && result.js) {
 		const { js, slotCount } = stabilizeSymbols(result.js, filepath)
 		result.js = js
-		const prev = _prevSlots.get(filepath)
+		const prev = _prevSlots.get(abs)
 		result.slots = (prev === undefined || prev === slotCount) ? 'stable' : 'shifted'
-		_prevSlots.set(filepath, slotCount)
+		_prevSlots.set(abs, slotCount)
 		updateImportGraph(abs, extractImports(js, abs))
 	}
 
-	const changeType = _prevJs.get(abs) === result.js ? 'none' : 'full'
-	_prevJs.set(abs, result.js)
-	_compileCache.set(abs, { mtime, result, slots: result.slots })
-	return { ...result, changeType }
+	// Bake errors as an own property so caching/spreading preserves them.
+	const baked = { js: result.js, errors, slots: result.slots }
+	const changeType = _prevJs.get(abs) === baked.js ? 'none' : 'full'
+	_prevJs.set(abs, baked.js)
+	_compileCache.set(abs, { mtime, result: baked })
+	return _normalizeResult(baked, { changeType })
 }
 
 // ─── HTML helpers ─────────────────────────────────────────────────────────────
@@ -471,6 +448,7 @@ export function serve(entrypoint, flags) {
 	const htmlDir  = path.dirname(htmlPath)
 	const srcDir   = path.dirname(entrypoint)
 	const sockets  = new Set()
+	const entryAbs = path.resolve(entrypoint)
 	let importMapTag = null
 
 	// ── Status line (prints current compile result, fades out on success) ──────
@@ -545,13 +523,14 @@ export function serve(entrypoint, flags) {
 	watch(srcDir, { recursive: true }, async (_event, filename) => {
 		if (!filename || !filename.endsWith('.imba')) return
 		if (_debounce.has(filename)) return
-		_debounce.set(filename, setTimeout(() => _debounce.delete(filename), 50))
+		_debounce.set(filename, setTimeout(() => _debounce.delete(filename), 150))
 
 		const filepath = path.join(srcDir, filename)
 		const rel = path.join(path.relative('.', srcDir), filename).replaceAll('\\', '/')
 
 		try {
 			const out = await compileFile(filepath)
+
 
 			if (out.errors?.length) {
 				printStatus(rel, 'fail', out.errors)
@@ -568,19 +547,17 @@ export function serve(entrypoint, flags) {
 
 			printStatus(rel, 'ok')
 			broadcast({ type: 'clear-error' })
-			broadcast({ type: 'update', file: rel, slots: out.slots || 'shifted' })
+			broadcast({ type: 'update', file: rel, slots: 'shifted' })
 
-			// Cascade: re-import every module transitively importing this file.
-			// They don't need recompilation (their source didn't change), but
-			// their captured references to the changed module are stale, so we
-			// tell the client to re-import them. The client's HMR queue
-			// processes these in order; tag classes get re-patched, plain
-			// utility modules get fresh top-level state.
-			const ups = transitiveImporters(path.resolve(filepath))
+			// Cascade: re-import modules that transitively import this file.
+			// Skip the entry point — re-importing it re-runs imba.mount and
+			// recreates global services, and traversing through it would
+			// cascade to the entire project.
+			const ups = transitiveImporters(path.resolve(filepath), new Set([entryAbs]))
 			for (const upAbs of ups) {
 				const upRel = path.relative('.', upAbs).replaceAll('\\', '/')
 				const cached = _compileCache.get(upAbs)
-				const slots = cached?.slots || 'shifted'
+				const slots = cached?.result?.slots || 'shifted'
 				broadcast({ type: 'update', file: upRel, slots })
 			}
 		} catch(e) {
@@ -658,8 +635,8 @@ export function serve(entrypoint, flags) {
 		},
 
 		websocket: {
-			open:    ws => sockets.add(ws),
-			close:   ws => sockets.delete(ws),
+			open:    ws => { sockets.add(ws) },
+			close:   ws => { sockets.delete(ws) },
 			message: () => {},
 		},
 	})
