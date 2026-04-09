@@ -25,10 +25,10 @@ const hmrClient = `
 	//
 	const _origDefine = customElements.define.bind(customElements);
 	const _classes = new Map(); // tagName → first-registered constructor
-	let _hotTags = [];          // tags defined during the current hot import
+	let _collector = null;      // when set, captures tag names defined during one HMR import
 
 	customElements.define = function(name, cls, opts) {
-		_hotTags.push(name);
+		if (_collector) _collector.push(name);
 		const existing = customElements.get(name);
 		if (!existing) {
 			_origDefine(name, cls, opts);
@@ -62,30 +62,169 @@ const hmrClient = `
 
 	// ── HMR update handler ─────────────────────────────────────────────────────
 
-	function _applyUpdate(file) {
-		clearError();
-		_hotTags = [];
+	// Updates are serialized via a promise queue. Without this, two file edits
+	// arriving back-to-back would race on the shared collector and on imba's
+	// reconcile loop, with the second update potentially missing tags from
+	// the first.
+	let _queue = Promise.resolve();
 
-		import('/' + file + '?t=' + Date.now()).then(() => {
-			_hotTags = [];
-
-			// Remove duplicate root elements. Re-importing a module with a fresh
-			// ?t= query causes top-level code (e.g. imba.mount()) to run again,
-			// which can append a second copy of the root tag to body.
-			const seen = new Set();
-			[...document.body.children].forEach(el => {
-				const tag = el.tagName.toLowerCase();
-				if (seen.has(tag)) el.remove();
-				else seen.add(tag);
-			});
-
-			// Let Imba re-render in place from the patched prototypes. We do NOT
-			// touch instance DOM (no innerHTML reset, no symbol cleanup) — that
-			// would destroy rendered children like open popups / dropdowns and
-			// collapse any transient UI state. Prototype patching already makes
-			// the next render use the new methods; imba.commit() triggers it.
-			if (typeof imba !== 'undefined') imba.commit();
+	function _applyUpdate(file, slots) {
+		_queue = _queue.then(() => _doUpdate(file, slots)).catch(err => {
+			// Safety net: any uncaught failure during HMR → full reload.
+			// Better to lose state than to leave a broken page.
+			console.error('[bimba HMR] reload due to error:', err);
+			location.reload();
 		});
+	}
+
+	// Walk a subtree and call disconnectedCallback on each custom element.
+	// Used before destroying inner DOM on the shifted path so imba/web-component
+	// teardown logic (event listeners, observers, etc.) runs cleanly.
+	function _disconnectDescendants(root) {
+		const all = root.querySelectorAll('*');
+		for (const el of all) {
+			if (el.tagName.includes('-')) {
+				try { el.disconnectedCallback && el.disconnectedCallback(); } catch(_) {}
+			}
+		}
+	}
+
+	async function _doUpdate(file, slots) {
+		clearError();
+
+		// Snapshot direct body children BEFORE importing the new module, so we
+		// know which elements pre-existed. After commit we only dedupe NEW
+		// elements whose tag also existed before — this preserves legitimate
+		// multi-instance roots like toasts and parallel popups, while still
+		// catching accidental re-mounts from re-running top-level code.
+		const bodyBefore = new Set(document.body.children);
+		const tagsBefore = new Set();
+		for (const el of bodyBefore) tagsBefore.add(el.tagName.toLowerCase());
+
+		// Use a local collector instead of a shared variable so concurrent
+		// imports can't clobber each other's tag lists.
+		const collected = [];
+		const prev = _collector;
+		_collector = collected;
+		try {
+			await import('/' + file + '?t=' + Date.now());
+		} finally {
+			_collector = prev;
+		}
+
+		// Two HMR paths depending on whether render-cache slot symbols are
+		// stable across this re-import:
+		//
+		// 'stable': server-side symbol stabilization made the new module's
+		//   anonymous Symbols identical (by reference) to the previous
+		//   compilation. Live element instances still have valid slot
+		//   references → imba's renderer will diff and update the existing
+		//   DOM in place. We just patch class prototypes (already done in
+		//   the customElements.define hook above) and call imba.commit().
+		//   No DOM destruction, full inner state preserved.
+		//
+		// 'shifted': slot count changed (user added/removed elements), so
+		//   stabilization can't safely reuse symbols. Fall back to the
+		//   destructive path: snapshot own enumerable properties, wipe
+		//   ANONYMOUS symbol slots only (preserve global Symbol.for keys
+		//   that imba's runtime uses for lifecycle), clear innerHTML,
+		//   restore state, re-render. Loses inner DOM state for instances
+		//   of the patched tags, but preserves their instance fields.
+		// Snapshot child counts of the patched tags BEFORE commit. On the
+		// stable path, child count must not grow — if it does, it means slot
+		// stabilization failed for this edit and imba's renderer appended
+		// fresh children alongside the old ones. That's the duplication bug
+		// we cannot recover from in-place → trigger a reload.
+		const childSnap = new Map();
+		for (const tag of collected) {
+			const list = document.querySelectorAll(tag);
+			for (const el of list) childSnap.set(el, el.children.length);
+		}
+
+		if (slots === 'shifted') {
+			for (const tag of collected) {
+				document.querySelectorAll(tag).forEach(el => {
+					const state = {};
+					for (const k of Object.keys(el)) state[k] = el[k];
+					_disconnectDescendants(el);
+					for (const sym of Object.getOwnPropertySymbols(el)) {
+						if (Symbol.keyFor(sym) !== undefined) continue;
+						try { delete el[sym]; } catch(_) {}
+					}
+					el.innerHTML = '';
+					Object.assign(el, state);
+					try { el.render && el.render(); } catch(_) {}
+					// Re-fire lifecycle for the top tag itself: imba compiles
+					// "def mount" to a mount() instance method, and standard
+					// connectedCallback may also matter for descendants created
+					// by render(). The element is still attached to its parent,
+					// so we just call them directly.
+					try { el.connectedCallback && el.connectedCallback(); } catch(_) {}
+					try { el.mount && el.mount(); } catch(_) {}
+				});
+			}
+		}
+
+		if (typeof imba !== 'undefined') imba.commit();
+
+		// Stable-path duplication check.
+		if (slots !== 'shifted') {
+			for (const [el, before] of childSnap) {
+				if (el.children.length > before) {
+					console.warn('[bimba HMR] slot stabilization failed, reloading');
+					location.reload();
+					return;
+				}
+			}
+		}
+
+		// Smart body dedupe: remove only elements that were ADDED during this
+		// HMR cycle and whose tag already existed in body before. This catches
+		// accidental re-mounts from top-level imba.mount() re-runs, but
+		// preserves toasts, multiple modals, and devtools-injected siblings.
+		for (const el of [...document.body.children]) {
+			if (bodyBefore.has(el)) continue;
+			if (tagsBefore.has(el.tagName.toLowerCase())) el.remove();
+		}
+
+		// Reap orphaned imba style blocks. Each compilation that produces a
+		// different content hash leaves behind a <style> whose rules target
+		// classnames no element in the DOM uses anymore. Walk our tracked
+		// styles and drop the unused ones — keeps head clean and removes
+		// stale rules that would otherwise still apply to live elements with
+		// matching classnames (e.g. a "stuck" old text color).
+		_reapStyles();
+	}
+
+	// ── Style reaper ───────────────────────────────────────────────────────────
+
+	// imba_styles.register inserts <style data-id="<hash>"> blocks into <head>.
+	// Walk them, sample a few class selectors, and check whether any element
+	// in the document still uses one of those classnames. If not, the block
+	// is dead (its tag was hot-replaced with a new content hash and the old
+	// classnames are gone from the DOM) — remove it.
+	function _reapStyles() {
+		const styles = document.head.querySelectorAll('style[data-id]');
+		for (const style of styles) {
+			try {
+				const sheet = style.sheet;
+				if (!sheet || !sheet.cssRules) continue;
+				const probes = [];
+				for (const rule of sheet.cssRules) {
+					if (probes.length >= 4) break;
+					const sel = rule.selectorText;
+					if (!sel) continue;
+					const m = sel.match(/\.(z[a-z0-9_-]+)/i);
+					if (m && !probes.includes(m[1])) probes.push(m[1]);
+				}
+				if (!probes.length) continue;
+				let used = false;
+				for (const cls of probes) {
+					if (document.querySelector('.' + CSS.escape(cls))) { used = true; break; }
+				}
+				if (!used) style.remove();
+			} catch(_) { /* cross-origin or detached */ }
+		}
 	}
 
 	// ── WebSocket connection ───────────────────────────────────────────────────
@@ -103,7 +242,7 @@ const hmrClient = `
 
 		ws.onmessage = (e) => {
 			const msg = JSON.parse(e.data);
-			if      (msg.type === 'update')      _applyUpdate(msg.file);
+			if      (msg.type === 'update')      _applyUpdate(msg.file, msg.slots);
 			else if (msg.type === 'reload')      location.reload();
 			else if (msg.type === 'error')       showError(msg.file, msg.errors);
 			else if (msg.type === 'clear-error') clearError();
@@ -152,14 +291,108 @@ const hmrClient = `
 
 const _compileCache = new Map()  // filepath → { mtime, result }
 const _prevJs = new Map()  // filepath → compiled js — for change detection
+const _prevSlots = new Map()  // filepath → previous symbol slot count
+
+// ─── Import dependency graph ──────────────────────────────────────────────────
+//
+// When a non-tag module (utility functions, constants, shared state) is edited,
+// the existing class-prototype patching does nothing for the modules that
+// imported it — they hold their own captured references. To make those
+// updates flow into the UI, we track who imports whom and, on every change,
+// re-broadcast updates for the transitive importer set. The client's existing
+// HMR queue then re-imports each in turn; their top-level code reruns, picks
+// up the new symbols, and any tag re-registrations patch instances in place.
+//
+// Keys are absolute, normalized paths (path.resolve). Edges are added during
+// compilation by scanning the produced JS for relative .imba imports.
+
+const _imports = new Map()    // absFile → Set<absFile> (what it imports)
+const _importers = new Map()  // absFile → Set<absFile> (who imports it)
+
+function extractImports(js, fromAbs) {
+	const dir = path.dirname(fromAbs)
+	const out = new Set()
+	const re = /(?:^|[\s;])(?:import|from)\s*['"]([^'"]+)['"]/g
+	let m
+	while ((m = re.exec(js))) {
+		const spec = m[1]
+		if (!spec.startsWith('.') && !spec.startsWith('/')) continue
+		if (!spec.endsWith('.imba')) continue
+		const resolved = spec.startsWith('/')
+			? path.resolve('.' + spec)
+			: path.resolve(dir, spec)
+		out.add(resolved)
+	}
+	return out
+}
+
+function updateImportGraph(fromAbs, newDeps) {
+	const old = _imports.get(fromAbs)
+	if (old) {
+		for (const d of old) {
+			if (newDeps.has(d)) continue
+			const set = _importers.get(d)
+			if (set) { set.delete(fromAbs); if (!set.size) _importers.delete(d) }
+		}
+	}
+	for (const d of newDeps) {
+		let set = _importers.get(d)
+		if (!set) { set = new Set(); _importers.set(d, set) }
+		set.add(fromAbs)
+	}
+	_imports.set(fromAbs, newDeps)
+}
+
+function transitiveImporters(absFile) {
+	const out = new Set()
+	const stack = [absFile]
+	while (stack.length) {
+		const cur = stack.pop()
+		const ups = _importers.get(cur)
+		if (!ups) continue
+		for (const u of ups) if (!out.has(u)) { out.add(u); stack.push(u) }
+	}
+	return out
+}
+
+// Imba compiles tag render-cache slots as anonymous local Symbols at module top
+// level: `var $4 = Symbol(), $11 = Symbol(), ...; let c$0 = Symbol();`. Each
+// re-import of the file creates fresh Symbol objects, so old slot data on live
+// element instances no longer matches the new render's keys, and imba's diff
+// can't reuse cached children — it appends new ones, causing duplication.
+//
+// We rewrite each `<name> = Symbol()` clause so that the Symbol is read from a
+// per-file global cache, keyed by the variable name. On the first compilation
+// the cache is populated; on every subsequent compilation the same Symbol
+// objects are reused, slot keys stay stable, and imba's renderer happily
+// diff-updates existing DOM in place.
+//
+// Caveat: stability is keyed by name. If the user adds/removes elements in the
+// template, slot indices shift and the same name now points to a semantically
+// different slot. We detect this by counting slots — if the count changes vs
+// the previous compilation, we mark the file `slots: 'shifted'` and the client
+// falls back to the destructive wipe-and-render path. Pure CSS/text edits keep
+// counts unchanged → true in-place HMR.
+function stabilizeSymbols(js, filepath) {
+	let count = 0
+	const out = js.replace(
+		/([A-Za-z_$][\w$]*)\s*=\s*Symbol\(\)/g,
+		(_m, name) => { count++; return `${name} = (__bsyms__[${JSON.stringify(name)}] ||= Symbol())` }
+	)
+	if (count === 0) return { js, slotCount: 0 }
+	const fileKey = JSON.stringify(filepath)
+	const bootstrap = `const __bsyms__ = ((globalThis.__bimba_syms ||= {})[${fileKey}] ||= {});\n`
+	return { js: bootstrap + out, slotCount: count }
+}
 
 async function compileFile(filepath) {
+	const abs = path.resolve(filepath)
 	const file = Bun.file(filepath)
 	const stat = await file.stat()
 	const mtime = stat.mtime.getTime()
 
-	const cached = _compileCache.get(filepath)
-	if (cached && cached.mtime === mtime) return { ...cached.result, changeType: 'cached' }
+	const cached = _compileCache.get(abs)
+	if (cached && cached.mtime === mtime) return { ...cached.result, changeType: 'cached', slots: cached.slots }
 
 	const code = await file.text()
 	const result = compiler.compile(code, {
@@ -168,9 +401,18 @@ async function compileFile(filepath) {
 		sourcemap: 'inline',
 	})
 
-	const changeType = _prevJs.get(filepath) === result.js ? 'none' : 'full'
-	_prevJs.set(filepath, result.js)
-	_compileCache.set(filepath, { mtime, result })
+	if (!result.errors?.length && result.js) {
+		const { js, slotCount } = stabilizeSymbols(result.js, filepath)
+		result.js = js
+		const prev = _prevSlots.get(filepath)
+		result.slots = (prev === undefined || prev === slotCount) ? 'stable' : 'shifted'
+		_prevSlots.set(filepath, slotCount)
+		updateImportGraph(abs, extractImports(js, abs))
+	}
+
+	const changeType = _prevJs.get(abs) === result.js ? 'none' : 'full'
+	_prevJs.set(abs, result.js)
+	_compileCache.set(abs, { mtime, result, slots: result.slots })
 	return { ...result, changeType }
 }
 
@@ -326,7 +568,21 @@ export function serve(entrypoint, flags) {
 
 			printStatus(rel, 'ok')
 			broadcast({ type: 'clear-error' })
-			broadcast({ type: 'update', file: rel })
+			broadcast({ type: 'update', file: rel, slots: out.slots || 'shifted' })
+
+			// Cascade: re-import every module transitively importing this file.
+			// They don't need recompilation (their source didn't change), but
+			// their captured references to the changed module are stale, so we
+			// tell the client to re-import them. The client's HMR queue
+			// processes these in order; tag classes get re-patched, plain
+			// utility modules get fresh top-level state.
+			const ups = transitiveImporters(path.resolve(filepath))
+			for (const upAbs of ups) {
+				const upRel = path.relative('.', upAbs).replaceAll('\\', '/')
+				const cached = _compileCache.get(upAbs)
+				const slots = cached?.slots || 'shifted'
+				broadcast({ type: 'update', file: upRel, slots })
+			}
 		} catch(e) {
 			printStatus(rel, 'fail', [{ message: e.message }])
 			broadcast({ type: 'error', file: rel, errors: [{ message: e.message, snippet: e.stack || e.message }] })
