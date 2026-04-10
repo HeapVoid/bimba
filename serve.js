@@ -28,6 +28,7 @@ const hmrClient = `
 	const _newClasses = new Map(); // tagName → latest class from HMR import
 	const _oldNs = new Map();  // tagName → previous _ns_ (saved before _patchClass wipes it)
 	let _collector = null;      // when set, captures tag names defined during one HMR import
+	let _stableSlots = false;   // when true, _patchClass skips Symbol-keyed props (CSS-only HMR)
 
 	customElements.define = function(name, cls, opts) {
 		if (_collector) _collector.push(name);
@@ -41,7 +42,9 @@ const hmrClient = `
 			if (target) {
 				// Save old _ns_ before _patchClass overwrites prototype descriptors
 				if (target.prototype._ns_) _oldNs.set(name, target.prototype._ns_);
-				_patchClass(target, cls);
+				// When CSS-only (stable slots), skip patching render/methods —
+				// new render() has new Symbol closures that would cause duplicate DOM.
+				if (!_stableSlots) _patchClass(target, cls);
 			}
 		}
 	};
@@ -106,10 +109,12 @@ const hmrClient = `
 		const collected = [];
 		const prev = _collector;
 		_collector = collected;
+		_stableSlots = (slots === 'stable');
 		try {
 			await import('/' + file + '?t=' + Date.now());
 		} finally {
 			_collector = prev;
+			_stableSlots = false;
 		}
 
 		// Sync _ns_ (CSS namespace) from the new classes. imba_defineTag sets
@@ -135,23 +140,27 @@ const hmrClient = `
 			_oldNs.delete(tag);
 		}
 
-		// Destructive HMR: wipe inner DOM and re-render each collected tag
-		for (const tag of collected) {
-			const els = document.querySelectorAll(tag);
-			els.forEach(el => {
-				const state = {};
-				for (const k of Object.keys(el)) state[k] = el[k];
-				_disconnectDescendants(el);
-				for (const sym of Object.getOwnPropertySymbols(el)) {
-					if (Symbol.keyFor(sym) !== undefined) continue;
-					try { delete el[sym]; } catch(_) {}
-				}
-				el.innerHTML = '';
-				Object.assign(el, state);
-				try { el.render && el.render(); } catch(e) { console.error('[bimba] render error:', e); }
-				try { el.connectedCallback && el.connectedCallback(); } catch(_) {}
-				try { el.mount && el.mount(); } catch(_) {}
-			});
+		// Destructive HMR: wipe inner DOM and re-render each collected tag.
+		// Skip when slots === 'stable' (CSS-only change) — no template diff,
+		// so wiping innerHTML would destroy DOM state (inputs, focus) for nothing.
+		if (slots !== 'stable') {
+			for (const tag of collected) {
+				const els = document.querySelectorAll(tag);
+				els.forEach(el => {
+					const state = {};
+					for (const k of Object.keys(el)) state[k] = el[k];
+					_disconnectDescendants(el);
+					for (const sym of Object.getOwnPropertySymbols(el)) {
+						if (Symbol.keyFor(sym) !== undefined) continue;
+						try { delete el[sym]; } catch(_) {}
+					}
+					el.innerHTML = '';
+					Object.assign(el, state);
+					try { el.render && el.render(); } catch(e) { console.error('[bimba] render error:', e); }
+					try { el.connectedCallback && el.connectedCallback(); } catch(_) {}
+					try { el.mount && el.mount(); } catch(_) {}
+				});
+			}
 		}
 
 		if (typeof imba !== 'undefined') imba.commit();
@@ -547,7 +556,7 @@ export function serve(entrypoint, flags) {
 
 			printStatus(rel, 'ok')
 			broadcast({ type: 'clear-error' })
-			broadcast({ type: 'update', file: rel, slots: 'shifted' })
+			broadcast({ type: 'update', file: rel, slots: out.slots || 'shifted' })
 
 			// Cascade: re-import modules that transitively import this file.
 			// Skip the entry point — re-importing it re-runs imba.mount and
