@@ -691,6 +691,8 @@ export function serve(entrypoint, flags) {
 				// Serve a resolved file: compile .imba, wrap CJS as ESM, pass ESM through
 				const serveResolved = async (filePath) => {
 					if (filePath.endsWith('.imba')) {
+						const f = Bun.file(filePath)
+						if (!(await f.exists())) return null
 						const out = await compileFile(filePath)
 						if (out.errors?.length) return new Response(out.errors.map(e => e.message).join('\n'), { status: 500 })
 						return new Response(out.js, { headers: { 'Content-Type': 'application/javascript' } })
