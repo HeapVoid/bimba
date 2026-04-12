@@ -408,6 +408,99 @@ function findHtml(flagHtml) {
 	return candidates.find(p => existsSync(p)) || './index.html';
 }
 
+// ─── Node modules resolution ─────────────────────────────────────────────────
+//
+// Packages with conditional exports (e.g. highlight.js) map subpaths like
+// "./lib/languages/*" to different files for `require` vs `import`. The browser
+// import map uses a simple trailing-slash prefix mapping, so
+// `highlight.js/lib/languages/javascript` → `/node_modules/highlight.js/lib/languages/javascript`.
+// But that's the CJS file — the browser needs the ESM one under `es/`.
+//
+// We solve this at the HTTP level: when serving a JS file from node_modules,
+// check if the file is CJS and the package has an ESM alternative via its
+// `exports` field. If so, rewrite to the ESM path.
+
+const _pkgJsonCache = new Map() // pkg root dir → parsed package.json
+
+async function readPkgJson(pkgDir) {
+	const cached = _pkgJsonCache.get(pkgDir)
+	if (cached) return cached
+	try {
+		const json = JSON.parse(await Bun.file(path.join(pkgDir, 'package.json')).text())
+		_pkgJsonCache.set(pkgDir, json)
+		return json
+	} catch(_) {
+		return null
+	}
+}
+
+// Given a request path inside node_modules (e.g. "node_modules/highlight.js/lib/languages/javascript"),
+// try to resolve via conditional exports to find the ESM version.
+// Returns the rewritten filesystem path, or null if no rewrite needed.
+async function resolveNodeModuleESM(filepath) {
+	// Only rewrite JS files (or extensionless → .js)
+	const parts = filepath.split('/')
+	const nmIdx = parts.indexOf('node_modules')
+	if (nmIdx === -1) return null
+
+	const pkgName = parts[nmIdx + 1].startsWith('@')
+		? parts[nmIdx + 1] + '/' + parts[nmIdx + 2]
+		: parts[nmIdx + 1]
+	const pkgDir = parts.slice(0, nmIdx + 1 + (pkgName.includes('/') ? 2 : 1)).join('/')
+	const depPkg = await readPkgJson(pkgDir)
+	if (!depPkg?.exports || typeof depPkg.exports === 'string') return null
+
+	// Build the subpath relative to pkg root: "./lib/languages/javascript"
+	const pkgParts = pkgName.includes('/') ? 2 : 1
+	const subParts = parts.slice(nmIdx + 1 + pkgParts)
+	const subpath = './' + subParts.join('/')
+
+	const exp = depPkg.exports
+
+	// Try exact match first: exports["./lib/core"]
+	if (exp[subpath]) {
+		const target = exp[subpath]
+		const esm = typeof target === 'string' ? target : (target?.import || target?.default)
+		if (esm) {
+			const resolved = path.join(pkgDir, esm)
+			if (existsSync(resolved)) return resolved
+		}
+	}
+
+	// Try with .js extension: exports["./lib/core"] for request "./lib/core"
+	const subpathJs = subpath + '.js'
+	if (exp[subpathJs]) {
+		const target = exp[subpathJs]
+		const esm = typeof target === 'string' ? target : (target?.import || target?.default)
+		if (esm) {
+			const resolved = path.join(pkgDir, esm)
+			if (existsSync(resolved)) return resolved
+		}
+	}
+
+	// Try wildcard match: exports["./lib/languages/*"]
+	for (const [pattern, target] of Object.entries(exp)) {
+		if (!pattern.includes('*')) continue
+		const prefix = pattern.slice(0, pattern.indexOf('*'))
+		const suffix = pattern.slice(pattern.indexOf('*') + 1)
+
+		// Check both with and without .js extension
+		for (const sp of [subpath, subpathJs]) {
+			if (!sp.startsWith(prefix)) continue
+			if (suffix && !sp.endsWith(suffix)) continue
+			const stem = sp.slice(prefix.length, suffix ? -suffix.length || undefined : undefined)
+
+			const esm = typeof target === 'string' ? target : (target?.import || target?.default)
+			if (!esm || !esm.includes('*')) continue
+
+			const resolved = path.join(pkgDir, esm.replace('*', stem))
+			if (existsSync(resolved)) return resolved
+		}
+	}
+
+	return null
+}
+
 // Resolve the ESM entry point for an npm package.
 // Priority: exports["."].import → exports["."].default → module → main
 function resolveEntry(depPkg) {
@@ -430,13 +523,6 @@ function resolveEntry(depPkg) {
 	return depPkg.module || depPkg.browser || depPkg.main;
 }
 
-// Check if a package has subpath exports (exports with keys other than ".")
-function hasSubpathExports(depPkg) {
-	const exp = depPkg.exports;
-	if (!exp || typeof exp === 'string') return false;
-	return Object.keys(exp).some(k => k !== '.' && k.startsWith('./'));
-}
-
 // Build an ES import map from package.json dependencies.
 // Packages with an .imba entry point are served locally; others via esm.sh.
 async function buildImportMap() {
@@ -451,37 +537,18 @@ async function buildImportMap() {
 			try {
 				const depPkg = JSON.parse(await Bun.file(`./node_modules/${name}/package.json`).text());
 				const entry = resolveEntry(depPkg);
-				if (entry && entry.endsWith('.imba')) {
-					// Imba packages — always local
+				if (entry && !entry.startsWith('http')) {
+					// Local package — serve from node_modules
 					imports[name] = `/node_modules/${name}/${entry}`;
+					// Always add trailing-slash mapping for deep/subpath imports
+					// (e.g. highlight.js/lib/languages/javascript). The browser
+					// doesn't enforce Node's `exports` restrictions, it just needs
+					// a URL prefix to resolve bare specifiers like "pkg/sub/path".
 					imports[name + '/'] = `/node_modules/${name}/`;
-				} else if (entry && !entry.startsWith('http')) {
-					// Local ESM/CJS package — serve from node_modules
-					imports[name] = `/node_modules/${name}/${entry}`;
-					// Trailing-slash mapping for deep imports (unless package
-					// uses subpath exports — those need explicit mappings)
-					if (!hasSubpathExports(depPkg)) {
-						imports[name + '/'] = `/node_modules/${name}/`;
-					}
 				} else {
 					// No resolvable entry — use esm.sh to auto-wrap
 					imports[name] = `https://esm.sh/${name}`;
 					imports[name + '/'] = `https://esm.sh/${name}/`;
-				}
-
-				// Add subpath export mappings (e.g. "pkg/styles.css" → local path)
-				if (hasSubpathExports(depPkg)) {
-					const exp = depPkg.exports;
-					for (const [subpath, target] of Object.entries(exp)) {
-						if (subpath === '.') continue;
-						if (!subpath.startsWith('./')) continue;
-						const importKey = name + '/' + subpath.slice(2);
-						const resolved = typeof target === 'string' ? target
-							: (target?.import || target?.default);
-						if (resolved) {
-							imports[importKey] = `/node_modules/${name}/${resolved}`;
-						}
-					}
 				}
 			} catch(_) {
 				imports[name] = `https://esm.sh/${name}`;
@@ -699,6 +766,19 @@ export function serve(entrypoint, flags) {
 				}
 			}
 
+			// node_modules: resolve conditional exports (CJS → ESM) before serving.
+			// e.g. highlight.js/lib/languages/javascript → es/languages/javascript.js
+			if (pathname.startsWith('/node_modules/')) {
+				const filepath = '.' + pathname
+				const esmPath = await resolveNodeModuleESM(filepath)
+				if (esmPath) {
+					const file = Bun.file(esmPath)
+					if (await file.exists()) return new Response(file, {
+						headers: { 'Content-Type': 'application/javascript' },
+					})
+				}
+			}
+
 			// Static files: check htmlDir first (for assets relative to HTML), then root
 			const inHtmlDir = Bun.file(path.join(htmlDir, pathname))
 			if (await inHtmlDir.exists()) return new Response(inHtmlDir)
@@ -708,6 +788,8 @@ export function serve(entrypoint, flags) {
 			// Try .js / .mjs extension for extensionless paths (e.g. node_modules imports)
 			const lastSegment = pathname.split('/').pop()
 			if (!lastSegment.includes('.')) {
+				// For node_modules, ESM resolution above already handles extensionless
+				// paths via wildcard exports matching (tries subpath + '.js').
 				for (const ext of ['.js', '.mjs']) {
 					const withExt = Bun.file('.' + pathname + ext)
 					if (await withExt.exists()) return new Response(withExt, {
