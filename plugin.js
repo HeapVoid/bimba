@@ -18,6 +18,11 @@ export let stats = {
   errors: 0,
 };
 
+// Target platform for the Imba compiler: 'browser' or 'node'
+// Set via setTarget() from the CLI before building
+export let target = 'browser';
+export function setTarget(t) { target = t; }
+
 export const imbaPlugin = {
   name: "imba",
   async setup(build) {
@@ -28,13 +33,11 @@ export const imbaPlugin = {
       const f = dir.parse(path)
       let contents = '';
 
-      // return the cached version if exists
-      const cached = dir.join(cache, Bun.hash(path) + '_' + fs.statSync(path).mtimeMs + '.js');
+      // return the cached version if exists (include target in hash to avoid cross-platform cache hits)
+      const cached = dir.join(cache, Bun.hash(path + ':' + target) + '_' + fs.statSync(path).mtimeMs + '.js');
       if (fs.existsSync(cached)) {
         stats.bundled++;
         stats.cached++;
-        //console.log(theme.action("cached: ") + theme.folder(f.dir + '/') + theme.filename(f.base) + " - " + theme.success("ok"));
-        //console.log(theme.action("compiling: ") + theme.folder(dir.join(f.dir,'/')) + theme.filename(f.base) + " - " + theme.success("from cache"));
         return {
           contents: await Bun.file(cached).text(),
           loader: "js",
@@ -42,14 +45,15 @@ export const imbaPlugin = {
       }
 
       // clear previous cached version
-      const glob = new Glob(Bun.hash(path) + '_' + "*.js");
+      const glob = new Glob(Bun.hash(path + ':' + target) + '_' + "*.js");
       for await (const file of glob.scan(cache)) if (fs.existsSync(dir.join(cache, file))) unlink(dir.join(cache, file));
 
       // if no cached version read and compile it with the imba compiler
       const file = await Bun.file(path).text();
+      const platform = target === 'node' || target === 'bun' ? 'node' : 'browser';
       const out = compiler.compile(file, {
           sourcePath: path,
-          platform: 'browser',
+          platform: platform,
           comments: false
       })
       

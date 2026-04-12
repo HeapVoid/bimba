@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 
 import { parseArgs } from "util";
-import { imbaPlugin, stats, cache } from './plugin.js'
+import { imbaPlugin, stats, cache, setTarget } from './plugin.js'
 import {theme} from './utils.js';
 import fs from 'fs'
 import path from 'path';
@@ -23,6 +23,7 @@ try {
             minify: { type: 'boolean' },
             splitting: { type: 'boolean' },
             target: { type: 'string' },
+            external: { type: 'string', multiple: true },
             sourcemap: { type: 'string' },
             serve: { type: 'boolean' },
             port: { type: 'string' },
@@ -63,7 +64,8 @@ if(flags.help) {
     console.log("   "+theme.flags('--outdir <folder>')+"                     Compile imba files to the specified folder");
     console.log("   "+theme.flags('--minify')+"                              Minify compiled .js files");
     console.log("   "+theme.flags('--sourcemap <inline|external|none>')+"    How should sourcemap files be included in the .js");
-    console.log("   "+theme.flags('--platform <browser|node>')+"             Flag that will be passed to Imba compiler ('node' value does not work in Bun)");
+    console.log("   "+theme.flags('--target <browser|node>')+"               Target platform for both Imba compiler and Bun bundler");
+    console.log("   "+theme.flags('--external <package>')+"                Exclude package from bundle (repeatable, e.g. --external ws --external node-pty)");
     console.log("   "+theme.flags('--watch')+"                               Watch for changes in the entrypoint folder");
     console.log("   "+theme.flags('--clearcache')+"                          Clear cache on exit, works only when in watch mode");
     console.log("");
@@ -137,17 +139,38 @@ async function bundle() {
     console.log(theme.folder("──────────────────────────────────────────────────────────────────────"));
     console.log(theme.start(`Start building the Imba entrypoint: ${theme.filedir(entrypoint)}`));
 
+    // set Imba compiler platform based on target
+    const buildTarget = flags.target || 'browser';
+    setTarget(buildTarget);
+
     let result = undefined
     try {
-        result = await Bun.build({
+        const buildOpts = {
             entrypoints: [entrypoint],
             outdir: flags.outdir,
-            target: flags.target || 'browser',
+            target: buildTarget,
             sourcemap: flags.sourcemap || 'none',
             minify: true,
             splitting: flags.splitting || false,
             plugins: [imbaPlugin]
-        });
+        };
+        if (flags.external?.length) {
+            buildOpts.external = flags.external;
+        }
+        result = await Bun.build(buildOpts);
+
+        // For node target, add shebang to the output file
+        if (result.success && (buildTarget === 'node' || buildTarget === 'bun')) {
+            for (const output of result.outputs) {
+                const outPath = output.path;
+                const content = fs.readFileSync(outPath, 'utf8');
+                if (!content.startsWith('#!')) {
+                    const shebang = buildTarget === 'bun' ? '#!/usr/bin/env bun' : '#!/usr/bin/env node';
+                    fs.writeFileSync(outPath, shebang + '\n' + content);
+                    fs.chmodSync(outPath, 0o755);
+                }
+            }
+        }
 
         if(stats.failed)
             console.log(theme.start(theme.failure(" Failure ") + theme.filename(` Imba compiler failed to proceed ${stats.failed} file${stats.failed > 1 ? 's' : ''}`)));
