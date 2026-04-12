@@ -56,6 +56,8 @@ Duplicate root elements (caused by `imba.mount()` running again on re-import) ar
 
 **Smart HMR:** bimba detects whether a change affects the template structure (adding/removing elements) or just CSS/logic. CSS-only and logic-only changes patch prototypes in place without wiping innerHTML — preserving input focus, scroll position, and open popups. Template-structural changes do a full wipe-and-rerender to ensure correctness.
 
+For a deep dive into how Imba compiles tags, how the render cache works, and how bimba hooks into it — see [INTERNALS.md](INTERNALS.md).
+
 **HTML setup:** add a `data-entrypoint` attribute to the script tag that loads your bundle. The dev server will replace it with your `.imba` entrypoint and inject the importmap above it:
 
 ```html
