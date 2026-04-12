@@ -28,7 +28,6 @@ const hmrClient = `
 	const _newClasses = new Map(); // tagName → latest class from HMR import
 	const _oldNs = new Map();  // tagName → previous _ns_ (saved before _patchClass wipes it)
 	let _collector = null;      // when set, captures tag names defined during one HMR import
-	let _stableSlots = false;   // when true, _patchClass skips Symbol-keyed props (CSS-only HMR)
 
 	customElements.define = function(name, cls, opts) {
 		if (_collector) _collector.push(name);
@@ -42,9 +41,8 @@ const hmrClient = `
 			if (target) {
 				// Save old _ns_ before _patchClass overwrites prototype descriptors
 				if (target.prototype._ns_) _oldNs.set(name, target.prototype._ns_);
-				// When CSS-only (stable slots), skip patching render/methods —
-				// new render() has new Symbol closures that would cause duplicate DOM.
-				if (!_stableSlots) _patchClass(target, cls);
+				// Always patch: even CSS-only changes may update methods.
+				_patchClass(target, cls);
 			}
 		}
 	};
@@ -109,12 +107,10 @@ const hmrClient = `
 		const collected = [];
 		const prev = _collector;
 		_collector = collected;
-		_stableSlots = (slots === 'stable');
 		try {
 			await import('/' + file + '?t=' + Date.now());
 		} finally {
 			_collector = prev;
-			_stableSlots = false;
 		}
 
 		// Sync _ns_ (CSS namespace) from the new classes. imba_defineTag sets
@@ -141,8 +137,10 @@ const hmrClient = `
 		}
 
 		// Destructive HMR: wipe inner DOM and re-render each collected tag.
-		// Skip when slots === 'stable' (CSS-only change) — no template diff,
-		// so wiping innerHTML would destroy DOM state (inputs, focus) for nothing.
+		// Skip when slots === 'stable' — template structure unchanged (CSS-only
+		// or logic-only edit that didn't add/remove elements), so wiping innerHTML
+		// would destroy DOM state (inputs, focus, popups) for nothing.
+		// _patchClass already ran above, so methods are up-to-date either way.
 		if (slots !== 'stable') {
 			for (const tag of collected) {
 				const els = document.querySelectorAll(tag);
@@ -410,6 +408,35 @@ function findHtml(flagHtml) {
 	return candidates.find(p => existsSync(p)) || './index.html';
 }
 
+// Resolve the ESM entry point for an npm package.
+// Priority: exports["."].import → exports["."].default → module → main
+function resolveEntry(depPkg) {
+	const exp = depPkg.exports;
+	if (exp) {
+		// exports: "./index.js" (string shorthand)
+		if (typeof exp === 'string') return exp;
+		// exports: { ".": { "import": "...", "default": "..." } }
+		const dot = exp['.'];
+		if (dot) {
+			if (typeof dot === 'string') return dot;
+			if (dot.import) return dot.import;
+			if (dot.default) return dot.default;
+		}
+		// exports: { "import": "...", "default": "..." } (no "." wrapper)
+		if (exp.import) return exp.import;
+		if (exp.default) return exp.default;
+	}
+	// Fallback to legacy fields
+	return depPkg.module || depPkg.browser || depPkg.main;
+}
+
+// Check if a package has subpath exports (exports with keys other than ".")
+function hasSubpathExports(depPkg) {
+	const exp = depPkg.exports;
+	if (!exp || typeof exp === 'string') return false;
+	return Object.keys(exp).some(k => k !== '.' && k.startsWith('./'));
+}
+
 // Build an ES import map from package.json dependencies.
 // Packages with an .imba entry point are served locally; others via esm.sh.
 async function buildImportMap() {
@@ -423,12 +450,42 @@ async function buildImportMap() {
 			if (name === 'imba') continue;
 			try {
 				const depPkg = JSON.parse(await Bun.file(`./node_modules/${name}/package.json`).text());
-				const entry = depPkg.module || depPkg.main;
-				imports[name] = (entry && entry.endsWith('.imba'))
-					? `/node_modules/${name}/${entry}`
-					: `https://esm.sh/${name}`;
+				const entry = resolveEntry(depPkg);
+				if (entry && entry.endsWith('.imba')) {
+					// Imba packages — always local
+					imports[name] = `/node_modules/${name}/${entry}`;
+					imports[name + '/'] = `/node_modules/${name}/`;
+				} else if (entry && !entry.startsWith('http')) {
+					// Local ESM/CJS package — serve from node_modules
+					imports[name] = `/node_modules/${name}/${entry}`;
+					// Trailing-slash mapping for deep imports (unless package
+					// uses subpath exports — those need explicit mappings)
+					if (!hasSubpathExports(depPkg)) {
+						imports[name + '/'] = `/node_modules/${name}/`;
+					}
+				} else {
+					// No resolvable entry — use esm.sh to auto-wrap
+					imports[name] = `https://esm.sh/${name}`;
+					imports[name + '/'] = `https://esm.sh/${name}/`;
+				}
+
+				// Add subpath export mappings (e.g. "pkg/styles.css" → local path)
+				if (hasSubpathExports(depPkg)) {
+					const exp = depPkg.exports;
+					for (const [subpath, target] of Object.entries(exp)) {
+						if (subpath === '.') continue;
+						if (!subpath.startsWith('./')) continue;
+						const importKey = name + '/' + subpath.slice(2);
+						const resolved = typeof target === 'string' ? target
+							: (target?.import || target?.default);
+						if (resolved) {
+							imports[importKey] = `/node_modules/${name}/${resolved}`;
+						}
+					}
+				}
 			} catch(_) {
 				imports[name] = `https://esm.sh/${name}`;
+				imports[name + '/'] = `https://esm.sh/${name}/`;
 			}
 		}
 	} catch(_) { /* no package.json */ }
@@ -624,14 +681,42 @@ export function serve(entrypoint, flags) {
 				}
 			}
 
+			// CSS files imported from JS: wrap as a JS module that injects a <style> tag.
+			// Without this, `import './styles.css'` inside an ESM package fails because
+			// the browser expects a JS module response, not raw CSS.
+			if (pathname.endsWith('.css')) {
+				const cssFile = Bun.file('.' + pathname)
+				if (await cssFile.exists()) {
+					const css = await cssFile.text()
+					const id = JSON.stringify(pathname)
+					const js = [
+						`const id = ${id};`,
+						`let el = document.querySelector('style[data-bimba-css=' + JSON.stringify(id) + ']');`,
+						`if (!el) { el = document.createElement('style'); el.setAttribute('data-bimba-css', id); document.head.appendChild(el); }`,
+						`el.textContent = ${JSON.stringify(css)};`,
+					].join('\n')
+					return new Response(js, { headers: { 'Content-Type': 'application/javascript' } })
+				}
+			}
+
 			// Static files: check htmlDir first (for assets relative to HTML), then root
 			const inHtmlDir = Bun.file(path.join(htmlDir, pathname))
 			if (await inHtmlDir.exists()) return new Response(inHtmlDir)
 			const inRoot = Bun.file('.' + pathname)
 			if (await inRoot.exists()) return new Response(inRoot)
 
-			// SPA fallback for extension-less paths
+			// Try .js / .mjs extension for extensionless paths (e.g. node_modules imports)
 			const lastSegment = pathname.split('/').pop()
+			if (!lastSegment.includes('.')) {
+				for (const ext of ['.js', '.mjs']) {
+					const withExt = Bun.file('.' + pathname + ext)
+					if (await withExt.exists()) return new Response(withExt, {
+						headers: { 'Content-Type': 'application/javascript' },
+					})
+				}
+			}
+
+			// SPA fallback for extension-less paths
 			if (!lastSegment.includes('.')) {
 				let html = await Bun.file(htmlPath).text()
 				if (!importMapTag) importMapTag = await buildImportMap()

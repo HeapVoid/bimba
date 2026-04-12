@@ -37,7 +37,9 @@ bunx bimba src/index.imba --serve --port 5200 --html public/index.html
 **How it works:**
 - Serves your HTML file and compiles `.imba` files on demand (no bundling step)
 - Watches `src/` for changes and pushes updates over WebSocket
-- Injects an importmap built from your `package.json` dependencies
+- Injects an importmap built from your `package.json` dependencies (supports `exports`, `module`, `browser`, and `main` fields)
+- CSS files imported from JS (e.g. `import 'some-lib/styles.css'`) are automatically wrapped as JS modules that inject `<style>` tags
+- npm packages with ESM entry points are served from `node_modules` locally — no esm.sh proxy needed
 - Injects an HMR client that swaps component prototypes without a full page reload
 
 **HMR internals:**
@@ -48,9 +50,11 @@ Since Imba custom elements can't be registered twice (`customElements.define` th
 
 After patching, bimba clears each element's Imba render cache (anonymous `Symbol` keys pointing to DOM nodes) and sets `innerHTML = ''`, so the new render method starts from a clean slate. Then `imba.commit()` triggers a re-render of all mounted components.
 
-CSS is handled automatically: Imba's runtime calls `imba_styles.register()` during module execution, which updates the `<style>` tag in place — no extra DOM work needed.
+CSS is handled automatically: Imba's runtime calls `imba_styles.register()` during module execution, which updates the `<style>` tag in place — no extra DOM work needed. CSS files from npm packages (e.g. `import 'pkg/styles.css'`) are served as JS modules that inject and update `<style>` tags.
 
 Duplicate root elements (caused by `imba.mount()` running again on re-import) are removed by a dedup pass over `document.body.children` before any other HMR logic runs.
+
+**Smart HMR:** bimba detects whether a change affects the template structure (adding/removing elements) or just CSS/logic. CSS-only and logic-only changes patch prototypes in place without wiping innerHTML — preserving input focus, scroll position, and open popups. Template-structural changes do a full wipe-and-rerender to ensure correctness.
 
 **HTML setup:** add a `data-entrypoint` attribute to the script tag that loads your bundle. The dev server will replace it with your `.imba` entrypoint and inject the importmap above it:
 
@@ -66,7 +70,9 @@ Duplicate root elements (caused by `imba.mount()` running again on re-import) ar
 
 `--html <path>` — path to your HTML file (auto-detected from `./index.html`, `./public/index.html`, `./src/index.html` if omitted)
 
-Static files are resolved relative to the HTML file's directory first, then from the project root (for `node_modules`, `src`, etc.).
+Static files are resolved relative to the HTML file's directory first, then from the project root (for `node_modules`, `src`, etc.). Extensionless imports (common in `node_modules`) are resolved by trying `.js` and `.mjs` extensions automatically.
+
+**npm package resolution:** The import map is built by reading each dependency's `package.json`. The resolution order is: `exports["."].import` → `exports["."].default` → `module` → `browser` → `main`. Packages with subpath exports (e.g. `"./styles.css"`) get individual import map entries. CJS-only packages (no ESM entry) are proxied through esm.sh.
 
 ---
 
