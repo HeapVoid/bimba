@@ -753,9 +753,21 @@ export function serve(entrypoint, flags) {
 			// node_modules: all smart resolution happens here.
 			// The import map just maps bare specifiers to /node_modules/pkg/ URLs.
 			// This block handles: entry point resolution, conditional exports
-			// (CJS→ESM), subpath resolution, extensionless paths.
+			// (CJS→ESM), subpath resolution, .imba compilation.
 			if (pathname.startsWith('/node_modules/')) {
 				const filepath = '.' + pathname
+
+				// Serve a resolved file — compile .imba on the fly, pass JS through
+				const serveResolved = async (filePath) => {
+					if (filePath.endsWith('.imba')) {
+						const out = await compileFile(filePath)
+						if (out.errors?.length) return new Response(out.errors.map(e => e.message).join('\n'), { status: 500 })
+						return new Response(out.js, { headers: { 'Content-Type': 'application/javascript' } })
+					}
+					const f = Bun.file(filePath)
+					if (await f.exists()) return new Response(f, { headers: { 'Content-Type': 'application/javascript' } })
+					return null
+				}
 
 				// Resolve entry point for root package requests (/node_modules/pkg/ or /node_modules/pkg)
 				const parts = pathname.slice(1).split('/')  // ['node_modules', 'pkg', ...]
@@ -765,17 +777,13 @@ export function serve(entrypoint, flags) {
 				const isRootRequest = subParts.length === 0 || (subParts.length === 1 && subParts[0] === '')
 
 				if (isRootRequest) {
-					// Bare import: resolve entry point from package.json
 					const pkgDir = './' + parts.slice(0, pkgParts).join('/')
 					const depPkg = await readPkgJson(pkgDir)
 					if (depPkg) {
 						const entry = resolveEntry(depPkg)
 						if (entry) {
-							const entryPath = path.join(pkgDir, entry)
-							const file = Bun.file(entryPath)
-							if (await file.exists()) return new Response(file, {
-								headers: { 'Content-Type': 'application/javascript' },
-							})
+							const resp = await serveResolved(path.join(pkgDir, entry))
+							if (resp) return resp
 						}
 					}
 				}
@@ -783,10 +791,8 @@ export function serve(entrypoint, flags) {
 				// Subpath: resolve via conditional exports (CJS→ESM)
 				const esmPath = await resolveNodeModuleESM(filepath)
 				if (esmPath) {
-					const file = Bun.file(esmPath)
-					if (await file.exists()) return new Response(file, {
-						headers: { 'Content-Type': 'application/javascript' },
-					})
+					const resp = await serveResolved(esmPath)
+					if (resp) return resp
 				}
 			}
 
@@ -796,11 +802,15 @@ export function serve(entrypoint, flags) {
 			const inRoot = Bun.file('.' + pathname)
 			if (await inRoot.exists()) return new Response(inRoot)
 
-			// Try .js / .mjs extension for extensionless paths (e.g. node_modules imports)
+			// Try extensions for extensionless paths (e.g. node_modules imports)
 			const lastSegment = pathname.split('/').pop()
 			if (!lastSegment.includes('.')) {
-				// For node_modules, ESM resolution above already handles extensionless
-				// paths via wildcard exports matching (tries subpath + '.js').
+				// Try .imba first (compile on the fly), then .js/.mjs
+				const imbaPath = '.' + pathname + '.imba'
+				if (existsSync(imbaPath)) {
+					const out = await compileFile(imbaPath)
+					if (!out.errors?.length) return new Response(out.js, { headers: { 'Content-Type': 'application/javascript' } })
+				}
 				for (const ext of ['.js', '.mjs']) {
 					const withExt = Bun.file('.' + pathname + ext)
 					if (await withExt.exists()) return new Response(withExt, {
