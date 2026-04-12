@@ -524,7 +524,9 @@ function resolveEntry(depPkg) {
 }
 
 // Build an ES import map from package.json dependencies.
-// Packages with an .imba entry point are served locally; others via esm.sh.
+// The import map is intentionally simple — it just maps bare specifiers
+// to /node_modules/ URLs. All the smart resolution (conditional exports,
+// CJS→ESM, entry points, extensions) happens on the server side.
 async function buildImportMap() {
 	const imports = {
 		'imba/runtime': 'https://esm.sh/imba/runtime',
@@ -534,26 +536,8 @@ async function buildImportMap() {
 		const pkg = JSON.parse(await Bun.file('./package.json').text());
 		for (const [name] of Object.entries(pkg.dependencies || {})) {
 			if (name === 'imba') continue;
-			try {
-				const depPkg = JSON.parse(await Bun.file(`./node_modules/${name}/package.json`).text());
-				const entry = resolveEntry(depPkg);
-				if (entry && !entry.startsWith('http')) {
-					// Local package — serve from node_modules
-					imports[name] = `/node_modules/${name}/${entry}`;
-					// Always add trailing-slash mapping for deep/subpath imports
-					// (e.g. highlight.js/lib/languages/javascript). The browser
-					// doesn't enforce Node's `exports` restrictions, it just needs
-					// a URL prefix to resolve bare specifiers like "pkg/sub/path".
-					imports[name + '/'] = `/node_modules/${name}/`;
-				} else {
-					// No resolvable entry — use esm.sh to auto-wrap
-					imports[name] = `https://esm.sh/${name}`;
-					imports[name + '/'] = `https://esm.sh/${name}/`;
-				}
-			} catch(_) {
-				imports[name] = `https://esm.sh/${name}`;
-				imports[name + '/'] = `https://esm.sh/${name}/`;
-			}
+			imports[name] = `/node_modules/${name}/`;
+			imports[name + '/'] = `/node_modules/${name}/`;
 		}
 	} catch(_) { /* no package.json */ }
 
@@ -766,10 +750,37 @@ export function serve(entrypoint, flags) {
 				}
 			}
 
-			// node_modules: resolve conditional exports (CJS → ESM) before serving.
-			// e.g. highlight.js/lib/languages/javascript → es/languages/javascript.js
+			// node_modules: all smart resolution happens here.
+			// The import map just maps bare specifiers to /node_modules/pkg/ URLs.
+			// This block handles: entry point resolution, conditional exports
+			// (CJS→ESM), subpath resolution, extensionless paths.
 			if (pathname.startsWith('/node_modules/')) {
 				const filepath = '.' + pathname
+
+				// Resolve entry point for root package requests (/node_modules/pkg/ or /node_modules/pkg)
+				const parts = pathname.slice(1).split('/')  // ['node_modules', 'pkg', ...]
+				const isScoped = parts[1]?.startsWith('@')
+				const pkgParts = isScoped ? 3 : 2  // node_modules/@scope/pkg or node_modules/pkg
+				const subParts = parts.slice(pkgParts)
+				const isRootRequest = subParts.length === 0 || (subParts.length === 1 && subParts[0] === '')
+
+				if (isRootRequest) {
+					// Bare import: resolve entry point from package.json
+					const pkgDir = './' + parts.slice(0, pkgParts).join('/')
+					const depPkg = await readPkgJson(pkgDir)
+					if (depPkg) {
+						const entry = resolveEntry(depPkg)
+						if (entry) {
+							const entryPath = path.join(pkgDir, entry)
+							const file = Bun.file(entryPath)
+							if (await file.exists()) return new Response(file, {
+								headers: { 'Content-Type': 'application/javascript' },
+							})
+						}
+					}
+				}
+
+				// Subpath: resolve via conditional exports (CJS→ESM)
 				const esmPath = await resolveNodeModuleESM(filepath)
 				if (esmPath) {
 					const file = Bun.file(esmPath)
