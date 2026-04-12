@@ -409,16 +409,6 @@ function findHtml(flagHtml) {
 }
 
 // ─── Node modules resolution ─────────────────────────────────────────────────
-//
-// Packages with conditional exports (e.g. highlight.js) map subpaths like
-// "./lib/languages/*" to different files for `require` vs `import`. The browser
-// import map uses a simple trailing-slash prefix mapping, so
-// `highlight.js/lib/languages/javascript` → `/node_modules/highlight.js/lib/languages/javascript`.
-// But that's the CJS file — the browser needs the ESM one under `es/`.
-//
-// We solve this at the HTTP level: when serving a JS file from node_modules,
-// check if the file is CJS and the package has an ESM alternative via its
-// `exports` field. If so, rewrite to the ESM path.
 
 const _pkgJsonCache = new Map() // pkg root dir → parsed package.json
 
@@ -434,71 +424,13 @@ async function readPkgJson(pkgDir) {
 	}
 }
 
-// Given a request path inside node_modules (e.g. "node_modules/highlight.js/lib/languages/javascript"),
-// try to resolve via conditional exports to find the ESM version.
-// Returns the rewritten filesystem path, or null if no rewrite needed.
-async function resolveNodeModuleESM(filepath) {
-	// Only rewrite JS files (or extensionless → .js)
-	const parts = filepath.split('/')
-	const nmIdx = parts.indexOf('node_modules')
-	if (nmIdx === -1) return null
-
-	const pkgName = parts[nmIdx + 1].startsWith('@')
-		? parts[nmIdx + 1] + '/' + parts[nmIdx + 2]
-		: parts[nmIdx + 1]
-	const pkgDir = parts.slice(0, nmIdx + 1 + (pkgName.includes('/') ? 2 : 1)).join('/')
-	const depPkg = await readPkgJson(pkgDir)
-	if (!depPkg?.exports || typeof depPkg.exports === 'string') return null
-
-	// Build the subpath relative to pkg root: "./lib/languages/javascript"
-	const pkgParts = pkgName.includes('/') ? 2 : 1
-	const subParts = parts.slice(nmIdx + 1 + pkgParts)
-	const subpath = './' + subParts.join('/')
-
-	const exp = depPkg.exports
-
-	// Try exact match first: exports["./lib/core"]
-	if (exp[subpath]) {
-		const target = exp[subpath]
-		const esm = typeof target === 'string' ? target : (target?.import || target?.default)
-		if (esm) {
-			const resolved = path.join(pkgDir, esm)
-			if (existsSync(resolved)) return resolved
-		}
-	}
-
-	// Try with .js extension: exports["./lib/core"] for request "./lib/core"
-	const subpathJs = subpath + '.js'
-	if (exp[subpathJs]) {
-		const target = exp[subpathJs]
-		const esm = typeof target === 'string' ? target : (target?.import || target?.default)
-		if (esm) {
-			const resolved = path.join(pkgDir, esm)
-			if (existsSync(resolved)) return resolved
-		}
-	}
-
-	// Try wildcard match: exports["./lib/languages/*"]
-	for (const [pattern, target] of Object.entries(exp)) {
-		if (!pattern.includes('*')) continue
-		const prefix = pattern.slice(0, pattern.indexOf('*'))
-		const suffix = pattern.slice(pattern.indexOf('*') + 1)
-
-		// Check both with and without .js extension
-		for (const sp of [subpath, subpathJs]) {
-			if (!sp.startsWith(prefix)) continue
-			if (suffix && !sp.endsWith(suffix)) continue
-			const stem = sp.slice(prefix.length, suffix ? -suffix.length || undefined : undefined)
-
-			const esm = typeof target === 'string' ? target : (target?.import || target?.default)
-			if (!esm || !esm.includes('*')) continue
-
-			const resolved = path.join(pkgDir, esm.replace('*', stem))
-			if (existsSync(resolved)) return resolved
-		}
-	}
-
-	return null
+// Wrap a CommonJS file as an ESM module so the browser can import it.
+// Detects CJS by checking for `module.exports` or top-level `exports.` usage.
+function wrapCJS(code) {
+	if (!code.includes('module.exports') && !code.includes('exports.')) return null
+	// Already has ESM syntax — don't wrap (dual-format files)
+	if (/^\s*(export\s|import\s)/m.test(code)) return null
+	return `var module = { exports: {} }, exports = module.exports;\n${code}\nexport default module.exports;\nexport { module };`
 }
 
 // Resolve the ESM entry point for an npm package.
@@ -750,14 +682,13 @@ export function serve(entrypoint, flags) {
 				}
 			}
 
-			// node_modules: all smart resolution happens here.
+			// node_modules: entry point resolution, .imba compilation, CJS→ESM wrapping.
 			// The import map just maps bare specifiers to /node_modules/pkg/ URLs.
-			// This block handles: entry point resolution, conditional exports
-			// (CJS→ESM), subpath resolution, .imba compilation.
+			// All smart resolution happens here at request time.
 			if (pathname.startsWith('/node_modules/')) {
 				const filepath = '.' + pathname
 
-				// Serve a resolved file — compile .imba on the fly, pass JS through
+				// Serve a resolved file: compile .imba, wrap CJS as ESM, pass ESM through
 				const serveResolved = async (filePath) => {
 					if (filePath.endsWith('.imba')) {
 						const out = await compileFile(filePath)
@@ -765,8 +696,10 @@ export function serve(entrypoint, flags) {
 						return new Response(out.js, { headers: { 'Content-Type': 'application/javascript' } })
 					}
 					const f = Bun.file(filePath)
-					if (await f.exists()) return new Response(f, { headers: { 'Content-Type': 'application/javascript' } })
-					return null
+					if (!(await f.exists())) return null
+					const code = await f.text()
+					const wrapped = wrapCJS(code)
+					return new Response(wrapped || code, { headers: { 'Content-Type': 'application/javascript' } })
 				}
 
 				// Resolve entry point for root package requests (/node_modules/pkg/ or /node_modules/pkg)
@@ -788,11 +721,16 @@ export function serve(entrypoint, flags) {
 					}
 				}
 
-				// Subpath: resolve via conditional exports (CJS→ESM)
-				const esmPath = await resolveNodeModuleESM(filepath)
-				if (esmPath) {
-					const resp = await serveResolved(esmPath)
-					if (resp) return resp
+				// Subpath: try the exact path, then with extensions
+				const resp = await serveResolved(filepath)
+				if (resp) return resp
+
+				// Extensionless: try .imba, .js, .mjs
+				if (!filepath.includes('.', filepath.lastIndexOf('/') + 1)) {
+					for (const ext of ['.imba', '.js', '.mjs']) {
+						const resp = await serveResolved(filepath + ext)
+						if (resp) return resp
+					}
 				}
 			}
 
