@@ -307,21 +307,6 @@ function updateImportGraph(fromAbs, newDeps) {
 	_imports.set(fromAbs, newDeps)
 }
 
-function transitiveImporters(absFile, skip) {
-	const out = new Set()
-	const stack = [absFile]
-	while (stack.length) {
-		const cur = stack.pop()
-		const ups = _importers.get(cur)
-		if (!ups) continue
-		for (const u of ups) {
-			if (out.has(u) || (skip && skip.has(u))) continue
-			out.add(u)
-			stack.push(u)
-		}
-	}
-	return out
-}
 
 // Imba compiles tag render-cache slots as anonymous local Symbols at module top
 // level: `var $4 = Symbol(), $11 = Symbol(), ...; let c$0 = Symbol();`. Each
@@ -497,7 +482,6 @@ export function serve(entrypoint, flags) {
 	const htmlDir  = path.dirname(htmlPath)
 	const srcDir   = path.dirname(entrypoint)
 	const sockets  = new Set()
-	const entryAbs = path.resolve(entrypoint)
 	let importMapTag = null
 
 	// ── Status line (prints current compile result, fades out on success) ──────
@@ -597,18 +581,6 @@ export function serve(entrypoint, flags) {
 			printStatus(rel, 'ok')
 			broadcast({ type: 'clear-error' })
 			broadcast({ type: 'update', file: rel, slots: out.slots || 'shifted' })
-
-			// Cascade: re-import modules that transitively import this file.
-			// Skip the entry point — re-importing it re-runs imba.mount and
-			// recreates global services, and traversing through it would
-			// cascade to the entire project.
-			const ups = transitiveImporters(path.resolve(filepath), new Set([entryAbs]))
-			for (const upAbs of ups) {
-				const upRel = path.relative('.', upAbs).replaceAll('\\', '/')
-				const cached = _compileCache.get(upAbs)
-				const slots = cached?.result?.slots || 'shifted'
-				broadcast({ type: 'update', file: upRel, slots })
-			}
 		} catch(e) {
 			printStatus(rel, 'fail', [{ message: e.message }])
 			broadcast({ type: 'error', file: rel, errors: [{ message: e.message, snippet: e.stack || e.message }] })
