@@ -113,8 +113,6 @@ const hmrClient = `
 			_collector = prev;
 		}
 
-		console.log('[bimba HMR]', file, 'slots=' + slots, 'tags:', collected.join(', '));
-
 		// Sync _ns_ (CSS namespace) from the new classes. imba_defineTag sets
 		// _ns_ on NewClass.prototype AFTER register$ calls customElements.define,
 		// so _patchClass missed it. Now that import is done, all _ns_ values are set.
@@ -146,7 +144,6 @@ const hmrClient = `
 		if (slots !== 'stable') {
 			for (const tag of collected) {
 				const els = document.querySelectorAll(tag);
-				console.log('[bimba HMR] destructive:', tag, 'instances:', els.length);
 				els.forEach(el => {
 					const state = {};
 					for (const k of Object.keys(el)) state[k] = el[k];
@@ -162,35 +159,9 @@ const hmrClient = `
 					try { el.mount && el.mount(); } catch(_) {}
 				});
 			}
-		} else {
-			for (const tag of collected) {
-				const els = document.querySelectorAll(tag);
-				console.log('[bimba HMR] stable:', tag, 'instances:', els.length);
-			}
-		}
-
-		// Snapshot DOM before commit to detect duplication
-		const _domBefore = {};
-		for (const tag of collected) {
-			_domBefore[tag] = {
-				count: document.querySelectorAll(tag).length,
-				bodyChildren: document.body.children.length,
-			};
 		}
 
 		if (typeof imba !== 'undefined') imba.commit();
-
-		// Check DOM after commit (delayed to let rAF fire)
-		requestAnimationFrame(() => {
-			for (const tag of collected) {
-				const after = document.querySelectorAll(tag).length;
-				const before = _domBefore[tag]?.count || 0;
-				if (after !== before) {
-					console.warn('[bimba HMR] DUPLICATION:', tag, before, '->', after);
-				}
-				console.log('[bimba HMR] after commit:', tag, 'count:', after, 'body children:', document.body.children.length);
-			}
-		});
 
 		// Patch className on ALL custom elements: replace old CSS namespace
 		// hashes with new ones. Must be global because subclass elements
@@ -398,7 +369,7 @@ async function compileFile(filepath) {
 
 	const errors = result.errors || []
 	if (!errors.length && result.js) {
-		const { js, slotCount } = stabilizeSymbols(result.js, filepath)
+		const { js, slotCount } = stabilizeSymbols(result.js, abs)
 		result.js = js
 		const prev = _prevSlots.get(abs)
 		result.slots = (prev === undefined || prev === slotCount) ? 'stable' : 'shifted'
