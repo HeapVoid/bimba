@@ -137,28 +137,27 @@ const hmrClient = `
 		}
 
 		// Destructive HMR: wipe inner DOM and re-render each collected tag.
-		// Skip when slots === 'stable' — template structure unchanged (CSS-only
-		// or logic-only edit that didn't add/remove elements), so wiping innerHTML
-		// would destroy DOM state (inputs, focus, popups) for nothing.
-		// _patchClass already ran above, so methods are up-to-date either way.
-		if (slots !== 'stable') {
-			for (const tag of collected) {
-				const els = document.querySelectorAll(tag);
-				els.forEach(el => {
-					const state = {};
-					for (const k of Object.keys(el)) state[k] = el[k];
-					_disconnectDescendants(el);
-					for (const sym of Object.getOwnPropertySymbols(el)) {
-						if (Symbol.keyFor(sym) !== undefined) continue;
-						try { delete el[sym]; } catch(_) {}
-					}
-					el.innerHTML = '';
-					Object.assign(el, state);
-					try { el.render && el.render(); } catch(e) { console.error('[bimba] render error:', e); }
-					try { el.connectedCallback && el.connectedCallback(); } catch(_) {}
-					try { el.mount && el.mount(); } catch(_) {}
-				});
-			}
+		// Always destructive regardless of slots value. Imba's reconciliation
+		// uses slot-tracking symbols (this[$sym] === 1) to skip re-creating
+		// elements on re-render. Even "stable" edits (static text, attributes)
+		// won't apply unless we clear those symbols and force a fresh render.
+		// _patchClass already ran above, so the new render() method is in place.
+		for (const tag of collected) {
+			const els = document.querySelectorAll(tag);
+			els.forEach(el => {
+				const state = {};
+				for (const k of Object.keys(el)) state[k] = el[k];
+				_disconnectDescendants(el);
+				for (const sym of Object.getOwnPropertySymbols(el)) {
+					if (Symbol.keyFor(sym) !== undefined) continue;
+					try { delete el[sym]; } catch(_) {}
+				}
+				el.innerHTML = '';
+				Object.assign(el, state);
+				try { el.render && el.render(); } catch(e) { console.error('[bimba] render error:', e); }
+				try { el.connectedCallback && el.connectedCallback(); } catch(_) {}
+				try { el.mount && el.mount(); } catch(_) {}
+			});
 		}
 
 		if (typeof imba !== 'undefined') imba.commit();

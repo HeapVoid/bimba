@@ -188,18 +188,27 @@ oldCls.prototype._ns_ = newCls.prototype._ns_;
 
 Then patch `className` on ALL custom elements in the DOM, replacing old hash parts with new ones.
 
-### 3.5 The Two HMR Paths
+### 3.5 Always-Destructive HMR
 
-**Stable path** (`slots === 'stable'`):
+> **History:** Earlier versions (≤0.7.8) had two paths — "stable" (in-place
+> prototype patching + `imba.commit()`) and "shifted" (destructive wipe +
+> re-render). The stable path was meant to preserve DOM state (inputs, focus,
+> popups) when only CSS or logic changed without adding/removing template
+> elements. However, it fundamentally didn't work: imba's reconciliation uses
+> slot-tracking symbols (`this[$sym] === 1`) to skip re-creating elements on
+> re-render. Even when `_patchClass` installs a new `render()` method, calling
+> `render()` (or `imba.commit()`) does nothing — the slot check says "already
+> created" and skips `createElement`. Static text, attributes, and other
+> arguments baked into `createElement` calls never update.
+>
+> Since 0.7.9, bimba always takes the destructive path.
+
+The `slots` field is still computed and broadcast (for potential future use),
+but the client ignores it. Every HMR update does:
+
 1. `_patchClass` updates prototype (during import)
 2. `_ns_` is synced
-3. `imba.commit()` triggers normal re-render cycle
-4. Render runs in REUSE mode (`this[$7] === 1`) — methods are new, DOM is preserved
-5. Input values, focus, scroll position, popup state — all preserved
-
-**Shifted path** (`slots !== 'stable'`):
-1. `_patchClass` updates prototype
-2. For each instance of each affected tag:
+3. For each instance of each affected tag:
    - Save instance properties (`Object.keys(el)`)
    - Call `disconnectedCallback` on all descendant custom elements
    - Delete all anonymous Symbol properties (render cache) — skip `Symbol.for(...)` ones
@@ -207,7 +216,12 @@ Then patch `className` on ALL custom elements in the DOM, replacing old hash par
    - Restore instance properties
    - `el.render()` — rebuild DOM from scratch with new render method
    - `el.connectedCallback()`, `el.mount()` — re-initialize
-3. `imba.commit()` for final sync
+4. `imba.commit()` for final sync
+
+**Trade-off:** Input focus, scroll position, and popup state are lost on every
+edit. This is acceptable because correctness beats convenience — a "stable"
+update that silently ignores the change is far more confusing than losing
+transient UI state.
 
 ### 3.6 Body-level Deduplication
 
