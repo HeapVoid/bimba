@@ -1,6 +1,6 @@
-import { serve as bunServe } from 'bun'
+import { serve as bunServe, Glob } from 'bun'
 import * as compiler from 'imba/compiler'
-import { watch, existsSync } from 'fs'
+import { watch, existsSync, statSync } from 'fs'
 import path from 'path'
 import { theme } from './utils.js'
 import { printerr } from './plugin.js'
@@ -256,57 +256,6 @@ const _compileCache = new Map()  // filepath → { mtime, result }
 const _prevJs = new Map()  // filepath → compiled js — for change detection
 const _prevSlots = new Map()  // filepath → previous symbol slot count
 
-// ─── Import dependency graph ──────────────────────────────────────────────────
-//
-// When a non-tag module (utility functions, constants, shared state) is edited,
-// the existing class-prototype patching does nothing for the modules that
-// imported it — they hold their own captured references. To make those
-// updates flow into the UI, we track who imports whom and, on every change,
-// re-broadcast updates for the transitive importer set. The client's existing
-// HMR queue then re-imports each in turn; their top-level code reruns, picks
-// up the new symbols, and any tag re-registrations patch instances in place.
-//
-// Keys are absolute, normalized paths (path.resolve). Edges are added during
-// compilation by scanning the produced JS for relative .imba imports.
-
-const _imports = new Map()    // absFile → Set<absFile> (what it imports)
-const _importers = new Map()  // absFile → Set<absFile> (who imports it)
-
-function extractImports(js, fromAbs) {
-	const dir = path.dirname(fromAbs)
-	const out = new Set()
-	const re = /(?:^|[\s;])(?:import|from)\s*['"]([^'"]+)['"]/g
-	let m
-	while ((m = re.exec(js))) {
-		const spec = m[1]
-		if (!spec.startsWith('.') && !spec.startsWith('/')) continue
-		if (!spec.endsWith('.imba')) continue
-		const resolved = spec.startsWith('/')
-			? path.resolve('.' + spec)
-			: path.resolve(dir, spec)
-		out.add(resolved)
-	}
-	return out
-}
-
-function updateImportGraph(fromAbs, newDeps) {
-	const old = _imports.get(fromAbs)
-	if (old) {
-		for (const d of old) {
-			if (newDeps.has(d)) continue
-			const set = _importers.get(d)
-			if (set) { set.delete(fromAbs); if (!set.size) _importers.delete(d) }
-		}
-	}
-	for (const d of newDeps) {
-		let set = _importers.get(d)
-		if (!set) { set = new Set(); _importers.set(d, set) }
-		set.add(fromAbs)
-	}
-	_imports.set(fromAbs, newDeps)
-}
-
-
 // Imba compiles tag render-cache slots as anonymous local Symbols at module top
 // level: `var $4 = Symbol(), $11 = Symbol(), ...; let c$0 = Symbol();`. Each
 // re-import of the file creates fresh Symbol objects, so old slot data on live
@@ -373,7 +322,6 @@ async function compileFile(filepath) {
 		const prev = _prevSlots.get(abs)
 		result.slots = (prev === undefined || prev === slotCount) ? 'stable' : 'shifted'
 		_prevSlots.set(abs, slotCount)
-		updateImportGraph(abs, extractImports(js, abs))
 	}
 
 	// Bake errors as an own property so caching/spreading preserves them.
@@ -408,6 +356,282 @@ async function readPkgJson(pkgDir) {
 	}
 }
 
+function toPosix(filepath) {
+	return filepath.replaceAll('\\', '/')
+}
+
+function toBrowserPath(filepath) {
+	return '/' + toPosix(path.relative(process.cwd(), path.resolve(filepath)))
+}
+
+function parsePackageSpecifier(specifier) {
+	if (specifier.startsWith('@')) {
+		const parts = specifier.split('/')
+		return {
+			name: parts.slice(0, 2).join('/'),
+			subpath: parts.slice(2).join('/'),
+		}
+	}
+
+	const [name, ...rest] = specifier.split('/')
+	return { name, subpath: rest.join('/') }
+}
+
+function isConditionMap(value) {
+	return !!value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).every(key => !key.startsWith('.'))
+}
+
+function pickExportTarget(value) {
+	if (!value) return null
+	if (typeof value === 'string') return value
+	if (Array.isArray(value)) {
+		for (const item of value) {
+			const resolved = pickExportTarget(item)
+			if (resolved) return resolved
+		}
+		return null
+	}
+	if (!isConditionMap(value)) return null
+
+	for (const key of ['browser', 'import', 'default', 'module']) {
+		const resolved = pickExportTarget(value[key])
+		if (resolved) return resolved
+	}
+
+	for (const nested of Object.values(value)) {
+		const resolved = pickExportTarget(nested)
+		if (resolved) return resolved
+	}
+
+	return null
+}
+
+function resolveExportTarget(exportsField, subpath = '') {
+	if (!exportsField) return null
+	const exportKey = subpath ? `./${subpath}` : '.'
+
+	if (typeof exportsField === 'string' || Array.isArray(exportsField) || isConditionMap(exportsField)) {
+		return exportKey === '.' ? pickExportTarget(exportsField) : null
+	}
+
+	const exact = exportsField[exportKey]
+	if (exact) return pickExportTarget(exact)
+
+	let bestMatch = null
+	for (const [key, value] of Object.entries(exportsField)) {
+		if (!key.startsWith('./') || !key.includes('*')) continue
+
+		const [prefix, suffix] = key.split('*')
+		if (!exportKey.startsWith(prefix) || !exportKey.endsWith(suffix)) continue
+
+		const matched = exportKey.slice(prefix.length, exportKey.length - suffix.length)
+		const target = pickExportTarget(value)
+		if (!target) continue
+
+		const score = prefix.length + suffix.length
+		if (!bestMatch || score > bestMatch.score) {
+			bestMatch = { matched, target, score }
+		}
+	}
+
+	return bestMatch ? bestMatch.target.replaceAll('*', bestMatch.matched) : null
+}
+
+function resolvePackageTarget(depPkg, subpath = '') {
+	if (subpath) {
+		const exported = resolveExportTarget(depPkg.exports, subpath)
+		if (exported) return exported
+		if (depPkg.exports) return null
+		return './' + subpath
+	}
+
+	const exported = resolveExportTarget(depPkg.exports)
+	if (exported) return exported
+	if (typeof depPkg.browser === 'string') return depPkg.browser
+	return depPkg.module || depPkg.main || null
+}
+
+function resolveFileCandidate(filepath) {
+	const candidates = [
+		filepath,
+		filepath + '.js',
+		filepath + '.mjs',
+		filepath + '.cjs',
+		filepath + '.imba',
+		filepath + '.css',
+		path.join(filepath, 'index.js'),
+		path.join(filepath, 'index.mjs'),
+		path.join(filepath, 'index.cjs'),
+		path.join(filepath, 'index.imba'),
+	]
+
+	for (const candidate of candidates) {
+		if (!existsSync(candidate)) continue
+		try {
+			if (statSync(candidate).isFile()) return candidate
+		} catch (_) {
+			// ignore vanished files and continue resolving
+		}
+	}
+
+	return null
+}
+
+async function resolvePackageFile(specifier) {
+	const { name, subpath } = parsePackageSpecifier(specifier)
+	if (!name) return null
+
+	const pkgDir = path.join(process.cwd(), 'node_modules', name)
+	const depPkg = await readPkgJson(pkgDir)
+	if (!depPkg) return null
+
+	const target = resolvePackageTarget(depPkg, subpath)
+	if (!target) return null
+
+	const candidate = resolveFileCandidate(path.resolve(pkgDir, target))
+	return candidate ? path.resolve(candidate) : null
+}
+
+async function resolveNodeModulesRequest(pathname) {
+	const specifier = pathname.replace(/^\/node_modules\//, '')
+	if (!specifier) return null
+
+	const direct = resolveFileCandidate(path.join(process.cwd(), 'node_modules', specifier))
+	if (direct) return path.resolve(direct)
+
+	return resolvePackageFile(specifier)
+}
+
+function exportSpecifiers(name, exportsField) {
+	if (!exportsField || typeof exportsField === 'string' || Array.isArray(exportsField) || isConditionMap(exportsField)) {
+		return []
+	}
+
+	return Object.entries(exportsField)
+		.filter(([key]) => key.startsWith('./') && key !== '.')
+		.map(([key, value]) => ({ key, value }))
+}
+
+async function expandPatternExport(name, pkgDir, key, value) {
+	const target = pickExportTarget(value)
+	if (!target || !key.includes('*') || !target.includes('*')) return {}
+
+	const specPattern = key.slice(2)
+	const [specPrefix, specSuffix] = specPattern.split('*')
+	const normalizedTarget = target.replace(/^\.\//, '')
+	const [targetPrefix, targetSuffix] = normalizedTarget.split('*')
+	const glob = new Glob(normalizedTarget)
+	const mappings = {}
+
+	for await (const file of glob.scan(pkgDir)) {
+		const rel = toPosix(file)
+		if (!rel.startsWith(targetPrefix) || !rel.endsWith(targetSuffix)) continue
+
+		const matched = rel.slice(targetPrefix.length, rel.length - targetSuffix.length)
+		const specifier = `${name}/${specPrefix}${matched}${specSuffix}`.replace(/\/+/g, '/')
+		mappings[specifier] = '/' + toPosix(path.join('node_modules', name, rel))
+	}
+
+	return mappings
+}
+
+async function buildGeneratedImportMap() {
+	const imports = {}
+	const visited = new Set()
+	const queue = []
+
+	try {
+		const pkg = JSON.parse(await Bun.file('./package.json').text())
+		for (const field of ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies']) {
+			queue.push(...Object.keys(pkg[field] || {}))
+		}
+	} catch(_) { /* no package.json */ }
+
+	while (queue.length) {
+		const name = queue.shift()
+		if (!name || visited.has(name)) continue
+		visited.add(name)
+
+		const pkgDir = path.join(process.cwd(), 'node_modules', name)
+		const depPkg = await readPkgJson(pkgDir)
+		if (!depPkg) continue
+
+		const entryFile = await resolvePackageFile(name)
+		if (entryFile) imports[name] = toBrowserPath(entryFile)
+
+		if (depPkg.exports) {
+			for (const { key, value } of exportSpecifiers(name, depPkg.exports)) {
+				if (key.includes('*')) {
+					Object.assign(imports, await expandPatternExport(name, pkgDir, key, value))
+					continue
+				}
+
+				const specifier = `${name}/${key.slice(2)}`
+				const file = await resolvePackageFile(specifier)
+				if (file) imports[specifier] = toBrowserPath(file)
+			}
+		} else {
+			imports[name + '/'] = '/' + toPosix(path.join('node_modules', name)) + '/'
+		}
+
+		for (const field of ['dependencies', 'peerDependencies', 'optionalDependencies']) {
+			queue.push(...Object.keys(depPkg[field] || {}))
+		}
+	}
+
+	if (!imports['imba']) imports['imba'] = 'https://esm.sh/imba'
+	if (!imports['imba/runtime']) imports['imba/runtime'] = 'https://esm.sh/imba/runtime'
+
+	return { imports }
+}
+
+function extractUserImportMap(html) {
+	const merged = { imports: {}, scopes: {} }
+
+	html = html.replace(/<script\s+type=["']importmap["'][^>]*>([\s\S]*?)<\/script>/gi, (_match, json) => {
+		try {
+			const parsed = JSON.parse(json)
+			Object.assign(merged.imports, parsed.imports || {})
+			for (const [scope, specifiers] of Object.entries(parsed.scopes || {})) {
+				merged.scopes[scope] = { ...(merged.scopes[scope] || {}), ...specifiers }
+			}
+		} catch (_) {
+			// ignore invalid import maps and keep serving the page
+		}
+		return ''
+	})
+
+	if (!Object.keys(merged.scopes).length) delete merged.scopes
+	return { html, importMap: merged }
+}
+
+function mergeImportMaps(generated, user) {
+	const merged = {
+		imports: { ...(generated.imports || {}), ...(user.imports || {}) },
+	}
+
+	const scopeKeys = new Set([
+		...Object.keys(generated.scopes || {}),
+		...Object.keys(user.scopes || {}),
+	])
+
+	if (scopeKeys.size) {
+		merged.scopes = {}
+		for (const key of scopeKeys) {
+			merged.scopes[key] = {
+				...((generated.scopes || {})[key] || {}),
+				...((user.scopes || {})[key] || {}),
+			}
+		}
+	}
+
+	return merged
+}
+
+function renderImportMapTag(importMap) {
+	return `\t\t<script type="importmap">\n\t\t\t${JSON.stringify(importMap, null, '\t\t\t\t')}\n\t\t</script>`
+}
+
 // Wrap a CommonJS file as an ESM module so the browser can import it.
 // Detects CJS by checking for `module.exports` or top-level `exports.` usage.
 function wrapCJS(code) {
@@ -417,60 +641,21 @@ function wrapCJS(code) {
 	return `var module = { exports: {} }, exports = module.exports;\n${code}\nexport default module.exports;\nexport { module };`
 }
 
-// Resolve the ESM entry point for an npm package.
-// Priority: exports["."].import → exports["."].default → module → main
-function resolveEntry(depPkg) {
-	const exp = depPkg.exports;
-	if (exp) {
-		// exports: "./index.js" (string shorthand)
-		if (typeof exp === 'string') return exp;
-		// exports: { ".": { "import": "...", "default": "..." } }
-		const dot = exp['.'];
-		if (dot) {
-			if (typeof dot === 'string') return dot;
-			if (dot.import) return dot.import;
-			if (dot.default) return dot.default;
-		}
-		// exports: { "import": "...", "default": "..." } (no "." wrapper)
-		if (exp.import) return exp.import;
-		if (exp.default) return exp.default;
-	}
-	// Fallback to legacy fields
-	return depPkg.module || depPkg.browser || depPkg.main;
-}
-
-// Build an ES import map from package.json dependencies.
-// The import map is intentionally simple — it just maps bare specifiers
-// to /node_modules/ URLs. All the smart resolution (conditional exports,
-// CJS→ESM, entry points, extensions) happens on the server side.
-async function buildImportMap() {
-	const imports = {
-		'imba/runtime': 'https://esm.sh/imba/runtime',
-		'imba': 'https://esm.sh/imba',
-	};
-	try {
-		const pkg = JSON.parse(await Bun.file('./package.json').text());
-		for (const [name] of Object.entries(pkg.dependencies || {})) {
-			if (name === 'imba') continue;
-			imports[name] = `/node_modules/${name}/`;
-			imports[name + '/'] = `/node_modules/${name}/`;
-		}
-	} catch(_) { /* no package.json */ }
-
-	return `\t\t<script type="importmap">\n\t\t\t${JSON.stringify({ imports }, null, '\t\t\t\t')}\n\t\t</script>`;
-}
-
 // Rewrite production HTML for the dev server:
-// strips existing importmap + data-entrypoint script, injects importmap +
+// strips existing importmap + data-entrypoint script, injects merged importmap +
 // entrypoint module + HMR client before </head>.
-function transformHtml(html, entrypoint, importMapTag) {
-	html = html.replace(/<script\s+type=["']importmap["'][^>]*>[\s\S]*?<\/script>/gi, '');
-	html = html.replace(/<script([^>]*)\bdata-entrypoint\b([^>]*)><\/script>/gi, '');
-	const entryUrl = '/' + entrypoint.replace(/^\.\//, '').replaceAll('\\', '/');
+function transformHtml(html, entrypoint, generatedImportMap) {
+	const extracted = extractUserImportMap(html)
+	html = extracted.html
+	html = html.replace(/<script([^>]*)\bdata-entrypoint\b([^>]*)><\/script>/gi, '')
+
+	const entryUrl = '/' + entrypoint.replace(/^\.\//, '').replaceAll('\\', '/')
+	const importMapTag = renderImportMapTag(mergeImportMaps(generatedImportMap, extracted.importMap))
+
 	html = html.replace('</head>',
 		`${importMapTag}\n\t\t<script type='module' src='${entryUrl}'></script>\n${hmrClient}\n\t</head>`
-	);
-	return html;
+	)
+	return html
 }
 
 // ─── Dev server ───────────────────────────────────────────────────────────────
@@ -481,7 +666,7 @@ export function serve(entrypoint, flags) {
 	const htmlDir  = path.dirname(htmlPath)
 	const srcDir   = path.dirname(entrypoint)
 	const sockets  = new Set()
-	let importMapTag = null
+	let generatedImportMap = null
 
 	// ── Status line (prints current compile result, fades out on success) ──────
 
@@ -601,15 +786,15 @@ export function serve(entrypoint, flags) {
 				if (server.upgrade(req)) return undefined
 			}
 
-			// HTML: index or any .html file
-			if (pathname === '/' || pathname.endsWith('.html')) {
-				const htmlFile = pathname === '/' ? htmlPath : '.' + pathname
-				let html = await Bun.file(htmlFile).text()
-				if (!importMapTag) importMapTag = await buildImportMap()
-				return new Response(transformHtml(html, entrypoint, importMapTag), {
-					headers: { 'Content-Type': 'text/html' },
-				})
-			}
+				// HTML: index or any .html file
+				if (pathname === '/' || pathname.endsWith('.html')) {
+					const htmlFile = pathname === '/' ? htmlPath : '.' + pathname
+					let html = await Bun.file(htmlFile).text()
+					if (!generatedImportMap) generatedImportMap = await buildGeneratedImportMap()
+					return new Response(transformHtml(html, entrypoint, generatedImportMap), {
+						headers: { 'Content-Type': 'text/html' },
+					})
+				}
 
 			// Imba files: compile on demand and serve as JS
 			if (pathname.endsWith('.imba')) {
@@ -653,15 +838,14 @@ export function serve(entrypoint, flags) {
 				}
 			}
 
-			// node_modules: entry point resolution, .imba compilation, CJS→ESM wrapping.
-			// The import map just maps bare specifiers to /node_modules/pkg/ URLs.
-			// All smart resolution happens here at request time.
-			if (pathname.startsWith('/node_modules/')) {
-				const filepath = '.' + pathname
-
-				// Serve a resolved file: compile .imba, wrap CJS as ESM, pass ESM through
-				const serveResolved = async (filePath) => {
-					if (filePath.endsWith('.imba')) {
+				// node_modules: entry point resolution, .imba compilation, CJS→ESM wrapping.
+				// The import map points to concrete module URLs when possible, but we
+				// still resolve package-style /node_modules/pkg[/subpath] requests here
+				// so user-defined import maps and manual URLs keep working.
+				if (pathname.startsWith('/node_modules/')) {
+					// Serve a resolved file: compile .imba, wrap CJS as ESM, pass ESM through
+					const serveResolved = async (filePath) => {
+						if (filePath.endsWith('.imba')) {
 						const f = Bun.file(filePath)
 						if (!(await f.exists())) return null
 						const out = await compileFile(filePath)
@@ -671,41 +855,14 @@ export function serve(entrypoint, flags) {
 					const f = Bun.file(filePath)
 					if (!(await f.exists())) return null
 					const code = await f.text()
-					const wrapped = wrapCJS(code)
-					return new Response(wrapped || code, { headers: { 'Content-Type': 'application/javascript' } })
-				}
-
-				// Resolve entry point for root package requests (/node_modules/pkg/ or /node_modules/pkg)
-				const parts = pathname.slice(1).split('/')  // ['node_modules', 'pkg', ...]
-				const isScoped = parts[1]?.startsWith('@')
-				const pkgParts = isScoped ? 3 : 2  // node_modules/@scope/pkg or node_modules/pkg
-				const subParts = parts.slice(pkgParts)
-				const isRootRequest = subParts.length === 0 || (subParts.length === 1 && subParts[0] === '')
-
-				if (isRootRequest) {
-					const pkgDir = './' + parts.slice(0, pkgParts).join('/')
-					const depPkg = await readPkgJson(pkgDir)
-					if (depPkg) {
-						const entry = resolveEntry(depPkg)
-						if (entry) {
-							const resp = await serveResolved(path.join(pkgDir, entry))
-							if (resp) return resp
-						}
+						const wrapped = wrapCJS(code)
+						return new Response(wrapped || code, { headers: { 'Content-Type': 'application/javascript' } })
 					}
-				}
 
-				// Subpath: try the exact path, then with extensions
-				const resp = await serveResolved(filepath)
-				if (resp) return resp
-
-				// Extensionless: try .imba, .js, .mjs
-				if (!filepath.includes('.', filepath.lastIndexOf('/') + 1)) {
-					for (const ext of ['.imba', '.js', '.mjs']) {
-						const resp = await serveResolved(filepath + ext)
-						if (resp) return resp
-					}
+					const resolved = await resolveNodeModulesRequest(pathname)
+					const resp = resolved ? await serveResolved(resolved) : null
+					if (resp) return resp
 				}
-			}
 
 			// Static files: check htmlDir first (for assets relative to HTML), then root
 			const inHtmlDir = Bun.file(path.join(htmlDir, pathname))
@@ -731,13 +888,13 @@ export function serve(entrypoint, flags) {
 			}
 
 			// SPA fallback for extension-less paths
-			if (!lastSegment.includes('.')) {
-				let html = await Bun.file(htmlPath).text()
-				if (!importMapTag) importMapTag = await buildImportMap()
-				return new Response(transformHtml(html, entrypoint, importMapTag), {
-					headers: { 'Content-Type': 'text/html' },
-				})
-			}
+				if (!lastSegment.includes('.')) {
+					let html = await Bun.file(htmlPath).text()
+					if (!generatedImportMap) generatedImportMap = await buildGeneratedImportMap()
+					return new Response(transformHtml(html, entrypoint, generatedImportMap), {
+						headers: { 'Content-Type': 'text/html' },
+					})
+				}
 
 			return new Response('Not Found', { status: 404 })
 		},

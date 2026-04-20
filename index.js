@@ -14,7 +14,7 @@ let entrypoint = ''
 
 try {
     const { values, positionals } = parseArgs({
-        args: Bun.argv,
+        args: Bun.argv.slice(2),
         options: {
             watch: { type: 'boolean' },
             outdir: { type: 'string' },
@@ -29,11 +29,12 @@ try {
             port: { type: 'string' },
             html: { type: 'string' },
         },
+        allowNegative: true,
         strict: true,
         allowPositionals: true,
     });
     flags = values;
-    entrypoint = Bun.argv[2];
+    entrypoint = positionals[0] || '';
 }
 catch (error) {
     if (error instanceof Error)
@@ -43,16 +44,21 @@ catch (error) {
     process.exit(0);
 }
 
-// Ensure bunfig.toml exists and contains the required preload line
-const bunfigPath = path.join(process.cwd(), 'bunfig.toml');
-const preloadLine = 'preload = ["bimba-cli/plugin.js"]';
-if (!fs.existsSync(bunfigPath)) {
-    fs.writeFileSync(bunfigPath, preloadLine + '\n');
-} else {
-    const content = fs.readFileSync(bunfigPath, 'utf8');
-    if (!content.includes(preloadLine)) {
-        fs.appendFileSync(bunfigPath, (content.endsWith('\n') ? '' : '\n') + preloadLine + '\n');
+function ensureBunfigPreload() {
+    const bunfigPath = path.join(process.cwd(), 'bunfig.toml');
+    const preloadLine = 'preload = ["bimba-cli/plugin.js"]';
+
+    if (!fs.existsSync(bunfigPath)) {
+        console.log(theme.action("note: ") + theme.filename("bunfig.toml was not found, so bimba left it unchanged."));
+        console.log(theme.action("      ") + `Add ${theme.flags(preloadLine)} manually if you want Bun to preload the plugin.`);
+        return;
     }
+
+    const content = fs.readFileSync(bunfigPath, 'utf8');
+    if (content.includes(preloadLine)) return;
+
+    console.log(theme.action("note: ") + theme.filename("bunfig.toml already exists, so bimba did not edit it automatically."));
+    console.log(theme.action("      ") + `Add ${theme.flags(preloadLine)} manually if you want Bun to preload the plugin.`);
 }
 
 // help: more on bun building params here: https://bun.sh/docs/bundler
@@ -62,7 +68,7 @@ if(flags.help) {
     console.log("For example like this: "+theme.filedir('bimba file.imba --outdir public'));
     console.log("");
     console.log("   "+theme.flags('--outdir <folder>')+"                     Compile imba files to the specified folder");
-    console.log("   "+theme.flags('--minify')+"                              Minify compiled .js files");
+    console.log("   "+theme.flags('--no-minify')+"                           Disable minification for compiled .js files");
     console.log("   "+theme.flags('--sourcemap <inline|external|none>')+"    How should sourcemap files be included in the .js");
     console.log("   "+theme.flags('--target <browser|node>')+"               Target platform for both Imba compiler and Bun bundler");
     console.log("   "+theme.flags('--external <package>')+"                Exclude package from bundle (repeatable, e.g. --external ws --external node-pty)");
@@ -88,6 +94,7 @@ if (flags.serve) {
         console.log("");
         process.exit(1);
     }
+    ensureBunfigPreload();
     serve(entrypoint, { port: parseInt(flags.port) || 5200, html: flags.html });
 }
 // no entrypoint or outdir
@@ -100,7 +107,9 @@ else if(!entrypoint || !flags.outdir) {
 }
 // build
 else {
-    bundle();
+    ensureBunfigPreload();
+    const success = await bundle();
+    if (!success && !flags.watch) process.exit(1);
     watch(bundle);
 }
 
@@ -126,7 +135,7 @@ async function bundle() {
 
     if (!fs.existsSync(entrypoint)) {
         console.log(theme.failure('Error.') + ` The specified entrypoint does not exist: ${theme.filedir(entrypoint)}`);
-        process.exit(0);
+        return false;
     }
 
     stats.failed = 0
@@ -150,7 +159,7 @@ async function bundle() {
             outdir: flags.outdir,
             target: buildTarget,
             sourcemap: flags.sourcemap || 'none',
-            minify: true,
+            minify: flags.minify ?? true,
             splitting: flags.splitting || false,
             plugins: [imbaPlugin]
         };
@@ -182,6 +191,8 @@ async function bundle() {
                 console.log(log);
             }
         }
+
+        return result.success && !stats.failed && !stats.errors;
     }
     catch(error) {
         console.log(theme.folder("──────────────────────────────────────────────────────────────────────"));
@@ -189,6 +200,7 @@ async function bundle() {
         console.log(error)
         console.log(theme.folder("──────────────────────────────────────────────────────────────────────"));
         console.log(theme.failure(" Failure ") + theme.filename(' Bun found an error in the compiled JS file'))
+        return false;
     }
     finally {
         bundling = false;

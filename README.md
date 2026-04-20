@@ -82,7 +82,7 @@ Static files are resolved relative to the HTML file's directory first, then from
 
 To compile and bundle your source code from .imba to .js:
 ```bash
-bunx bimba src/index.imba --outdir public/js --minify
+bunx bimba src/index.imba --outdir public/js
 ```
 
 With watch:
@@ -100,7 +100,7 @@ bunx bimba src/index.imba --outdir public/js --watch --clearcache
 
 `--clearcache` — delete the cache directory on exit (Ctrl+C). Works only in watch mode.
 
-`--minify` — minify the output JS. Enabled by default in bundle mode.
+`--no-minify` — disable minification. Bundle mode minifies by default.
 
 `--sourcemap <inline|external|none>` — how to include source maps in the output (default: `none`).
 
