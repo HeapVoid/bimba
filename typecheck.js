@@ -157,7 +157,7 @@ function send(server, seq, command, args) {
 
 export async function checkImbaTypes(entrypoint, options = {}) {
     const cwd = options.cwd || process.cwd();
-    const timeout = Number(options.timeout || process.env.BIMBA_TYPECHECK_TIMEOUT || process.env.IMBA_TS_CHECK_TIMEOUT || 12000);
+    const timeout = Number(options.timeout || process.env.BIMBA_TYPECHECK_TIMEOUT || process.env.IMBA_TS_CHECK_TIMEOUT || 30000);
     const scanRoot = getScanRoot(entrypoint, cwd);
     const files = collectImbaFiles(scanRoot);
 
@@ -178,6 +178,7 @@ export async function checkImbaTypes(entrypoint, options = {}) {
         let buffer = Buffer.alloc(0);
         const seq = { value: 1 };
         const diagnostics = [];
+        let geterrSeq = null;
 
         const server = spawn(runner, [
             tsserver,
@@ -195,7 +196,7 @@ export async function checkImbaTypes(entrypoint, options = {}) {
             resolve(success);
         }
 
-        const timer = setTimeout(() => {
+        function finishWithDiagnostics() {
             const unique = uniqueDiagnostics(diagnostics);
 
             if (!unique.length) {
@@ -206,6 +207,11 @@ export async function checkImbaTypes(entrypoint, options = {}) {
 
             printDiagnostics(cwd, unique);
             console.log(theme.failure(' Failure ') + ` TypeScript found ${theme.count(unique.length)} diagnostic${unique.length > 1 ? 's' : ''}`);
+            finish(false);
+        }
+
+        const timer = setTimeout(() => {
+            console.log(theme.failure(' Failure ') + ` Timed out waiting for TypeScript diagnostics after ${theme.time(timeout)} ms`);
             finish(false);
         }, timeout);
 
@@ -219,7 +225,14 @@ export async function checkImbaTypes(entrypoint, options = {}) {
         server.stdout.on('data', chunk => {
             buffer = Buffer.concat([buffer, chunk]);
             buffer = parseMessages(buffer, msg => {
-                if (msg.type != 'event' || !/Diag$/.test(msg.event)) return;
+                if (msg.type != 'event') return;
+
+                if (msg.event == 'requestCompleted' && msg.body?.request_seq == geterrSeq) {
+                    finishWithDiagnostics();
+                    return;
+                }
+
+                if (!/Diag$/.test(msg.event)) return;
                 if (!msg.body?.diagnostics?.length) return;
 
                 for (const diagnostic of msg.body.diagnostics) {
@@ -246,6 +259,7 @@ export async function checkImbaTypes(entrypoint, options = {}) {
             if (settled) return;
             send(server, seq, 'configure', { preferences: {}, hostInfo: 'bimba-typecheck' });
             for (const file of files) send(server, seq, 'open', { file, projectRootPath: cwd });
+            geterrSeq = seq.value;
             send(server, seq, 'geterr', { files, delay: 0 });
         }, 100);
     });
