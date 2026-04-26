@@ -74,7 +74,7 @@ For a deep dive into how Imba compiles tags, how the render cache works, and how
 
 Static files are resolved relative to the HTML file's directory first, then from the project root (for `node_modules`, `src`, etc.). Extensionless imports (common in `node_modules`) are resolved by trying `.js` and `.mjs` extensions automatically.
 
-**npm package resolution:** The import map is built by reading each dependency's `package.json`. The resolution order is: `exports["."].import` → `exports["."].default` → `module` → `browser` → `main`. Packages with subpath exports (e.g. `"./styles.css"`) get individual import map entries. CJS-only packages (no ESM entry) are proxied through esm.sh.
+**npm package resolution:** The dev server maps package imports to `__bimba_vendor__/*` URLs and bundles those modules on demand with Bun (`target: "browser"`). Imba source files still compile separately for HMR, while Bun owns dependency resolution, `exports`, `browser` fields, nested `node_modules`, and CommonJS interop.
 
 ---
 

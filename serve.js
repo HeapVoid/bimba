@@ -1,4 +1,4 @@
-import { serve as bunServe, Glob } from 'bun'
+import { serve as bunServe } from 'bun'
 import * as compiler from 'imba/compiler'
 import { watch, existsSync, statSync } from 'fs'
 import path from 'path'
@@ -340,115 +340,16 @@ function findHtml(flagHtml) {
 	return candidates.find(p => existsSync(p)) || './index.html';
 }
 
-// ─── Node modules resolution ─────────────────────────────────────────────────
+// ─── Vendor modules ──────────────────────────────────────────────────────────
 
-const _pkgJsonCache = new Map() // pkg root dir → parsed package.json
+const _vendorCache = new Map() // entrypoint → { mtime, code }
 
-async function readPkgJson(pkgDir) {
-	const cached = _pkgJsonCache.get(pkgDir)
-	if (cached) return cached
-	try {
-		const json = JSON.parse(await Bun.file(path.join(pkgDir, 'package.json')).text())
-		_pkgJsonCache.set(pkgDir, json)
-		return json
-	} catch(_) {
-		return null
-	}
+function vendorUrl(specifier) {
+	return '/__bimba_vendor__/' + specifier
 }
 
-function toPosix(filepath) {
-	return filepath.replaceAll('\\', '/')
-}
-
-function toBrowserPath(filepath) {
-	return '/' + toPosix(path.relative(process.cwd(), path.resolve(filepath)))
-}
-
-function parsePackageSpecifier(specifier) {
-	if (specifier.startsWith('@')) {
-		const parts = specifier.split('/')
-		return {
-			name: parts.slice(0, 2).join('/'),
-			subpath: parts.slice(2).join('/'),
-		}
-	}
-
-	const [name, ...rest] = specifier.split('/')
-	return { name, subpath: rest.join('/') }
-}
-
-function isConditionMap(value) {
-	return !!value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).every(key => !key.startsWith('.'))
-}
-
-function pickExportTarget(value) {
-	if (!value) return null
-	if (typeof value === 'string') return value
-	if (Array.isArray(value)) {
-		for (const item of value) {
-			const resolved = pickExportTarget(item)
-			if (resolved) return resolved
-		}
-		return null
-	}
-	if (!isConditionMap(value)) return null
-
-	for (const key of ['browser', 'import', 'default', 'module']) {
-		const resolved = pickExportTarget(value[key])
-		if (resolved) return resolved
-	}
-
-	for (const nested of Object.values(value)) {
-		const resolved = pickExportTarget(nested)
-		if (resolved) return resolved
-	}
-
-	return null
-}
-
-function resolveExportTarget(exportsField, subpath = '') {
-	if (!exportsField) return null
-	const exportKey = subpath ? `./${subpath}` : '.'
-
-	if (typeof exportsField === 'string' || Array.isArray(exportsField) || isConditionMap(exportsField)) {
-		return exportKey === '.' ? pickExportTarget(exportsField) : null
-	}
-
-	const exact = exportsField[exportKey]
-	if (exact) return pickExportTarget(exact)
-
-	let bestMatch = null
-	for (const [key, value] of Object.entries(exportsField)) {
-		if (!key.startsWith('./') || !key.includes('*')) continue
-
-		const [prefix, suffix] = key.split('*')
-		if (!exportKey.startsWith(prefix) || !exportKey.endsWith(suffix)) continue
-
-		const matched = exportKey.slice(prefix.length, exportKey.length - suffix.length)
-		const target = pickExportTarget(value)
-		if (!target) continue
-
-		const score = prefix.length + suffix.length
-		if (!bestMatch || score > bestMatch.score) {
-			bestMatch = { matched, target, score }
-		}
-	}
-
-	return bestMatch ? bestMatch.target.replaceAll('*', bestMatch.matched) : null
-}
-
-function resolvePackageTarget(depPkg, subpath = '') {
-	if (subpath) {
-		const exported = resolveExportTarget(depPkg.exports, subpath)
-		if (exported) return exported
-		if (depPkg.exports) return null
-		return './' + subpath
-	}
-
-	const exported = resolveExportTarget(depPkg.exports)
-	if (exported) return exported
-	if (typeof depPkg.browser === 'string') return depPkg.browser
-	return depPkg.module || depPkg.main || null
+function vendorPrefixUrl(specifier) {
+	return vendorUrl(specifier) + '/'
 }
 
 function resolveFileCandidate(filepath) {
@@ -477,110 +378,77 @@ function resolveFileCandidate(filepath) {
 	return null
 }
 
-async function resolvePackageFile(specifier) {
-	const { name, subpath } = parsePackageSpecifier(specifier)
-	if (!name) return null
-
-	const pkgDir = path.join(process.cwd(), 'node_modules', name)
-	const depPkg = await readPkgJson(pkgDir)
-	if (!depPkg) return null
-
-	const target = resolvePackageTarget(depPkg, subpath)
-	if (!target) return null
-
-	const candidate = resolveFileCandidate(path.resolve(pkgDir, target))
-	return candidate ? path.resolve(candidate) : null
+function vendorSpecifierFromPath(pathname) {
+	const prefix = '/__bimba_vendor__/'
+	if (!pathname.startsWith(prefix)) return null
+	const specifier = decodeURIComponent(pathname.slice(prefix.length))
+	return specifier || null
 }
 
-async function resolveNodeModulesRequest(pathname) {
-	const specifier = pathname.replace(/^\/node_modules\//, '')
-	if (!specifier) return null
+async function bundleVendor(entrypoint) {
+	try {
+		const stat = path.isAbsolute(entrypoint) && existsSync(entrypoint) ? statSync(entrypoint) : null
+		const mtime = stat?.mtimeMs || 0
+		const cached = _vendorCache.get(entrypoint)
+		if (cached && cached.mtime === mtime) return cached
 
-	const direct = resolveFileCandidate(path.join(process.cwd(), 'node_modules', specifier))
-	if (direct) return path.resolve(direct)
+		const result = await Bun.build({
+			entrypoints: [entrypoint],
+			target: 'browser',
+			format: 'esm',
+			write: false,
+			minify: false,
+			sourcemap: 'none',
+			packages: 'bundle',
+		})
 
-	return resolvePackageFile(specifier)
-}
+		if (!result.success) {
+			return { mtime, errors: result.logs.map(log => String(log)) }
+		}
 
-function exportSpecifiers(name, exportsField) {
-	if (!exportsField || typeof exportsField === 'string' || Array.isArray(exportsField) || isConditionMap(exportsField)) {
-		return []
+		const output = result.outputs.find(output => output.path.endsWith('.js')) || result.outputs[0]
+		if (!output) return { mtime, errors: ['Bun.build did not return a JavaScript output'] }
+
+		let code = await output.text()
+		const css = (await Promise.all(
+			result.outputs
+				.filter(output => output.path.endsWith('.css'))
+				.map(output => output.text())
+		)).join('\n')
+		if (css) {
+			const id = JSON.stringify('vendor:' + entrypoint)
+			code = [
+				`const __bimba_vendor_css_id = ${id};`,
+				`let __bimba_vendor_css = document.querySelector('style[data-bimba-css=' + JSON.stringify(__bimba_vendor_css_id) + ']');`,
+				`if (!__bimba_vendor_css) { __bimba_vendor_css = document.createElement('style'); __bimba_vendor_css.setAttribute('data-bimba-css', __bimba_vendor_css_id); document.head.appendChild(__bimba_vendor_css); }`,
+				`__bimba_vendor_css.textContent = ${JSON.stringify(css)};`,
+				code,
+			].join('\n')
+		}
+		const bundled = { mtime, code }
+		_vendorCache.set(entrypoint, bundled)
+		return bundled
+	} catch (error) {
+		return { mtime: 0, errors: [error?.message || String(error)] }
 	}
-
-	return Object.entries(exportsField)
-		.filter(([key]) => key.startsWith('./') && key !== '.')
-		.map(([key, value]) => ({ key, value }))
-}
-
-async function expandPatternExport(name, pkgDir, key, value) {
-	const target = pickExportTarget(value)
-	if (!target || !key.includes('*') || !target.includes('*')) return {}
-
-	const specPattern = key.slice(2)
-	const [specPrefix, specSuffix] = specPattern.split('*')
-	const normalizedTarget = target.replace(/^\.\//, '')
-	const [targetPrefix, targetSuffix] = normalizedTarget.split('*')
-	const glob = new Glob(normalizedTarget)
-	const mappings = {}
-
-	for await (const file of glob.scan(pkgDir)) {
-		const rel = toPosix(file)
-		if (!rel.startsWith(targetPrefix) || !rel.endsWith(targetSuffix)) continue
-
-		const matched = rel.slice(targetPrefix.length, rel.length - targetSuffix.length)
-		const specifier = `${name}/${specPrefix}${matched}${specSuffix}`.replace(/\/+/g, '/')
-		mappings[specifier] = '/' + toPosix(path.join('node_modules', name, rel))
-	}
-
-	return mappings
 }
 
 async function buildGeneratedImportMap() {
 	const imports = {}
-	const visited = new Set()
-	const queue = []
 
 	try {
 		const pkg = JSON.parse(await Bun.file('./package.json').text())
 		for (const field of ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies']) {
-			queue.push(...Object.keys(pkg[field] || {}))
+			for (const name of Object.keys(pkg[field] || {})) {
+				imports[name] ||= vendorUrl(name)
+				imports[name + '/'] ||= vendorPrefixUrl(name)
+			}
 		}
 	} catch(_) { /* no package.json */ }
 
-	while (queue.length) {
-		const name = queue.shift()
-		if (!name || visited.has(name)) continue
-		visited.add(name)
-
-		const pkgDir = path.join(process.cwd(), 'node_modules', name)
-		const depPkg = await readPkgJson(pkgDir)
-		if (!depPkg) continue
-
-		const entryFile = await resolvePackageFile(name)
-		if (entryFile) imports[name] = toBrowserPath(entryFile)
-
-		if (depPkg.exports) {
-			for (const { key, value } of exportSpecifiers(name, depPkg.exports)) {
-				if (key.includes('*')) {
-					Object.assign(imports, await expandPatternExport(name, pkgDir, key, value))
-					continue
-				}
-
-				const specifier = `${name}/${key.slice(2)}`
-				const file = await resolvePackageFile(specifier)
-				if (file) imports[specifier] = toBrowserPath(file)
-			}
-		} else {
-			imports[name + '/'] = '/' + toPosix(path.join('node_modules', name)) + '/'
-		}
-
-		for (const field of ['dependencies', 'peerDependencies', 'optionalDependencies']) {
-			queue.push(...Object.keys(depPkg[field] || {}))
-		}
-	}
-
-	if (!imports['imba']) imports['imba'] = 'https://esm.sh/imba'
-	if (!imports['imba/runtime']) imports['imba/runtime'] = 'https://esm.sh/imba/runtime'
+	imports['imba'] ||= vendorUrl('imba')
+	imports['imba/'] ||= vendorPrefixUrl('imba')
+	imports['imba/runtime'] ||= vendorUrl('imba/runtime')
 
 	return { imports }
 }
@@ -630,15 +498,6 @@ function mergeImportMaps(generated, user) {
 
 function renderImportMapTag(importMap) {
 	return `\t\t<script type="importmap">\n\t\t\t${JSON.stringify(importMap, null, '\t\t\t\t')}\n\t\t</script>`
-}
-
-// Wrap a CommonJS file as an ESM module so the browser can import it.
-// Detects CJS by checking for `module.exports` or top-level `exports.` usage.
-function wrapCJS(code) {
-	if (!code.includes('module.exports') && !code.includes('exports.')) return null
-	// Already has ESM syntax — don't wrap (dual-format files)
-	if (/^\s*(export\s|import\s)/m.test(code)) return null
-	return `var module = { exports: {} }, exports = module.exports;\n${code}\nexport default module.exports;\nexport { module };`
 }
 
 // Rewrite production HTML for the dev server:
@@ -786,15 +645,25 @@ export function serve(entrypoint, flags) {
 				if (server.upgrade(req)) return undefined
 			}
 
-				// HTML: index or any .html file
-				if (pathname === '/' || pathname.endsWith('.html')) {
-					const htmlFile = pathname === '/' ? htmlPath : '.' + pathname
-					let html = await Bun.file(htmlFile).text()
-					if (!generatedImportMap) generatedImportMap = await buildGeneratedImportMap()
-					return new Response(transformHtml(html, entrypoint, generatedImportMap), {
-						headers: { 'Content-Type': 'text/html' },
-					})
+			if (pathname.startsWith('/__bimba_vendor__/')) {
+				const specifier = vendorSpecifierFromPath(pathname)
+				const bundled = specifier ? await bundleVendor(specifier) : null
+				if (bundled?.code) {
+					return new Response(bundled.code, { headers: { 'Content-Type': 'application/javascript' } })
 				}
+
+				return new Response((bundled?.errors || [`Could not bundle vendor module: ${specifier}`]).join('\n'), { status: 500 })
+			}
+
+			// HTML: index or any .html file
+			if (pathname === '/' || pathname.endsWith('.html')) {
+				const htmlFile = pathname === '/' ? htmlPath : '.' + pathname
+				let html = await Bun.file(htmlFile).text()
+				if (!generatedImportMap) generatedImportMap = await buildGeneratedImportMap()
+				return new Response(transformHtml(html, entrypoint, generatedImportMap), {
+					headers: { 'Content-Type': 'text/html' },
+				})
+			}
 
 			// Imba files: compile on demand and serve as JS
 			if (pathname.endsWith('.imba')) {
@@ -838,31 +707,25 @@ export function serve(entrypoint, flags) {
 				}
 			}
 
-				// node_modules: entry point resolution, .imba compilation, CJS→ESM wrapping.
-				// The import map points to concrete module URLs when possible, but we
-				// still resolve package-style /node_modules/pkg[/subpath] requests here
-				// so user-defined import maps and manual URLs keep working.
-				if (pathname.startsWith('/node_modules/')) {
-					// Serve a resolved file: compile .imba, wrap CJS as ESM, pass ESM through
-					const serveResolved = async (filePath) => {
-						if (filePath.endsWith('.imba')) {
-						const f = Bun.file(filePath)
-						if (!(await f.exists())) return null
-						const out = await compileFile(filePath)
-						if (out.errors?.length) return new Response(out.errors.map(e => e.message).join('\n'), { status: 500 })
-						return new Response(out.js, { headers: { 'Content-Type': 'application/javascript' } })
-					}
-					const f = Bun.file(filePath)
-					if (!(await f.exists())) return null
-					const code = await f.text()
-						const wrapped = wrapCJS(code)
-						return new Response(wrapped || code, { headers: { 'Content-Type': 'application/javascript' } })
-					}
-
-					const resolved = await resolveNodeModulesRequest(pathname)
-					const resp = resolved ? await serveResolved(resolved) : null
-					if (resp) return resp
+			// Direct node_modules URLs (from user import maps or explicit imports)
+			// are bundled through Bun too, so browser/cjs/exports handling stays
+			// in one place.
+			if (pathname.startsWith('/node_modules/')) {
+				const resolved = resolveFileCandidate('.' + pathname)
+				if (resolved?.endsWith('.imba')) {
+					const out = await compileFile(resolved)
+					if (out.errors?.length) return new Response(out.errors.map(e => e.message).join('\n'), { status: 500 })
+					return new Response(out.js, { headers: { 'Content-Type': 'application/javascript' } })
 				}
+
+				if (resolved) {
+					const bundled = await bundleVendor(path.resolve(resolved))
+					if (bundled?.code) {
+						return new Response(bundled.code, { headers: { 'Content-Type': 'application/javascript' } })
+					}
+					return new Response((bundled?.errors || [`Could not bundle ${pathname}`]).join('\n'), { status: 500 })
+				}
+			}
 
 			// Static files: check htmlDir first (for assets relative to HTML), then root
 			const inHtmlDir = Bun.file(path.join(htmlDir, pathname))
