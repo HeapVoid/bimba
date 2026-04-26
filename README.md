@@ -90,6 +90,21 @@ With watch:
 bunx bimba src/index.imba --outdir public/js --watch --clearcache
 ```
 
+### TypeScript diagnostics for Imba files
+
+To check TypeScript diagnostics reported by the Imba language-service plugin:
+```bash
+bunx bimba --typecheck
+```
+
+By default this scans `src/` when it exists, otherwise the project root. You can also pass a specific file or folder:
+```bash
+bunx bimba src/index.imba --typecheck
+bunx bimba src --typecheck
+```
+
+This mode requires `typescript` in the project and `typescript-imba-plugin` either in `node_modules` or in an installed Imba editor extension.
+
 ---
 
 ### All CLI flags
@@ -105,6 +120,10 @@ bunx bimba src/index.imba --outdir public/js --watch --clearcache
 `--sourcemap <inline|external|none>` — how to include source maps in the output (default: `none`).
 
 `--target <browser|node>` — platform flag passed to the Imba compiler (default: `browser`). The `node` value does not work under Bun.
+
+`--typecheck` — check TypeScript diagnostics in `.imba` files using `tsserver` and `typescript-imba-plugin`.
+
+`--tscheck` — alias for `--typecheck`.
 
 `--serve` — start dev server with HMR instead of bundling.
 

@@ -7,6 +7,7 @@ import fs from 'fs'
 import path from 'path';
 import { rmSync } from "node:fs";
 import { serve } from './serve.js';
+import { checkImbaTypes } from './typecheck.js';
 
 
 let flags = {}
@@ -28,6 +29,8 @@ try {
             serve: { type: 'boolean' },
             port: { type: 'string' },
             html: { type: 'string' },
+            typecheck: { type: 'boolean' },
+            tscheck: { type: 'boolean' },
         },
         allowNegative: true,
         strict: true,
@@ -74,6 +77,8 @@ if(flags.help) {
     console.log("   "+theme.flags('--external <package>')+"                Exclude package from bundle (repeatable, e.g. --external ws --external node-pty)");
     console.log("   "+theme.flags('--watch')+"                               Watch for changes in the entrypoint folder");
     console.log("   "+theme.flags('--clearcache')+"                          Clear cache on exit, works only when in watch mode");
+    console.log("   "+theme.flags('--typecheck')+"                           Check TypeScript diagnostics in .imba files");
+    console.log("   "+theme.flags('--tscheck')+"                             Alias for --typecheck");
     console.log("");
     console.log("Dev server (HMR):");
     console.log("   "+theme.flags('--serve')+"                               Start dev server with Hot Module Replacement");
@@ -86,8 +91,19 @@ if(flags.help) {
 
 let bundling = false;
 
+// typecheck mode
+if (flags.typecheck || flags.tscheck) {
+    try {
+        const success = await checkImbaTypes(entrypoint);
+        process.exit(success ? 0 : 1);
+    }
+    catch (error) {
+        console.log(theme.failure(' Failure ') + ` ${error.message}`);
+        process.exit(1);
+    }
+}
 // serve mode
-if (flags.serve) {
+else if (flags.serve) {
     if (!entrypoint) {
         console.log("");
         console.log("You should provide entrypoint: "+theme.flags('bimba file.imba --serve'));
