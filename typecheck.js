@@ -26,6 +26,10 @@ function canResolve(request, from) {
     }
 }
 
+function hasPackage(root, name) {
+    return fs.existsSync(path.join(root, name, 'package.json'));
+}
+
 function findTypeScript(cwd) {
     const tsserver = canResolve('typescript/lib/tsserver.js', cwd);
     if (tsserver) return tsserver;
@@ -35,7 +39,7 @@ function findTypeScript(cwd) {
 
 function findPluginProbe(cwd) {
     const localProbe = path.join(cwd, 'node_modules');
-    if (canResolve('typescript-imba-plugin', localProbe)) return localProbe;
+    if (hasPackage(localProbe, 'typescript-imba-plugin')) return localProbe;
 
     const extensionRoots = [
         path.join(os.homedir(), '.vscode', 'extensions'),
@@ -49,7 +53,7 @@ function findPluginProbe(cwd) {
 
         for (const entry of fs.readdirSync(root)) {
             const probe = path.join(root, entry, 'node_modules');
-            if (canResolve('typescript-imba-plugin', probe)) return probe;
+            if (hasPackage(probe, 'typescript-imba-plugin')) return probe;
         }
     }
 
