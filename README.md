@@ -37,9 +37,9 @@ bunx bimba src/index.imba --serve --port 5200 --html public/index.html
 **How it works:**
 - Serves your HTML file and compiles `.imba` files on demand (no bundling step)
 - Watches `src/` for changes and pushes updates over WebSocket
-- Injects an importmap built from your `package.json` dependencies (supports `exports`, `module`, `browser`, and `main` fields)
+- Rewrites bare package imports in served JS modules to `__bimba_vendor__/*` URLs
 - CSS files imported from JS (e.g. `import 'some-lib/styles.css'`) are automatically wrapped as JS modules that inject `<style>` tags
-- npm packages with ESM entry points are served from `node_modules` locally — no esm.sh proxy needed
+- npm packages are bundled on demand by Bun (`target: "browser"`), so Bun owns `exports`, `browser`, CommonJS interop, and nested dependency resolution
 - Injects an HMR client that swaps component prototypes without a full page reload
 
 **HMR internals:**
@@ -58,7 +58,7 @@ Duplicate root elements (caused by `imba.mount()` running again on re-import) ar
 
 For a deep dive into how Imba compiles tags, how the render cache works, and how bimba hooks into it — see [INTERNALS.md](INTERNALS.md).
 
-**HTML setup:** add a `data-entrypoint` attribute to the script tag that loads your bundle. The dev server will replace it with your `.imba` entrypoint and inject the importmap above it:
+**HTML setup:** add a `data-entrypoint` attribute to the script tag that loads your bundle. The dev server will replace it with your `.imba` entrypoint and remove existing import maps, since package imports are rewritten in served modules instead:
 
 ```html
 <script type='module' src="./js/index.js" data-entrypoint></script>
@@ -72,9 +72,9 @@ For a deep dive into how Imba compiles tags, how the render cache works, and how
 
 `--html <path>` — path to your HTML file (auto-detected from `./index.html`, `./public/index.html`, `./src/index.html` if omitted)
 
-Static files are resolved relative to the HTML file's directory first, then from the project root (for `node_modules`, `src`, etc.). Extensionless imports (common in `node_modules`) are resolved by trying `.js` and `.mjs` extensions automatically.
+Static files are resolved relative to the HTML file's directory first, then from the project root (for `node_modules`, `src`, etc.). Extensionless imports are resolved by trying `.imba`, `.js`, and `.mjs` extensions automatically.
 
-**npm package resolution:** The dev server maps package imports to `__bimba_vendor__/*` URLs and bundles those modules on demand with Bun (`target: "browser"`). Imba source files still compile separately for HMR, while Bun owns dependency resolution, `exports`, `browser` fields, nested `node_modules`, and CommonJS interop.
+**npm package resolution:** The dev server scans each served JS module and rewrites bare imports such as `imba/runtime`, `@scope/pkg`, and `pkg/subpath` to `__bimba_vendor__/*` URLs. Those vendor URLs are bundled on demand with Bun (`target: "browser"`). Imba source files still compile separately for HMR, while Bun owns dependency resolution, `exports`, `browser` fields, nested `node_modules`, and CommonJS interop.
 
 ---
 

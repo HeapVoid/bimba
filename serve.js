@@ -255,6 +255,7 @@ const hmrClient = `
 const _compileCache = new Map()  // filepath → { mtime, result }
 const _prevJs = new Map()  // filepath → compiled js — for change detection
 const _prevSlots = new Map()  // filepath → previous symbol slot count
+const _importScanner = new Bun.Transpiler({ loader: 'js' })
 
 // Imba compiles tag render-cache slots as anonymous local Symbols at module top
 // level: `var $4 = Symbol(), $11 = Symbol(), ...; let c$0 = Symbol();`. Each
@@ -299,6 +300,40 @@ function _normalizeResult(result, extras) {
 	}
 }
 
+function isBareSpecifier(specifier) {
+	if (!specifier) return false
+	if (specifier.startsWith('.') || specifier.startsWith('/')) return false
+	if (/^[a-zA-Z][a-zA-Z\d+.-]*:/.test(specifier)) return false
+	if (specifier.startsWith('#')) return false
+	return true
+}
+
+function escapeRegExp(value) {
+	return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+function rewriteBareImports(js) {
+	let imports = []
+	try {
+		imports = _importScanner.scanImports(js)
+	} catch (_) {
+		return js
+	}
+
+	for (const specifier of new Set(imports.map(item => item.path).filter(isBareSpecifier))) {
+		const target = vendorUrl(specifier)
+		const escaped = escapeRegExp(specifier)
+
+		const staticPattern = new RegExp(`((?:import|export)\\s+(?:[^'"]*?\\s+from\\s*)?)(['"])${escaped}\\2`, 'g')
+		js = js.replace(staticPattern, (_match, prefix, quote) => `${prefix}${quote}${target}${quote}`)
+
+		const dynamicPattern = new RegExp(`(\\bimport\\s*\\(\\s*)(['"])${escaped}\\2`, 'g')
+		js = js.replace(dynamicPattern, (_match, prefix, quote) => `${prefix}${quote}${target}${quote}`)
+	}
+
+	return js
+}
+
 async function compileFile(filepath) {
 	const abs = path.resolve(filepath)
 	const file = Bun.file(filepath)
@@ -318,7 +353,7 @@ async function compileFile(filepath) {
 	const errors = result.errors || []
 	if (!errors.length && result.js) {
 		const { js, slotCount } = stabilizeSymbols(result.js, abs)
-		result.js = js
+		result.js = rewriteBareImports(js)
 		const prev = _prevSlots.get(abs)
 		result.slots = (prev === undefined || prev === slotCount) ? 'stable' : 'shifted'
 		_prevSlots.set(abs, slotCount)
@@ -345,11 +380,7 @@ function findHtml(flagHtml) {
 const _vendorCache = new Map() // entrypoint → { mtime, code }
 
 function vendorUrl(specifier) {
-	return '/__bimba_vendor__/' + specifier
-}
-
-function vendorPrefixUrl(specifier) {
-	return vendorUrl(specifier) + '/'
+	return '/__bimba_vendor__/' + encodeURIComponent(specifier)
 }
 
 function resolveFileCandidate(filepath) {
@@ -453,86 +484,22 @@ async function bundleVendor(entrypoint) {
 	}
 }
 
-async function buildGeneratedImportMap() {
-	const imports = {}
-
-	try {
-		const pkg = JSON.parse(await Bun.file('./package.json').text())
-		for (const field of ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies']) {
-			for (const name of Object.keys(pkg[field] || {})) {
-				imports[name] ||= vendorUrl(name)
-				imports[name + '/'] ||= vendorPrefixUrl(name)
-			}
-		}
-	} catch(_) { /* no package.json */ }
-
-	imports['imba'] ||= vendorUrl('imba')
-	imports['imba/'] ||= vendorPrefixUrl('imba')
-	imports['imba/runtime'] ||= vendorUrl('imba/runtime')
-
-	return { imports }
-}
-
-function extractUserImportMap(html) {
-	const merged = { imports: {}, scopes: {} }
-
-	html = html.replace(/<script\s+type=["']importmap["'][^>]*>([\s\S]*?)<\/script>/gi, (_match, json) => {
-		try {
-			const parsed = JSON.parse(json)
-			Object.assign(merged.imports, parsed.imports || {})
-			for (const [scope, specifiers] of Object.entries(parsed.scopes || {})) {
-				merged.scopes[scope] = { ...(merged.scopes[scope] || {}), ...specifiers }
-			}
-		} catch (_) {
-			// ignore invalid import maps and keep serving the page
-		}
-		return ''
-	})
-
-	if (!Object.keys(merged.scopes).length) delete merged.scopes
-	return { html, importMap: merged }
-}
-
-function mergeImportMaps(generated, user) {
-	const merged = {
-		imports: { ...(generated.imports || {}), ...(user.imports || {}) },
-	}
-
-	const scopeKeys = new Set([
-		...Object.keys(generated.scopes || {}),
-		...Object.keys(user.scopes || {}),
-	])
-
-	if (scopeKeys.size) {
-		merged.scopes = {}
-		for (const key of scopeKeys) {
-			merged.scopes[key] = {
-				...((generated.scopes || {})[key] || {}),
-				...((user.scopes || {})[key] || {}),
-			}
-		}
-	}
-
-	return merged
-}
-
-function renderImportMapTag(importMap) {
-	return `\t\t<script type="importmap">\n\t\t\t${JSON.stringify(importMap, null, '\t\t\t\t')}\n\t\t</script>`
+async function serveJavaScriptFile(filepath) {
+	const js = rewriteBareImports(await Bun.file(filepath).text())
+	return new Response(js, { headers: { 'Content-Type': 'application/javascript' } })
 }
 
 // Rewrite production HTML for the dev server:
-// strips existing importmap + data-entrypoint script, injects merged importmap +
+// strips existing importmap + data-entrypoint script, then injects the Imba
 // entrypoint module + HMR client before </head>.
-function transformHtml(html, entrypoint, generatedImportMap) {
-	const extracted = extractUserImportMap(html)
-	html = extracted.html
+function transformHtml(html, entrypoint) {
+	html = html.replace(/<script\s+type=["']importmap["'][^>]*>[\s\S]*?<\/script>/gi, '')
 	html = html.replace(/<script([^>]*)\bdata-entrypoint\b([^>]*)><\/script>/gi, '')
 
 	const entryUrl = '/' + entrypoint.replace(/^\.\//, '').replaceAll('\\', '/')
-	const importMapTag = renderImportMapTag(mergeImportMaps(generatedImportMap, extracted.importMap))
 
 	html = html.replace('</head>',
-		`${importMapTag}\n\t\t<script type='module' src='${entryUrl}'></script>\n${hmrClient}\n\t</head>`
+		`\t\t<script type='module' src='${entryUrl}'></script>\n${hmrClient}\n\t</head>`
 	)
 	return html
 }
@@ -545,7 +512,6 @@ export function serve(entrypoint, flags) {
 	const htmlDir  = path.dirname(htmlPath)
 	const srcDir   = path.dirname(entrypoint)
 	const sockets  = new Set()
-	let generatedImportMap = null
 
 	// ── Status line (prints current compile result, fades out on success) ──────
 
@@ -679,8 +645,7 @@ export function serve(entrypoint, flags) {
 			if (pathname === '/' || pathname.endsWith('.html')) {
 				const htmlFile = pathname === '/' ? htmlPath : '.' + pathname
 				let html = await Bun.file(htmlFile).text()
-				if (!generatedImportMap) generatedImportMap = await buildGeneratedImportMap()
-				return new Response(transformHtml(html, entrypoint, generatedImportMap), {
+				return new Response(transformHtml(html, entrypoint), {
 					headers: { 'Content-Type': 'text/html' },
 				})
 			}
@@ -713,8 +678,13 @@ export function serve(entrypoint, flags) {
 			// Without this, `import './styles.css'` inside an ESM package fails because
 			// the browser expects a JS module response, not raw CSS.
 			if (pathname.endsWith('.css')) {
-				const cssFile = Bun.file('.' + pathname)
-				if (await cssFile.exists()) {
+				const cssPath = resolveFileCandidate(path.join(htmlDir, pathname)) || resolveFileCandidate('.' + pathname)
+				const cssFile = cssPath ? Bun.file(cssPath) : null
+				if (cssFile && await cssFile.exists()) {
+					if (req.headers.get('sec-fetch-dest') === 'style') {
+						return new Response(cssFile, { headers: { 'Content-Type': 'text/css' } })
+					}
+
 					const css = await cssFile.text()
 					const id = JSON.stringify(pathname)
 					const js = [
@@ -725,6 +695,11 @@ export function serve(entrypoint, flags) {
 					].join('\n')
 					return new Response(js, { headers: { 'Content-Type': 'application/javascript' } })
 				}
+			}
+
+			if (!pathname.startsWith('/node_modules/') && (pathname.endsWith('.js') || pathname.endsWith('.mjs'))) {
+				const jsFile = resolveFileCandidate(path.join(htmlDir, pathname)) || resolveFileCandidate('.' + pathname)
+				if (jsFile) return serveJavaScriptFile(jsFile)
 			}
 
 			// Direct node_modules URLs (from user import maps or explicit imports)
@@ -763,18 +738,15 @@ export function serve(entrypoint, flags) {
 					if (!out.errors?.length) return new Response(out.js, { headers: { 'Content-Type': 'application/javascript' } })
 				}
 				for (const ext of ['.js', '.mjs']) {
-					const withExt = Bun.file('.' + pathname + ext)
-					if (await withExt.exists()) return new Response(withExt, {
-						headers: { 'Content-Type': 'application/javascript' },
-					})
+					const withExt = '.' + pathname + ext
+					if (existsSync(withExt)) return serveJavaScriptFile(withExt)
 				}
 			}
 
 			// SPA fallback for extension-less paths
 				if (!lastSegment.includes('.')) {
 					let html = await Bun.file(htmlPath).text()
-					if (!generatedImportMap) generatedImportMap = await buildGeneratedImportMap()
-					return new Response(transformHtml(html, entrypoint, generatedImportMap), {
+					return new Response(transformHtml(html, entrypoint), {
 						headers: { 'Content-Type': 'text/html' },
 					})
 				}
