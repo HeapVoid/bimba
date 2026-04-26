@@ -1,6 +1,6 @@
 import { serve as bunServe } from 'bun'
 import * as compiler from 'imba/compiler'
-import { watch, existsSync, statSync } from 'fs'
+import { mkdirSync, watch, existsSync, statSync, writeFileSync } from 'fs'
 import path from 'path'
 import { theme } from './utils.js'
 import { printerr } from './plugin.js'
@@ -385,6 +385,25 @@ function vendorSpecifierFromPath(pathname) {
 	return specifier || null
 }
 
+function vendorEntrypoint(entrypoint) {
+	if (path.isAbsolute(entrypoint)) return entrypoint
+
+	const dir = path.join(process.cwd(), 'node_modules', '.cache', 'bimba', 'vendor-entry')
+	mkdirSync(dir, { recursive: true })
+
+	const name = encodeURIComponent(entrypoint).replace(/%/g, '_')
+	const file = path.join(dir, name + '.js')
+	const specifier = JSON.stringify(entrypoint)
+	const code = [
+		`export * from ${specifier};`,
+		`import * as mod from ${specifier};`,
+		`export default (mod.default ?? mod);`,
+		'',
+	].join('\n')
+	writeFileSync(file, code)
+	return file
+}
+
 async function bundleVendor(entrypoint) {
 	try {
 		const stat = path.isAbsolute(entrypoint) && existsSync(entrypoint) ? statSync(entrypoint) : null
@@ -392,8 +411,9 @@ async function bundleVendor(entrypoint) {
 		const cached = _vendorCache.get(entrypoint)
 		if (cached && cached.mtime === mtime) return cached
 
+		const buildEntrypoint = vendorEntrypoint(entrypoint)
 		const result = await Bun.build({
-			entrypoints: [entrypoint],
+			entrypoints: [buildEntrypoint],
 			target: 'browser',
 			format: 'esm',
 			write: false,
