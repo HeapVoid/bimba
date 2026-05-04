@@ -208,7 +208,7 @@ const hmrClient = `
 			if      (msg.type === 'update')      _applyUpdate(msg.file, msg.slots);
 			else if (msg.type === 'reload')      location.reload();
 			else if (msg.type === 'error')       showError(msg.file, msg.errors);
-			else if (msg.type === 'clear-error') clearError();
+			else if (msg.type === 'clear-error') clearError(msg.file);
 		};
 
 		ws.onclose = () => setTimeout(connect, 1000);
@@ -225,6 +225,7 @@ const hmrClient = `
 			overlay.addEventListener('click', e => { if (e.target === overlay) overlay.remove(); });
 			document.body.appendChild(overlay);
 		}
+		overlay.dataset.file = file;
 		overlay.innerHTML = \`
 			<div style="background:#1a1a1a;border:1px solid #ff4444;border-radius:8px;max-width:860px;width:100%;max-height:90vh;overflow:auto;box-shadow:0 0 40px rgba(255,68,68,.3)">
 				<div style="background:#ff4444;color:#fff;padding:10px 16px;font-size:13px;font-weight:600;display:flex;justify-content:space-between;align-items:center">
@@ -241,9 +242,9 @@ const hmrClient = `
 		\`;
 	}
 
-	function clearError() {
+	function clearError(file) {
 		const overlay = document.getElementById('__bimba_error__');
-		if (overlay) overlay.remove();
+		if (overlay && (!file || overlay.dataset.file === file)) overlay.remove();
 	}
 
 	connect();
@@ -256,6 +257,13 @@ const _compileCache = new Map()  // filepath → { mtime, result }
 const _prevJs = new Map()  // filepath → compiled js — for change detection
 const _prevSlots = new Map()  // filepath → previous symbol slot count
 const _importScanner = new Bun.Transpiler({ loader: 'js' })
+
+function dropFileState(filepath) {
+	const abs = path.resolve(filepath)
+	_compileCache.delete(abs)
+	_prevJs.delete(abs)
+	_prevSlots.delete(abs)
+}
 
 // Imba compiles tag render-cache slots as anonymous local Symbols at module top
 // level: `var $4 = Symbol(), $11 = Symbol(), ...; let c$0 = Symbol();`. Each
@@ -517,12 +525,23 @@ export function serve(entrypoint, flags) {
 
 	let _fadeTimers = []
 	let _fadeId = 0
+	let _statusFile = null
 	let _statusSaved = false
 	const _isTTY = process.stdout.isTTY
 
 	function cancelFade() {
 		_fadeTimers.forEach(t => clearTimeout(t))
 		_fadeTimers = []
+	}
+
+	function clearStatus(file) {
+		if (file && _statusFile && _statusFile !== file) return
+		cancelFade()
+		if (_statusSaved) {
+			process.stdout.write('\x1b[u\x1b[J')
+			_statusSaved = false
+		}
+		_statusFile = null
 	}
 
 	function printStatus(file, state, errors) {
@@ -552,6 +571,7 @@ export function serve(entrypoint, flags) {
 
 		process.stdout.write('\x1b[s')
 		_statusSaved = true
+		_statusFile = file
 
 		if (errors?.length) {
 			process.stdout.write(`  ${theme.folder(now)}  ${theme.filename(file)}  ${status}\n`)
@@ -567,7 +587,10 @@ export function serve(entrypoint, flags) {
 				_fadeTimers.push(setTimeout(() => {
 					if (_fadeId !== myId) return
 					process.stdout.write('\x1b[1D \x1b[1D')
-					if (i === total) _statusSaved = false
+					if (i === total) {
+						_statusSaved = false
+						_statusFile = null
+					}
 				}, 5000 + i * 22))
 			}
 		}
@@ -578,6 +601,11 @@ export function serve(entrypoint, flags) {
 	function broadcast(payload) {
 		const msg = JSON.stringify(payload)
 		for (const socket of sockets) socket.send(msg)
+	}
+
+	function clearError(file) {
+		clearStatus(file)
+		broadcast({ type: 'clear-error', file })
 	}
 
 	const _debounce = new Map()
@@ -591,6 +619,12 @@ export function serve(entrypoint, flags) {
 		const rel = path.join(path.relative('.', srcDir), filename).replaceAll('\\', '/')
 
 		try {
+			if (!existsSync(filepath)) {
+				dropFileState(filepath)
+				clearError(rel)
+				return
+			}
+
 			const out = await compileFile(filepath)
 
 
@@ -604,11 +638,12 @@ export function serve(entrypoint, flags) {
 				return
 			}
 
+			clearError()
+
 			// No change at all — skip
 			if (out.changeType === 'none' || out.changeType === 'cached') return
 
 			printStatus(rel, 'ok')
-			broadcast({ type: 'clear-error' })
 			broadcast({ type: 'update', file: rel, slots: out.slots || 'shifted' })
 		} catch(e) {
 			printStatus(rel, 'fail', [{ message: e.message }])
