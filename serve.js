@@ -354,16 +354,39 @@ function rewriteBareImports(js) {
 	return js
 }
 
+function isMissingFileError(error) {
+	return error?.code === 'ENOENT' || String(error?.message || error).includes('ENOENT: no such file or directory')
+}
+
+function missingCompileResult(filepath) {
+	dropFileState(filepath)
+	return { js: '', errors: [], slots: null, changeType: 'missing', missing: true }
+}
+
 async function compileFile(filepath) {
 	const abs = path.resolve(filepath)
+	if (!existsSync(abs)) return missingCompileResult(abs)
+
 	const file = Bun.file(filepath)
-	const stat = await file.stat()
+	let stat
+	try {
+		stat = await file.stat()
+	} catch (error) {
+		if (isMissingFileError(error)) return missingCompileResult(abs)
+		throw error
+	}
 	const mtime = stat.mtime.getTime()
 
 	const cached = _compileCache.get(abs)
 	if (cached && cached.mtime === mtime) return _normalizeResult(cached.result, { changeType: 'cached' })
 
-	const code = await file.text()
+	let code
+	try {
+		code = await file.text()
+	} catch (error) {
+		if (isMissingFileError(error)) return missingCompileResult(abs)
+		throw error
+	}
 	const result = compiler.compile(code, {
 		sourcePath: filepath,
 		platform: 'browser',
@@ -655,7 +678,7 @@ export function serve(entrypoint, flags) {
 
 	function errorSignature(errors) {
 		return serializeErrors(errors)
-			.map(error => [error.message, error.line || '', error.snippet || ''].join('\n'))
+			.map(error => [error.message, error.line || ''].join('\n'))
 			.join('\n---\n')
 	}
 
@@ -683,6 +706,16 @@ export function serve(entrypoint, flags) {
 		}
 
 		showTrackedError(key, item)
+	}
+
+	function errorText(errors) {
+		const list = Array.isArray(errors) ? errors : [errors]
+		return list.map(errorMessage).join('\n')
+	}
+
+	function errorResponse(file, errors, status = 500) {
+		reportError(file, errors)
+		return new Response(errorText(errors), { status })
 	}
 
 	function clearError(file) {
@@ -742,6 +775,10 @@ export function serve(entrypoint, flags) {
 			const out = await compileFile(filepath)
 
 			if (!isCurrentChange(filename, version)) return
+			if (out.missing) {
+				clearError(rel)
+				return
+			}
 
 			if (out.errors?.length) {
 				reportError(rel, out.errors)
@@ -757,6 +794,11 @@ export function serve(entrypoint, flags) {
 			broadcast({ type: 'update', file: rel, slots: out.slots || 'shifted' })
 		} catch(e) {
 			if (!isCurrentChange(filename, version)) return
+			if (isMissingFileError(e)) {
+				dropFileState(filepath)
+				clearError(rel)
+				return
+			}
 			reportError(rel, [{ message: e.message, snippet: e.stack || e.message }])
 		}
 	}
@@ -774,6 +816,7 @@ export function serve(entrypoint, flags) {
 		fetch: async (req, server) => {
 			const url = new URL(req.url)
 			const pathname = url.pathname
+			try {
 
 			// WebSocket upgrade for HMR
 			if (pathname === '/__hmr__') {
@@ -782,21 +825,33 @@ export function serve(entrypoint, flags) {
 
 			if (pathname.startsWith('/__bimba_vendor__/')) {
 				const specifier = vendorSpecifierFromPath(pathname)
+				const file = 'vendor:' + (specifier || pathname)
 				const bundled = specifier ? await bundleVendor(specifier) : null
 				if (bundled?.code) {
+					clearError(file)
 					return new Response(bundled.code, { headers: { 'Content-Type': 'application/javascript' } })
 				}
 
-				return new Response((bundled?.errors || [`Could not bundle vendor module: ${specifier}`]).join('\n'), { status: 500 })
+				return errorResponse(file, bundled?.errors || [`Could not bundle vendor module: ${specifier}`])
 			}
 
 			// HTML: index or any .html file
 			if (pathname === '/' || pathname.endsWith('.html')) {
 				const htmlFile = pathname === '/' ? htmlPath : '.' + pathname
-				let html = await Bun.file(htmlFile).text()
-				return new Response(transformHtml(html, entrypoint), {
-					headers: { 'Content-Type': 'text/html' },
-				})
+				const file = 'html:' + normalizeFile(htmlFile)
+				try {
+					let html = await Bun.file(htmlFile).text()
+					clearError(file)
+					return new Response(transformHtml(html, entrypoint), {
+						headers: { 'Content-Type': 'text/html' },
+					})
+				} catch (error) {
+					if (isMissingFileError(error)) {
+						clearError(file)
+						return new Response('Not Found', { status: 404 })
+					}
+					return errorResponse(file, [error])
+				}
 			}
 
 			// Imba files: compile on demand and serve as JS
@@ -805,15 +860,22 @@ export function serve(entrypoint, flags) {
 				const file = normalizeFile(pathname)
 				try {
 					const out = await compileFile(filepath)
+					if (out.missing) {
+						clearError(file)
+						return new Response('Not Found', { status: 404 })
+					}
 					if (out.errors?.length) {
-						reportError(file, out.errors)
-						return new Response(out.errors.map(e => e.message).join('\n'), { status: 500 })
+						return errorResponse(file, out.errors)
 					}
 					clearError(file)
 					return new Response(out.js, { headers: { 'Content-Type': 'application/javascript' } })
 				} catch(e) {
-					reportError(file, [{ message: e.message, snippet: e.stack || e.message }])
-					return new Response(e.message, { status: 500 })
+					if (isMissingFileError(e)) {
+						dropFileState(filepath)
+						clearError(file)
+						return new Response('Not Found', { status: 404 })
+					}
+					return errorResponse(file, [{ message: e.message, snippet: e.stack || e.message }])
 				}
 			}
 
@@ -823,26 +885,50 @@ export function serve(entrypoint, flags) {
 			if (pathname.endsWith('.css')) {
 				const cssPath = resolveFileCandidate(path.join(htmlDir, pathname)) || resolveFileCandidate('.' + pathname)
 				const cssFile = cssPath ? Bun.file(cssPath) : null
-				if (cssFile && await cssFile.exists()) {
-					if (req.headers.get('sec-fetch-dest') === 'style') {
-						return new Response(cssFile, { headers: { 'Content-Type': 'text/css' } })
-					}
+				const file = 'css:' + normalizeFile(cssPath || pathname)
+				try {
+					if (cssFile && await cssFile.exists()) {
+						if (req.headers.get('sec-fetch-dest') === 'style') {
+							clearError(file)
+							return new Response(cssFile, { headers: { 'Content-Type': 'text/css' } })
+						}
 
-					const css = await cssFile.text()
-					const id = JSON.stringify(pathname)
-					const js = [
-						`const id = ${id};`,
-						`let el = document.querySelector('style[data-bimba-css=' + JSON.stringify(id) + ']');`,
-						`if (!el) { el = document.createElement('style'); el.setAttribute('data-bimba-css', id); document.head.appendChild(el); }`,
-						`el.textContent = ${JSON.stringify(css)};`,
-					].join('\n')
-					return new Response(js, { headers: { 'Content-Type': 'application/javascript' } })
+						const css = await cssFile.text()
+						const id = JSON.stringify(pathname)
+						const js = [
+							`const id = ${id};`,
+							`let el = document.querySelector('style[data-bimba-css=' + JSON.stringify(id) + ']');`,
+							`if (!el) { el = document.createElement('style'); el.setAttribute('data-bimba-css', id); document.head.appendChild(el); }`,
+							`el.textContent = ${JSON.stringify(css)};`,
+						].join('\n')
+						clearError(file)
+						return new Response(js, { headers: { 'Content-Type': 'application/javascript' } })
+					}
+				} catch (error) {
+					if (isMissingFileError(error)) {
+						clearError(file)
+						return new Response('Not Found', { status: 404 })
+					}
+					return errorResponse(file, [error])
 				}
 			}
 
 			if (!pathname.startsWith('/node_modules/') && (pathname.endsWith('.js') || pathname.endsWith('.mjs'))) {
 				const jsFile = resolveFileCandidate(path.join(htmlDir, pathname)) || resolveFileCandidate('.' + pathname)
-				if (jsFile) return serveJavaScriptFile(jsFile)
+				if (jsFile) {
+					const file = 'js:' + normalizeFile(jsFile)
+					try {
+						const response = await serveJavaScriptFile(jsFile)
+						clearError(file)
+						return response
+					} catch (error) {
+						if (isMissingFileError(error)) {
+							clearError(file)
+							return new Response('Not Found', { status: 404 })
+						}
+						return errorResponse(file, [error])
+					}
+				}
 			}
 
 			// Direct node_modules URLs (from user import maps or explicit imports)
@@ -853,28 +939,45 @@ export function serve(entrypoint, flags) {
 				if (resolved?.endsWith('.imba')) {
 					const out = await compileFile(resolved)
 					const file = normalizeFile(resolved)
+					if (out.missing) {
+						clearError(file)
+						return new Response('Not Found', { status: 404 })
+					}
 					if (out.errors?.length) {
-						reportError(file, out.errors)
-						return new Response(out.errors.map(e => e.message).join('\n'), { status: 500 })
+						return errorResponse(file, out.errors)
 					}
 					clearError(file)
 					return new Response(out.js, { headers: { 'Content-Type': 'application/javascript' } })
 				}
 
 				if (resolved) {
+					const file = 'vendor:' + normalizeFile(pathname)
 					const bundled = await bundleVendor(path.resolve(resolved))
 					if (bundled?.code) {
+						clearError(file)
 						return new Response(bundled.code, { headers: { 'Content-Type': 'application/javascript' } })
 					}
-					return new Response((bundled?.errors || [`Could not bundle ${pathname}`]).join('\n'), { status: 500 })
+					return errorResponse(file, bundled?.errors || [`Could not bundle ${pathname}`])
 				}
 			}
 
 			// Static files: check htmlDir first (for assets relative to HTML), then root
-			const inHtmlDir = Bun.file(path.join(htmlDir, pathname))
-			if (await inHtmlDir.exists()) return new Response(inHtmlDir)
-			const inRoot = Bun.file('.' + pathname)
-			if (await inRoot.exists()) return new Response(inRoot)
+			try {
+				const inHtmlDirPath = path.join(htmlDir, pathname)
+				const inHtmlDir = Bun.file(inHtmlDirPath)
+				if (await inHtmlDir.exists()) {
+					clearError('static:' + normalizeFile(inHtmlDirPath))
+					return new Response(inHtmlDir)
+				}
+				const inRootPath = '.' + pathname
+				const inRoot = Bun.file(inRootPath)
+				if (await inRoot.exists()) {
+					clearError('static:' + normalizeFile(inRootPath))
+					return new Response(inRoot)
+				}
+			} catch (error) {
+				if (!isMissingFileError(error)) return errorResponse('static:' + normalizeFile(pathname), [error])
+			}
 
 			// Try extensions for extensionless paths (e.g. node_modules imports)
 			const lastSegment = pathname.split('/').pop()
@@ -884,28 +987,62 @@ export function serve(entrypoint, flags) {
 				if (existsSync(imbaPath)) {
 					const out = await compileFile(imbaPath)
 					const file = normalizeFile(imbaPath)
+					if (out.missing) {
+						clearError(file)
+						return new Response('Not Found', { status: 404 })
+					}
 					if (out.errors?.length) {
-						reportError(file, out.errors)
-						return new Response(out.errors.map(e => e.message).join('\n'), { status: 500 })
+						return errorResponse(file, out.errors)
 					}
 					clearError(file)
 					return new Response(out.js, { headers: { 'Content-Type': 'application/javascript' } })
 				}
 				for (const ext of ['.js', '.mjs']) {
 					const withExt = '.' + pathname + ext
-					if (existsSync(withExt)) return serveJavaScriptFile(withExt)
+					if (existsSync(withExt)) {
+						const file = 'js:' + normalizeFile(withExt)
+						try {
+							const response = await serveJavaScriptFile(withExt)
+							clearError(file)
+							return response
+						} catch (error) {
+							if (isMissingFileError(error)) {
+								clearError(file)
+								return new Response('Not Found', { status: 404 })
+							}
+							return errorResponse(file, [error])
+						}
+					}
 				}
 			}
 
 			// SPA fallback for extension-less paths
-				if (!lastSegment.includes('.')) {
+			if (!lastSegment.includes('.')) {
+				const file = 'html:' + normalizeFile(htmlPath)
+				try {
 					let html = await Bun.file(htmlPath).text()
+					clearError(file)
 					return new Response(transformHtml(html, entrypoint), {
 						headers: { 'Content-Type': 'text/html' },
 					})
+				} catch (error) {
+					if (isMissingFileError(error)) {
+						clearError(file)
+						return new Response('Not Found', { status: 404 })
+					}
+					return errorResponse(file, [error])
 				}
+			}
 
 			return new Response('Not Found', { status: 404 })
+			} catch (error) {
+				const file = 'server:' + normalizeFile(pathname || req.url)
+				if (isMissingFileError(error)) {
+					clearError(file)
+					return new Response('Not Found', { status: 404 })
+				}
+				return errorResponse(file, [error])
+			}
 		},
 
 		websocket: {

@@ -48,7 +48,7 @@ function compileErrorSnippet(error) {
 
 function compileErrorSignature(errors) {
   return errors
-    .map(error => [compileErrorMessage(error), compileErrorLine(error), compileErrorSnippet(error)].join('\n'))
+    .map(error => [compileErrorMessage(error), compileErrorLine(error)].join('\n'))
     .join('\n---\n');
 }
 
