@@ -731,10 +731,22 @@ export function serve(entrypoint, flags) {
 		clearStatus(key)
 		broadcast({ type: 'clear-error', file: key })
 
+		let showedNext = false
 		if (wasStatusFile && _activeErrors.size) {
 			const [nextFile, nextItem] = Array.from(_activeErrors.entries()).at(-1)
 			showTrackedError(nextFile, nextItem)
+			showedNext = true
 		}
+
+		return { cleared: hadError || wasStatusFile, file: key, showedNext }
+	}
+
+	function markSuccess(file) {
+		const key = normalizeFile(file)
+		const result = clearError(key)
+		const shouldPrint = result?.cleared && !result.showedNext
+		if (shouldPrint) printStatus(key, 'ok')
+		return { cleared: !!result?.cleared, printed: !!shouldPrint, showedNext: !!result?.showedNext }
 	}
 
 	const _debounce = new Map()
@@ -785,12 +797,12 @@ export function serve(entrypoint, flags) {
 				return
 			}
 
-			clearError(rel)
+			const success = markSuccess(rel)
 
 			// No change at all — skip
 			if (out.changeType === 'none' || out.changeType === 'cached') return
 
-			printStatus(rel, 'ok')
+			if (!success.printed && !success.showedNext) printStatus(rel, 'ok')
 			broadcast({ type: 'update', file: rel, slots: out.slots || 'shifted' })
 		} catch(e) {
 			if (!isCurrentChange(filename, version)) return
@@ -828,7 +840,7 @@ export function serve(entrypoint, flags) {
 				const file = 'vendor:' + (specifier || pathname)
 				const bundled = specifier ? await bundleVendor(specifier) : null
 				if (bundled?.code) {
-					clearError(file)
+					markSuccess(file)
 					return new Response(bundled.code, { headers: { 'Content-Type': 'application/javascript' } })
 				}
 
@@ -841,7 +853,7 @@ export function serve(entrypoint, flags) {
 				const file = 'html:' + normalizeFile(htmlFile)
 				try {
 					let html = await Bun.file(htmlFile).text()
-					clearError(file)
+					markSuccess(file)
 					return new Response(transformHtml(html, entrypoint), {
 						headers: { 'Content-Type': 'text/html' },
 					})
@@ -867,7 +879,7 @@ export function serve(entrypoint, flags) {
 					if (out.errors?.length) {
 						return errorResponse(file, out.errors)
 					}
-					clearError(file)
+					markSuccess(file)
 					return new Response(out.js, { headers: { 'Content-Type': 'application/javascript' } })
 				} catch(e) {
 					if (isMissingFileError(e)) {
@@ -889,7 +901,7 @@ export function serve(entrypoint, flags) {
 				try {
 					if (cssFile && await cssFile.exists()) {
 						if (req.headers.get('sec-fetch-dest') === 'style') {
-							clearError(file)
+							markSuccess(file)
 							return new Response(cssFile, { headers: { 'Content-Type': 'text/css' } })
 						}
 
@@ -901,7 +913,7 @@ export function serve(entrypoint, flags) {
 							`if (!el) { el = document.createElement('style'); el.setAttribute('data-bimba-css', id); document.head.appendChild(el); }`,
 							`el.textContent = ${JSON.stringify(css)};`,
 						].join('\n')
-						clearError(file)
+						markSuccess(file)
 						return new Response(js, { headers: { 'Content-Type': 'application/javascript' } })
 					}
 				} catch (error) {
@@ -919,7 +931,7 @@ export function serve(entrypoint, flags) {
 					const file = 'js:' + normalizeFile(jsFile)
 					try {
 						const response = await serveJavaScriptFile(jsFile)
-						clearError(file)
+						markSuccess(file)
 						return response
 					} catch (error) {
 						if (isMissingFileError(error)) {
@@ -946,7 +958,7 @@ export function serve(entrypoint, flags) {
 					if (out.errors?.length) {
 						return errorResponse(file, out.errors)
 					}
-					clearError(file)
+					markSuccess(file)
 					return new Response(out.js, { headers: { 'Content-Type': 'application/javascript' } })
 				}
 
@@ -954,7 +966,7 @@ export function serve(entrypoint, flags) {
 					const file = 'vendor:' + normalizeFile(pathname)
 					const bundled = await bundleVendor(path.resolve(resolved))
 					if (bundled?.code) {
-						clearError(file)
+						markSuccess(file)
 						return new Response(bundled.code, { headers: { 'Content-Type': 'application/javascript' } })
 					}
 					return errorResponse(file, bundled?.errors || [`Could not bundle ${pathname}`])
@@ -966,13 +978,13 @@ export function serve(entrypoint, flags) {
 				const inHtmlDirPath = path.join(htmlDir, pathname)
 				const inHtmlDir = Bun.file(inHtmlDirPath)
 				if (await inHtmlDir.exists()) {
-					clearError('static:' + normalizeFile(inHtmlDirPath))
+					markSuccess('static:' + normalizeFile(inHtmlDirPath))
 					return new Response(inHtmlDir)
 				}
 				const inRootPath = '.' + pathname
 				const inRoot = Bun.file(inRootPath)
 				if (await inRoot.exists()) {
-					clearError('static:' + normalizeFile(inRootPath))
+					markSuccess('static:' + normalizeFile(inRootPath))
 					return new Response(inRoot)
 				}
 			} catch (error) {
@@ -994,7 +1006,7 @@ export function serve(entrypoint, flags) {
 					if (out.errors?.length) {
 						return errorResponse(file, out.errors)
 					}
-					clearError(file)
+					markSuccess(file)
 					return new Response(out.js, { headers: { 'Content-Type': 'application/javascript' } })
 				}
 				for (const ext of ['.js', '.mjs']) {
@@ -1003,7 +1015,7 @@ export function serve(entrypoint, flags) {
 						const file = 'js:' + normalizeFile(withExt)
 						try {
 							const response = await serveJavaScriptFile(withExt)
-							clearError(file)
+							markSuccess(file)
 							return response
 						} catch (error) {
 							if (isMissingFileError(error)) {
@@ -1021,7 +1033,7 @@ export function serve(entrypoint, flags) {
 				const file = 'html:' + normalizeFile(htmlPath)
 				try {
 					let html = await Bun.file(htmlPath).text()
-					clearError(file)
+					markSuccess(file)
 					return new Response(transformHtml(html, entrypoint), {
 						headers: { 'Content-Type': 'text/html' },
 					})
