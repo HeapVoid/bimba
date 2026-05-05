@@ -216,7 +216,15 @@ const hmrClient = `
 
 	// ── Error overlay ──────────────────────────────────────────────────────────
 
+	function normalizeFile(file) {
+		let value = String(file || '').split(String.fromCharCode(92)).join('/');
+		while (value.startsWith('./')) value = value.slice(2);
+		while (value.startsWith('/')) value = value.slice(1);
+		return value;
+	}
+
 	function showError(file, errors) {
+		const displayFile = normalizeFile(file);
 		let overlay = document.getElementById('__bimba_error__');
 		if (!overlay) {
 			overlay = document.createElement('div');
@@ -225,11 +233,11 @@ const hmrClient = `
 			overlay.addEventListener('click', e => { if (e.target === overlay) overlay.remove(); });
 			document.body.appendChild(overlay);
 		}
-		overlay.dataset.file = file;
+		overlay.dataset.file = displayFile;
 		overlay.innerHTML = \`
 			<div style="background:#1a1a1a;border:1px solid #ff4444;border-radius:8px;max-width:860px;width:100%;max-height:90vh;overflow:auto;box-shadow:0 0 40px rgba(255,68,68,.3)">
 				<div style="background:#ff4444;color:#fff;padding:10px 16px;font-size:13px;font-weight:600;display:flex;justify-content:space-between;align-items:center">
-					<span>Compile error — \${file}</span>
+					<span>Compile error — \${displayFile}</span>
 					<span onclick="document.getElementById('__bimba_error__').remove()" style="cursor:pointer;opacity:.7;font-size:16px">✕</span>
 				</div>
 				\${errors.map(err => \`
@@ -244,7 +252,10 @@ const hmrClient = `
 
 	function clearError(file) {
 		const overlay = document.getElementById('__bimba_error__');
-		if (overlay && (!file || overlay.dataset.file === file)) overlay.remove();
+		if (!overlay) return;
+
+		const activeFile = overlay.dataset.file;
+		if (!file || !activeFile || activeFile === normalizeFile(file)) overlay.remove();
 	}
 
 	connect();

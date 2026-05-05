@@ -90,6 +90,8 @@ if(flags.help) {
 
 
 let bundling = false;
+let rebuildQueued = false;
+let watchTimer = null;
 
 // typecheck mode
 if (flags.typecheck || flags.tscheck) {
@@ -131,7 +133,13 @@ else {
 
 function watch(callback) {
     if (flags.watch) {
-        const watcher = fs.watch(path.dirname(entrypoint), {recursive: true}, async (event, filename) => ( callback() ));
+        const watcher = fs.watch(path.dirname(entrypoint), {recursive: true}, () => {
+            if (watchTimer) clearTimeout(watchTimer);
+            watchTimer = setTimeout(() => {
+                watchTimer = null;
+                callback();
+            }, 150);
+        });
     
         process.on("SIGINT", () => {
             if(flags.clearcache) rmSync(cache, { recursive: true, force: true });
@@ -146,7 +154,10 @@ function watch(callback) {
 
 
 async function bundle() {
-    if (bundling) return;
+    if (bundling) {
+        rebuildQueued = true;
+        return false;
+    }
     bundling = true;
 
     if (!fs.existsSync(entrypoint)) {
@@ -220,5 +231,9 @@ async function bundle() {
     }
     finally {
         bundling = false;
+        if (rebuildQueued) {
+            rebuildQueued = false;
+            queueMicrotask(bundle);
+        }
     };
 }
