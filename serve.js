@@ -265,7 +265,7 @@ const hmrClient = `
 
 // ─── Server-side compile cache ────────────────────────────────────────────────
 
-const _compileCache = new Map()  // filepath → { mtime, result }
+const _compileCache = new Map()  // filepath → { stamp, result }
 const _prevJs = new Map()  // filepath → compiled js — for change detection
 const _prevSlots = new Map()  // filepath → previous symbol slot count
 const _importScanner = new Bun.Transpiler({ loader: 'js' })
@@ -367,7 +367,7 @@ async function compileFile(filepath) {
 	const abs = path.resolve(filepath)
 	if (!existsSync(abs)) return missingCompileResult(abs)
 
-	const file = Bun.file(filepath)
+	const file = Bun.file(abs)
 	let stat
 	try {
 		stat = await file.stat()
@@ -375,10 +375,10 @@ async function compileFile(filepath) {
 		if (isMissingFileError(error)) return missingCompileResult(abs)
 		throw error
 	}
-	const mtime = stat.mtime.getTime()
+	const stamp = `${stat.mtimeMs ?? stat.mtime?.getTime?.() ?? 0}:${stat.size ?? 0}`
 
 	const cached = _compileCache.get(abs)
-	if (cached && cached.mtime === mtime) return _normalizeResult(cached.result, { changeType: 'cached' })
+	if (cached && cached.stamp === stamp) return _normalizeResult(cached.result, { changeType: 'cached' })
 
 	let code
 	try {
@@ -406,7 +406,7 @@ async function compileFile(filepath) {
 	const baked = { js: result.js, errors, slots: result.slots }
 	const changeType = _prevJs.get(abs) === baked.js ? 'none' : 'full'
 	_prevJs.set(abs, baked.js)
-	_compileCache.set(abs, { mtime, result: baked })
+	_compileCache.set(abs, { stamp, result: baked })
 	return _normalizeResult(baked, { changeType })
 }
 
@@ -652,6 +652,9 @@ export function serve(entrypoint, flags) {
 		return value
 	}
 
+	const srcRoot = path.resolve(srcDir)
+	const srcRel = normalizeFile(srcRoot)
+
 	function errorMessage(error) {
 		return error?.message || String(error)
 	}
@@ -752,33 +755,50 @@ export function serve(entrypoint, flags) {
 	const _debounce = new Map()
 	const _watchVersion = new Map()
 
-	function scheduleCompile(filename) {
+	function watchedFile(filename) {
 		filename = filename && String(filename)
-		if (!filename || !filename.endsWith('.imba')) return
+		if (!filename) return null
 
-		const version = (_watchVersion.get(filename) || 0) + 1
-		_watchVersion.set(filename, version)
+		let filepath
+		if (path.isAbsolute(filename)) {
+			filepath = path.resolve(filename)
+		} else {
+			const rel = normalizeFile(filename)
+			filepath = (rel === srcRel || rel.startsWith(srcRel + '/'))
+				? path.resolve(filename)
+				: path.resolve(srcRoot, filename)
+		}
 
-		const pending = _debounce.get(filename)
+		const rel = normalizeFile(filepath)
+		return { filepath, rel }
+	}
+
+	function scheduleCompile(filename) {
+		const file = watchedFile(filename)
+		if (!file || !file.rel.endsWith('.imba')) return
+
+		const version = (_watchVersion.get(file.rel) || 0) + 1
+		_watchVersion.set(file.rel, version)
+
+		const pending = _debounce.get(file.rel)
 		if (pending) clearTimeout(pending)
 
-		_debounce.set(filename, setTimeout(() => {
-			_debounce.delete(filename)
-			compileChangedFile(filename, version)
+		_debounce.set(file.rel, setTimeout(() => {
+			_debounce.delete(file.rel)
+			compileChangedFile(file, version)
 		}, 150))
 	}
 
-	function isCurrentChange(filename, version) {
-		return _watchVersion.get(filename) === version
+	function isCurrentChange(file, version) {
+		return _watchVersion.get(file.rel) === version
 	}
 
-	async function compileChangedFile(filename, version) {
-		const filepath = path.join(srcDir, filename)
-		const rel = normalizeFile(path.join(path.relative('.', srcDir), filename))
+	async function compileChangedFile(file, version) {
+		const { filepath, rel } = file
 
 		try {
 			if (!existsSync(filepath)) {
-				if (!isCurrentChange(filename, version)) return
+				if (!isCurrentChange(file, version)) return
 				dropFileState(filepath)
 				clearError(rel)
 				return
@@ -786,7 +806,7 @@ export function serve(entrypoint, flags) {
 
 			const out = await compileFile(filepath)
 
-			if (!isCurrentChange(filename, version)) return
+			if (!isCurrentChange(file, version)) return
 			if (out.missing) {
 				clearError(rel)
 				return
@@ -805,7 +825,7 @@ export function serve(entrypoint, flags) {
 			if (!success.printed && !success.showedNext) printStatus(rel, 'ok')
 			broadcast({ type: 'update', file: rel, slots: out.slots || 'shifted' })
 		} catch(e) {
-			if (!isCurrentChange(filename, version)) return
+			if (!isCurrentChange(file, version)) return
 			if (isMissingFileError(e)) {
 				dropFileState(filepath)
 				clearError(rel)
