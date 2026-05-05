@@ -609,17 +609,35 @@ export function serve(entrypoint, flags) {
 	}
 
 	const _debounce = new Map()
+	const _watchVersion = new Map()
 
-	watch(srcDir, { recursive: true }, async (_event, filename) => {
+	function scheduleCompile(filename) {
+		filename = filename && String(filename)
 		if (!filename || !filename.endsWith('.imba')) return
-		if (_debounce.has(filename)) return
-		_debounce.set(filename, setTimeout(() => _debounce.delete(filename), 150))
 
+		const version = (_watchVersion.get(filename) || 0) + 1
+		_watchVersion.set(filename, version)
+
+		const pending = _debounce.get(filename)
+		if (pending) clearTimeout(pending)
+
+		_debounce.set(filename, setTimeout(() => {
+			_debounce.delete(filename)
+			compileChangedFile(filename, version)
+		}, 150))
+	}
+
+	function isCurrentChange(filename, version) {
+		return _watchVersion.get(filename) === version
+	}
+
+	async function compileChangedFile(filename, version) {
 		const filepath = path.join(srcDir, filename)
 		const rel = path.join(path.relative('.', srcDir), filename).replaceAll('\\', '/')
 
 		try {
 			if (!existsSync(filepath)) {
+				if (!isCurrentChange(filename, version)) return
 				dropFileState(filepath)
 				clearError(rel)
 				return
@@ -627,6 +645,7 @@ export function serve(entrypoint, flags) {
 
 			const out = await compileFile(filepath)
 
+			if (!isCurrentChange(filename, version)) return
 
 			if (out.errors?.length) {
 				printStatus(rel, 'fail', out.errors)
@@ -638,7 +657,7 @@ export function serve(entrypoint, flags) {
 				return
 			}
 
-			clearError()
+			clearError(rel)
 
 			// No change at all — skip
 			if (out.changeType === 'none' || out.changeType === 'cached') return
@@ -646,9 +665,14 @@ export function serve(entrypoint, flags) {
 			printStatus(rel, 'ok')
 			broadcast({ type: 'update', file: rel, slots: out.slots || 'shifted' })
 		} catch(e) {
+			if (!isCurrentChange(filename, version)) return
 			printStatus(rel, 'fail', [{ message: e.message }])
 			broadcast({ type: 'error', file: rel, errors: [{ message: e.message, snippet: e.stack || e.message }] })
 		}
+	}
+
+	watch(srcDir, { recursive: true }, (_event, filename) => {
+		scheduleCompile(filename)
 	})
 
 	// ── HTTP + WebSocket server ────────────────────────────────────────────────
