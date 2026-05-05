@@ -168,6 +168,7 @@ async function bundle() {
     stats.failed = 0
     stats.compiled = 0
     stats.errors = 0
+    stats.reported = 0
     stats.bundled = 0
 
     const start = Date.now();
@@ -208,8 +209,10 @@ async function bundle() {
             }
         }
 
-        if(stats.failed)
-            console.log(theme.start(theme.failure(" Failure ") + theme.filename(` Imba compiler failed to proceed ${stats.failed} file${stats.failed > 1 ? 's' : ''}`)));
+        if(stats.failed) {
+            if (stats.reported)
+                console.log(theme.start(theme.failure(" Failure ") + theme.filename(` Imba compiler failed to proceed ${stats.failed} file${stats.failed > 1 ? 's' : ''}`)));
+        }
         else
             console.log(theme.start(theme.success("Success") +` It took ${theme.time(Date.now() - start)} ms to bundle ${theme.count(stats.bundled)} file${stats.bundled > 1 ? 's' : ''} to the folder: ${theme.filedir(flags.outdir)}`));
 

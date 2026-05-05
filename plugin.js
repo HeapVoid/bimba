@@ -16,7 +16,53 @@ export let stats = {
   cached: 0,
   bundled: 0,
   errors: 0,
+  reported: 0,
 };
+
+const _activeCompileErrors = new Map();
+
+function normalizeCompilePath(filepath) {
+  let value = String(filepath || '');
+  if (dir.isAbsolute(value)) {
+    const rel = dir.relative(process.cwd(), value);
+    if (!rel.startsWith('..')) value = rel;
+  }
+  return value.replaceAll('\\', '/');
+}
+
+function compileErrorMessage(error) {
+  return error?.message || String(error);
+}
+
+function compileErrorLine(error) {
+  return error?.range?.start?.line ?? error?.line ?? '';
+}
+
+function compileErrorSnippet(error) {
+  try {
+    return error?.toSnippet?.() || error?.snippet || error?.stack || compileErrorMessage(error);
+  } catch(_) {
+    return error?.snippet || error?.stack || compileErrorMessage(error);
+  }
+}
+
+function compileErrorSignature(errors) {
+  return errors
+    .map(error => [compileErrorMessage(error), compileErrorLine(error), compileErrorSnippet(error)].join('\n'))
+    .join('\n---\n');
+}
+
+function shouldPrintCompileError(filepath, errors) {
+  const key = normalizeCompilePath(filepath);
+  const signature = compileErrorSignature(errors);
+  const previous = _activeCompileErrors.get(key);
+  _activeCompileErrors.set(key, { signature, time: Date.now() });
+  return previous?.signature !== signature;
+}
+
+function clearCompileError(filepath) {
+  _activeCompileErrors.delete(normalizeCompilePath(filepath));
+}
 
 // Target platform for the Imba compiler: 'browser' or 'node'
 // Set via setTarget() from the CLI before building
@@ -36,6 +82,7 @@ export const imbaPlugin = {
       // return the cached version if exists (include target in hash to avoid cross-platform cache hits)
       const cached = dir.join(cache, Bun.hash(path + ':' + target) + '_' + fs.statSync(path).mtimeMs + '.js');
       if (fs.existsSync(cached)) {
+        clearCompileError(path);
         stats.bundled++;
         stats.cached++;
         return {
@@ -59,6 +106,7 @@ export const imbaPlugin = {
       
       // the file has been successfully compiled
       if (!out.errors?.length) {
+        clearCompileError(path);
         console.log(theme.action("compiling: ") + theme.folder(dir.join(f.dir,'/')) + theme.filename(f.base) + " - " + theme.success("compiled"));
         stats.bundled++;
         stats.compiled++;
@@ -67,10 +115,14 @@ export const imbaPlugin = {
       }
       // there were errors during compilation
       else {
-        console.log(theme.action("compiling: ") + theme.folder(dir.join(f.dir,'/')) + theme.filename(f.base) + " - " + theme.failure(" fail "));
+        const shouldPrint = shouldPrintCompileError(path, out.errors);
+        if (shouldPrint) console.log(theme.action("compiling: ") + theme.folder(dir.join(f.dir,'/')) + theme.filename(f.base) + " - " + theme.failure(" fail "));
         stats.failed++;
-        for (let i = 0; i < out.errors.length; i++) {
-          if(out.errors[i]) printerr(out.errors[i]);
+        if (shouldPrint) {
+          stats.reported++;
+          for (let i = 0; i < out.errors.length; i++) {
+            if(out.errors[i]) printerr(out.errors[i]);
+          }
         }
         stats.errors++;
       }

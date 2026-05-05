@@ -207,7 +207,7 @@ const hmrClient = `
 			const msg = JSON.parse(e.data);
 			if      (msg.type === 'update')      _applyUpdate(msg.file, msg.slots);
 			else if (msg.type === 'reload')      location.reload();
-			else if (msg.type === 'error')       showError(msg.file, msg.errors);
+			else if (msg.type === 'error')       showError(msg.file, msg.errors, msg.time);
 			else if (msg.type === 'clear-error') clearError(msg.file);
 		};
 
@@ -223,8 +223,9 @@ const hmrClient = `
 		return value;
 	}
 
-	function showError(file, errors) {
+	function showError(file, errors, time) {
 		const displayFile = normalizeFile(file);
+		const displayTime = time || new Date().toLocaleTimeString();
 		let overlay = document.getElementById('__bimba_error__');
 		if (!overlay) {
 			overlay = document.createElement('div');
@@ -237,7 +238,7 @@ const hmrClient = `
 		overlay.innerHTML = \`
 			<div style="background:#1a1a1a;border:1px solid #ff4444;border-radius:8px;max-width:860px;width:100%;max-height:90vh;overflow:auto;box-shadow:0 0 40px rgba(255,68,68,.3)">
 				<div style="background:#ff4444;color:#fff;padding:10px 16px;font-size:13px;font-weight:600;display:flex;justify-content:space-between;align-items:center">
-					<span>Compile error — \${displayFile}</span>
+					<span>Compile error — \${displayFile} <span style="opacity:.75;font-weight:400">\${displayTime}</span></span>
 					<span onclick="document.getElementById('__bimba_error__').remove()" style="cursor:pointer;opacity:.7;font-size:16px">✕</span>
 				</div>
 				\${errors.map(err => \`
@@ -609,14 +610,98 @@ export function serve(entrypoint, flags) {
 
 	// ── File watcher ───────────────────────────────────────────────────────────
 
+	const _activeErrors = new Map()
+
 	function broadcast(payload) {
 		const msg = JSON.stringify(payload)
 		for (const socket of sockets) socket.send(msg)
 	}
 
+	function normalizeFile(file) {
+		let value = String(file || '')
+		if (path.isAbsolute(value)) {
+			const rel = path.relative(process.cwd(), value)
+			if (!rel.startsWith('..')) value = rel
+		}
+		value = value.replaceAll('\\', '/')
+		while (value.startsWith('./')) value = value.slice(2)
+		while (value.startsWith('/')) value = value.slice(1)
+		return value
+	}
+
+	function errorMessage(error) {
+		return error?.message || String(error)
+	}
+
+	function errorLine(error) {
+		return error?.range?.start?.line ?? error?.line
+	}
+
+	function errorSnippet(error) {
+		try {
+			return error?.toSnippet?.() || error?.snippet || error?.stack || errorMessage(error)
+		} catch(_) {
+			return error?.snippet || error?.stack || errorMessage(error)
+		}
+	}
+
+	function serializeErrors(errors) {
+		return errors.map(error => ({
+			message: errorMessage(error),
+			line: errorLine(error),
+			snippet: errorSnippet(error),
+		}))
+	}
+
+	function errorSignature(errors) {
+		return serializeErrors(errors)
+			.map(error => [error.message, error.line || '', error.snippet || ''].join('\n'))
+			.join('\n---\n')
+	}
+
+	function showTrackedError(file, item) {
+		printStatus(file, 'fail', item.errors)
+		broadcast({ type: 'error', file, time: item.time, errors: item.payload })
+	}
+
+	function reportError(file, errors) {
+		const key = normalizeFile(file)
+		const list = Array.isArray(errors) ? errors : [errors]
+		const signature = errorSignature(list)
+		const previous = _activeErrors.get(key)
+
+		const item = {
+			signature,
+			errors: list,
+			payload: serializeErrors(list),
+			time: new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+		}
+		_activeErrors.set(key, item)
+		if (previous?.signature === signature && !_isTTY) {
+			broadcast({ type: 'error', file: key, time: item.time, errors: item.payload })
+			return
+		}
+
+		showTrackedError(key, item)
+	}
+
 	function clearError(file) {
-		clearStatus(file)
-		broadcast({ type: 'clear-error', file })
+		const key = file ? normalizeFile(file) : null
+		const wasStatusFile = key && _statusFile === key
+		const hadError = key ? _activeErrors.has(key) : _activeErrors.size > 0
+
+		if (key) _activeErrors.delete(key)
+		else _activeErrors.clear()
+
+		if (key && !hadError && !wasStatusFile) return
+
+		clearStatus(key)
+		broadcast({ type: 'clear-error', file: key })
+
+		if (wasStatusFile && _activeErrors.size) {
+			const [nextFile, nextItem] = Array.from(_activeErrors.entries()).at(-1)
+			showTrackedError(nextFile, nextItem)
+		}
 	}
 
 	const _debounce = new Map()
@@ -644,7 +729,7 @@ export function serve(entrypoint, flags) {
 
 	async function compileChangedFile(filename, version) {
 		const filepath = path.join(srcDir, filename)
-		const rel = path.join(path.relative('.', srcDir), filename).replaceAll('\\', '/')
+		const rel = normalizeFile(path.join(path.relative('.', srcDir), filename))
 
 		try {
 			if (!existsSync(filepath)) {
@@ -659,12 +744,7 @@ export function serve(entrypoint, flags) {
 			if (!isCurrentChange(filename, version)) return
 
 			if (out.errors?.length) {
-				printStatus(rel, 'fail', out.errors)
-				broadcast({ type: 'error', file: rel, errors: out.errors.map(e => ({
-					message: e.message,
-					line: e.range?.start?.line,
-					snippet: e.toSnippet(),
-				})) })
+				reportError(rel, out.errors)
 				return
 			}
 
@@ -677,8 +757,7 @@ export function serve(entrypoint, flags) {
 			broadcast({ type: 'update', file: rel, slots: out.slots || 'shifted' })
 		} catch(e) {
 			if (!isCurrentChange(filename, version)) return
-			printStatus(rel, 'fail', [{ message: e.message }])
-			broadcast({ type: 'error', file: rel, errors: [{ message: e.message, snippet: e.stack || e.message }] })
+			reportError(rel, [{ message: e.message, snippet: e.stack || e.message }])
 		}
 	}
 
@@ -723,23 +802,17 @@ export function serve(entrypoint, flags) {
 			// Imba files: compile on demand and serve as JS
 			if (pathname.endsWith('.imba')) {
 				const filepath = '.' + pathname
+				const file = normalizeFile(pathname)
 				try {
 					const out = await compileFile(filepath)
 					if (out.errors?.length) {
-						const file = pathname.replace(/^\//, '')
-						printStatus(file, 'fail', out.errors)
-						broadcast({ type: 'error', file, errors: out.errors.map(e => ({
-							message: e.message,
-							line: e.range?.start?.line,
-							snippet: e.toSnippet(),
-						})) })
+						reportError(file, out.errors)
 						return new Response(out.errors.map(e => e.message).join('\n'), { status: 500 })
 					}
+					clearError(file)
 					return new Response(out.js, { headers: { 'Content-Type': 'application/javascript' } })
 				} catch(e) {
-					const file = pathname.replace(/^\//, '')
-					printStatus(file, 'fail', [{ message: e.message }])
-					broadcast({ type: 'error', file, errors: [{ message: e.message, snippet: e.stack || e.message }] })
+					reportError(file, [{ message: e.message, snippet: e.stack || e.message }])
 					return new Response(e.message, { status: 500 })
 				}
 			}
@@ -779,7 +852,12 @@ export function serve(entrypoint, flags) {
 				const resolved = resolveFileCandidate('.' + pathname)
 				if (resolved?.endsWith('.imba')) {
 					const out = await compileFile(resolved)
-					if (out.errors?.length) return new Response(out.errors.map(e => e.message).join('\n'), { status: 500 })
+					const file = normalizeFile(resolved)
+					if (out.errors?.length) {
+						reportError(file, out.errors)
+						return new Response(out.errors.map(e => e.message).join('\n'), { status: 500 })
+					}
+					clearError(file)
 					return new Response(out.js, { headers: { 'Content-Type': 'application/javascript' } })
 				}
 
@@ -805,7 +883,13 @@ export function serve(entrypoint, flags) {
 				const imbaPath = '.' + pathname + '.imba'
 				if (existsSync(imbaPath)) {
 					const out = await compileFile(imbaPath)
-					if (!out.errors?.length) return new Response(out.js, { headers: { 'Content-Type': 'application/javascript' } })
+					const file = normalizeFile(imbaPath)
+					if (out.errors?.length) {
+						reportError(file, out.errors)
+						return new Response(out.errors.map(e => e.message).join('\n'), { status: 500 })
+					}
+					clearError(file)
+					return new Response(out.js, { headers: { 'Content-Type': 'application/javascript' } })
 				}
 				for (const ext of ['.js', '.mjs']) {
 					const withExt = '.' + pathname + ext
