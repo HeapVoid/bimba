@@ -98,7 +98,7 @@ const hmrClient = `
 	}
 
 	async function _doUpdate(file, slots) {
-		clearError();
+		clearError(file);
 
 		const bodyBefore = new Set(document.body.children);
 		const tagsBefore = new Set();
@@ -216,6 +216,8 @@ const hmrClient = `
 
 	// ── Error overlay ──────────────────────────────────────────────────────────
 
+	const _compileErrors = new Map();
+
 	function normalizeFile(file) {
 		let value = String(file || '').split(String.fromCharCode(92)).join('/');
 		while (value.startsWith('./')) value = value.slice(2);
@@ -223,10 +225,24 @@ const hmrClient = `
 		return value;
 	}
 
-	function showError(file, errors, time) {
-		const displayFile = normalizeFile(file);
-		const displayTime = time || new Date().toLocaleTimeString();
+	function escapeHtml(value) {
+		return String(value ?? '').replace(/[&<>"']/g, ch => ({
+			'&': '&amp;',
+			'<': '&lt;',
+			'>': '&gt;',
+			'"': '&quot;',
+			"'": '&#39;',
+		})[ch]);
+	}
+
+	function renderErrors() {
 		let overlay = document.getElementById('__bimba_error__');
+
+		if (!_compileErrors.size) {
+			if (overlay) overlay.remove();
+			return;
+		}
+
 		if (!overlay) {
 			overlay = document.createElement('div');
 			overlay.id = '__bimba_error__';
@@ -234,29 +250,48 @@ const hmrClient = `
 			overlay.addEventListener('click', e => { if (e.target === overlay) overlay.remove(); });
 			document.body.appendChild(overlay);
 		}
-		overlay.dataset.file = displayFile;
-		overlay.innerHTML = \`
-			<div style="background:#1a1a1a;border:1px solid #ff4444;border-radius:8px;max-width:860px;width:100%;max-height:90vh;overflow:auto;box-shadow:0 0 40px rgba(255,68,68,.3)">
-				<div style="background:#ff4444;color:#fff;padding:10px 16px;font-size:13px;font-weight:600;display:flex;justify-content:space-between;align-items:center">
-					<span>Compile error — \${displayFile} <span style="opacity:.75;font-weight:400">\${displayTime}</span></span>
-					<span onclick="document.getElementById('__bimba_error__').remove()" style="cursor:pointer;opacity:.7;font-size:16px">✕</span>
-				</div>
-				\${errors.map(err => \`
-					<div style="padding:16px;border-bottom:1px solid #333">
-						<div style="color:#ff8080;font-size:13px;margin-bottom:10px">\${err.message}\${err.line ? \` <span style="color:#888">line \${err.line}</span>\` : ''}</div>
-						\${err.snippet ? \`<pre style="margin:0;padding:10px;background:#111;border-radius:4px;font-size:12px;line-height:1.6;color:#ccc;overflow-x:auto;white-space:pre">\${err.snippet.replace(/</g,'&lt;')}</pre>\` : ''}
-					</div>
-				\`).join('')}
-			</div>
-		\`;
+
+		const files = Array.from(_compileErrors.entries());
+		overlay.innerHTML =
+			'<div style="background:#1a1a1a;border:1px solid #ff4444;border-radius:8px;max-width:900px;width:100%;max-height:90vh;overflow:auto;box-shadow:0 0 40px rgba(255,68,68,.3)">' +
+				'<div style="background:#ff4444;color:#fff;padding:10px 16px;font-size:13px;font-weight:600;display:flex;justify-content:space-between;align-items:center">' +
+					'<span>Compile errors — ' + files.length + '</span>' +
+					'<span onclick="document.getElementById(\\'__bimba_error__\\').remove()" style="cursor:pointer;opacity:.7;font-size:16px">✕</span>' +
+				'</div>' +
+				files.map(([displayFile, item]) => {
+					const errors = item.errors || [];
+					return '<div style="border-bottom:1px solid #333">' +
+						'<div style="padding:10px 16px;background:#241616;color:#ffd1d1;font-size:13px;font-weight:600;display:flex;justify-content:space-between;gap:16px">' +
+							'<span>' + escapeHtml(displayFile) + '</span>' +
+							'<span style="opacity:.75;font-weight:400">' + escapeHtml(item.time || '') + '</span>' +
+						'</div>' +
+						errors.map(err =>
+							'<div style="padding:16px;border-top:1px solid #333">' +
+								'<div style="color:#ff8080;font-size:13px;margin-bottom:10px">' +
+									escapeHtml(err.message) +
+									(err.line ? ' <span style="color:#888">line ' + escapeHtml(err.line) + '</span>' : '') +
+								'</div>' +
+								(err.snippet ? '<pre style="margin:0;padding:10px;background:#111;border-radius:4px;font-size:12px;line-height:1.6;color:#ccc;overflow-x:auto;white-space:pre">' + escapeHtml(err.snippet) + '</pre>' : '') +
+							'</div>'
+						).join('') +
+					'</div>';
+				}).join('') +
+			'</div>';
+	}
+
+	function showError(file, errors, time) {
+		const displayFile = normalizeFile(file);
+		_compileErrors.set(displayFile, {
+			errors: Array.isArray(errors) ? errors : [errors],
+			time: time || new Date().toLocaleTimeString(),
+		});
+		renderErrors();
 	}
 
 	function clearError(file) {
-		const overlay = document.getElementById('__bimba_error__');
-		if (!overlay) return;
-
-		const activeFile = overlay.dataset.file;
-		if (!file || !activeFile || activeFile === normalizeFile(file)) overlay.remove();
+		if (file) _compileErrors.delete(normalizeFile(file));
+		else _compileErrors.clear();
+		renderErrors();
 	}
 
 	connect();
@@ -562,6 +597,7 @@ export function serve(entrypoint, flags) {
 	let _fadeId = 0
 	let _statusFile = null
 	let _statusSaved = false
+	let _statusKind = null
 	const _isTTY = process.stdout.isTTY
 
 	function cancelFade() {
@@ -577,6 +613,7 @@ export function serve(entrypoint, flags) {
 			_statusSaved = false
 		}
 		_statusFile = null
+		_statusKind = null
 	}
 
 	function printStatus(file, state, errors) {
@@ -607,6 +644,7 @@ export function serve(entrypoint, flags) {
 		process.stdout.write('\x1b[s')
 		_statusSaved = true
 		_statusFile = file
+		_statusKind = state
 
 		if (errors?.length) {
 			process.stdout.write(`  ${theme.folder(now)}  ${theme.filename(file)}  ${status}\n`)
@@ -625,6 +663,7 @@ export function serve(entrypoint, flags) {
 					if (i === total) {
 						_statusSaved = false
 						_statusFile = null
+						_statusKind = null
 					}
 				}, 5000 + i * 22))
 			}
@@ -634,6 +673,33 @@ export function serve(entrypoint, flags) {
 	// ── File watcher ───────────────────────────────────────────────────────────
 
 	const _activeErrors = new Map()
+
+	function renderErrorPanel() {
+		if (!_isTTY) return false
+
+		cancelFade()
+		if (_statusSaved) {
+			process.stdout.write('\x1b[u\x1b[J')
+			_statusSaved = false
+		}
+		_statusFile = null
+		_statusKind = null
+
+		if (!_activeErrors.size) return false
+
+		process.stdout.write('\x1b[s')
+		_statusSaved = true
+		_statusKind = 'errors'
+
+		for (const [file, item] of _activeErrors.entries()) {
+			process.stdout.write(`  ${theme.folder(item.time)}  ${theme.filename(file)}  ${theme.failure(' fail ')}\n`)
+			for (const err of item.errors) {
+				try { printerr(err) } catch(_) { process.stdout.write('  ' + err.message + '\n') }
+			}
+		}
+
+		return true
+	}
 
 	function broadcast(payload) {
 		const msg = JSON.stringify(payload)
@@ -686,7 +752,8 @@ export function serve(entrypoint, flags) {
 	}
 
 	function showTrackedError(file, item) {
-		printStatus(file, 'fail', item.errors)
+		if (_isTTY) renderErrorPanel()
+		else printStatus(file, 'fail', item.errors)
 		broadcast({ type: 'error', file, time: item.time, errors: item.payload })
 	}
 
@@ -731,11 +798,16 @@ export function serve(entrypoint, flags) {
 
 		if (key && !hadError && !wasStatusFile) return
 
-		clearStatus(key)
+		let showedNext = false
+		if (_isTTY && (hadError || _statusKind === 'errors')) {
+			showedNext = renderErrorPanel()
+		} else {
+			clearStatus(key)
+		}
+
 		broadcast({ type: 'clear-error', file: key })
 
-		let showedNext = false
-		if (wasStatusFile && _activeErrors.size) {
+		if (!_isTTY && wasStatusFile && _activeErrors.size) {
 			const [nextFile, nextItem] = Array.from(_activeErrors.entries()).at(-1)
 			showTrackedError(nextFile, nextItem)
 			showedNext = true
@@ -747,9 +819,10 @@ export function serve(entrypoint, flags) {
 	function markSuccess(file) {
 		const key = normalizeFile(file)
 		const result = clearError(key)
-		const shouldPrint = result?.cleared && !result.showedNext
+		const active = _activeErrors.size
+		const shouldPrint = result?.cleared && !result.showedNext && !active
 		if (shouldPrint) printStatus(key, 'ok')
-		return { cleared: !!result?.cleared, printed: !!shouldPrint, showedNext: !!result?.showedNext }
+		return { cleared: !!result?.cleared, printed: !!shouldPrint, showedNext: !!result?.showedNext, active }
 	}
 
 	const _debounce = new Map()
@@ -822,7 +895,7 @@ export function serve(entrypoint, flags) {
 			// No change at all — skip
 			if (out.changeType === 'none' || out.changeType === 'cached') return
 
-			if (!success.printed && !success.showedNext) printStatus(rel, 'ok')
+			if (!success.printed && !success.showedNext && !success.active) printStatus(rel, 'ok')
 			broadcast({ type: 'update', file: rel, slots: out.slots || 'shifted' })
 		} catch(e) {
 			if (!isCurrentChange(file, version)) return
