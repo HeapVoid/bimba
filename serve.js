@@ -219,10 +219,17 @@ const hmrClient = `
 	const _compileErrors = new Map();
 
 	function normalizeFile(file) {
-		let value = String(file || '').split(String.fromCharCode(92)).join('/');
+		let value = String(file || '').split(/[?#]/)[0].split(String.fromCharCode(92)).join('/');
 		while (value.startsWith('./')) value = value.slice(2);
 		while (value.startsWith('/')) value = value.slice(1);
 		return value;
+	}
+
+	function sameFile(left, right) {
+		const a = normalizeFile(left);
+		const b = normalizeFile(right);
+		if (!a || !b) return false;
+		return a === b || a.endsWith('/' + b) || b.endsWith('/' + a);
 	}
 
 	function escapeHtml(value) {
@@ -281,6 +288,9 @@ const hmrClient = `
 
 	function showError(file, errors, time) {
 		const displayFile = normalizeFile(file);
+		for (const key of Array.from(_compileErrors.keys())) {
+			if (sameFile(key, displayFile)) _compileErrors.delete(key);
+		}
 		_compileErrors.set(displayFile, {
 			errors: Array.isArray(errors) ? errors : [errors],
 			time: time || new Date().toLocaleTimeString(),
@@ -289,8 +299,14 @@ const hmrClient = `
 	}
 
 	function clearError(file) {
-		if (file) _compileErrors.delete(normalizeFile(file));
-		else _compileErrors.clear();
+		if (file) {
+			const displayFile = normalizeFile(file);
+			for (const key of Array.from(_compileErrors.keys())) {
+				if (sameFile(key, displayFile)) _compileErrors.delete(key);
+			}
+		} else {
+			_compileErrors.clear();
+		}
 		renderErrors();
 	}
 
@@ -708,6 +724,7 @@ export function serve(entrypoint, flags) {
 
 	function normalizeFile(file) {
 		let value = String(file || '')
+		value = value.split(/[?#]/)[0]
 		if (path.isAbsolute(value)) {
 			const rel = path.relative(process.cwd(), value)
 			if (!rel.startsWith('..')) value = rel
@@ -720,6 +737,40 @@ export function serve(entrypoint, flags) {
 
 	const srcRoot = path.resolve(srcDir)
 	const srcRel = normalizeFile(srcRoot)
+
+	function fileVariants(file) {
+		const key = normalizeFile(file)
+		const variants = new Set([key])
+
+		if (srcRel && key.startsWith(srcRel + '/')) variants.add(key.slice(srcRel.length + 1))
+		else if (srcRel && key) variants.add(srcRel + '/' + key)
+
+		return Array.from(variants).filter(Boolean)
+	}
+
+	function sameFile(left, right) {
+		const lefts = fileVariants(left)
+		const rights = fileVariants(right)
+
+		for (const a of lefts) {
+			for (const b of rights) {
+				if (a === b || a.endsWith('/' + b) || b.endsWith('/' + a)) return true
+			}
+		}
+
+		return false
+	}
+
+	function takeError(file) {
+		let previous = null
+		const keys = Array.from(_activeErrors.keys())
+		for (const key of keys) {
+			if (!sameFile(key, file)) continue
+			previous ||= _activeErrors.get(key)
+			_activeErrors.delete(key)
+		}
+		return previous
+	}
 
 	function errorMessage(error) {
 		return error?.message || String(error)
@@ -761,7 +812,7 @@ export function serve(entrypoint, flags) {
 		const key = normalizeFile(file)
 		const list = Array.isArray(errors) ? errors : [errors]
 		const signature = errorSignature(list)
-		const previous = _activeErrors.get(key)
+		const previous = takeError(key)
 
 		const item = {
 			signature,
@@ -790,18 +841,16 @@ export function serve(entrypoint, flags) {
 
 	function clearError(file) {
 		const key = file ? normalizeFile(file) : null
-		const wasStatusFile = key && _statusFile === key
-		const hadError = key ? _activeErrors.has(key) : _activeErrors.size > 0
+		const hadPanel = _statusKind === 'errors'
+		const wasStatusFile = key && _statusFile && sameFile(_statusFile, key)
+		const hadError = key ? !!takeError(key) : _activeErrors.size > 0
 
-		if (key) _activeErrors.delete(key)
-		else _activeErrors.clear()
-
-		if (key && !hadError && !wasStatusFile) return
+		if (!key) _activeErrors.clear()
 
 		let showedNext = false
-		if (_isTTY && (hadError || _statusKind === 'errors')) {
+		if (_isTTY && (hadError || wasStatusFile || hadPanel)) {
 			showedNext = renderErrorPanel()
-		} else {
+		} else if (!key || hadError || wasStatusFile) {
 			clearStatus(key)
 		}
 
