@@ -3,7 +3,6 @@ import * as compiler from 'imba/compiler'
 import { mkdirSync, watch, existsSync, statSync, writeFileSync, realpathSync } from 'fs'
 import path from 'path'
 import { theme } from './utils.js'
-import { printerr } from './plugin.js'
 
 // ─── HMR Client (injected into browser) ──────────────────────────────────────
 
@@ -628,29 +627,60 @@ export function serve(entrypoint, flags) {
 	const srcDir   = path.dirname(entrypoint)
 	const sockets  = new Set()
 
-	// ── Status line (prints current compile result, fades out on success) ──────
+	// ── Live status block (shows only the current compile state) ───────────────
 
-	let _fadeTimers = []
-	let _fadeId = 0
+	let _statusRows = 0
+	let _statusTimer = null
 	let _statusFile = null
-	let _statusSaved = false
-	let _statusKind = null
 	const _isTTY = process.stdout.isTTY
 
-	function cancelFade() {
-		_fadeTimers.forEach(t => clearTimeout(t))
-		_fadeTimers = []
+	function stripAnsi(text) {
+		return String(text).replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '')
+	}
+
+	function renderedRows(lines) {
+		const columns = Math.max(1, process.stdout.columns || 80)
+		return lines.reduce((total, line) => {
+			const length = stripAnsi(line).length
+			return total + Math.max(1, Math.ceil(length / columns))
+		}, 0)
 	}
 
 	function clearStatus(file) {
-		if (file && _statusFile && _statusFile !== file) return
-		cancelFade()
-		if (_statusSaved) {
-			process.stdout.write('\x1b[u\x1b[J')
-			_statusSaved = false
+		if (file && _statusFile && _statusFile !== file) return false
+		if (_statusTimer) {
+			clearTimeout(_statusTimer)
+			_statusTimer = null
 		}
+		if (_isTTY && _statusRows) {
+			process.stdout.write(`\x1b[${_statusRows}A\r\x1b[J`)
+		}
+		_statusRows = 0
 		_statusFile = null
-		_statusKind = null
+		return true
+	}
+
+	function formatErrorLines(errors) {
+		const lines = []
+		for (const err of errors || []) {
+			const message = errorMessage(err)
+			const line = errorLine(err)
+			lines.push(`           ${theme.error(' ' + message + ' ')}${line != null ? theme.margin(` line ${line + 1} `) : ''}`)
+			const snippet = errorSnippet(err)
+			if (snippet && snippet !== message) {
+				lines.push(...String(snippet).split('\n').slice(0, 6).map(item => `           ${theme.code(item)}`))
+			}
+			lines.push('')
+		}
+		return lines
+	}
+
+	function statusLines(file, state, errors) {
+		const now = new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+		const status = state === 'ok' ? theme.success(' ok ') : theme.failure(' fail ')
+		const lines = [`  ${theme.folder(now)}  ${theme.filename(file)}  ${status}`]
+		if (errors?.length) lines.push('', ...formatErrorLines(errors))
+		return lines
 	}
 
 	function printStatus(file, state, errors, options = {}) {
@@ -670,46 +700,13 @@ export function serve(entrypoint, flags) {
 			return
 		}
 
-		cancelFade()
-		if (_statusSaved) {
-			process.stdout.write('\x1b[u\x1b[J')
-			_statusSaved = false
-		}
-		const now = new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
-		const status = state === 'ok' ? theme.success(' ok ') : theme.failure(' fail ')
-
-		if (errors?.length || options.sticky) {
-			process.stdout.write(`  ${theme.folder(now)}  ${theme.filename(file)}  ${status}\n`)
-			if (errors?.length) {
-				for (const err of errors) {
-					try { printerr(err) } catch(_) { process.stdout.write('  ' + err.message + '\n') }
-				}
-			}
-			_statusFile = null
-			_statusKind = null
-			return
-		}
-
-		process.stdout.write('\x1b[s')
-		_statusSaved = true
+		clearStatus()
 		_statusFile = file
-		_statusKind = state
+		const lines = statusLines(file, state, errors)
+		process.stdout.write(lines.join('\n') + '\n')
+		_statusRows = renderedRows(lines)
 
-		const myId = ++_fadeId
-		const plainLine = `  ${now}  ${file}   ok `
-		const total = plainLine.length
-		process.stdout.write(`  ${theme.folder(now)}  ${theme.filename(file)}  ${status}`)
-		for (let i = 1; i <= total; i++) {
-			_fadeTimers.push(setTimeout(() => {
-				if (_fadeId !== myId) return
-				process.stdout.write('\x1b[1D \x1b[1D')
-				if (i === total) {
-					_statusSaved = false
-					_statusFile = null
-					_statusKind = null
-				}
-			}, 5000 + i * 22))
-		}
+		if (options.clearAfter) _statusTimer = setTimeout(() => clearStatus(file), options.clearAfter)
 	}
 
 	// ── File watcher ───────────────────────────────────────────────────────────
@@ -853,9 +850,29 @@ export function serve(entrypoint, flags) {
 			.join('\n---\n')
 	}
 
+	function renderActiveErrors() {
+		if (!_isTTY) return false
+		if (!_activeErrors.size) {
+			clearStatus()
+			return false
+		}
+
+		clearStatus()
+		const lines = []
+		for (const item of _activeErrors.values()) {
+			if (lines.length) lines.push('')
+			lines.push(...statusLines(item.file, 'fail', item.errors))
+		}
+		process.stdout.write(lines.join('\n') + '\n')
+		_statusFile = null
+		_statusRows = renderedRows(lines)
+		return true
+	}
+
 	function showTrackedError(item) {
 		const file = item.file
-		printStatus(file, 'fail', item.errors)
+		if (_isTTY) renderActiveErrors()
+		else printStatus(file, 'fail', item.errors)
 		broadcast({ type: 'error', file, time: item.time, errors: item.payload })
 	}
 
@@ -884,9 +901,10 @@ export function serve(entrypoint, flags) {
 		_activeErrors.set(key, item)
 		_terminalErrors.set(terminalKey, { signature: printSignature, time: now })
 
-		// The terminal is append-only in many real shells. Repeated reports of the
-		// same active error update the browser overlay, but must not print again.
+		// Repeated reports of the same active error update the live status and
+		// browser overlay, but do not create another terminal entry.
 		if (duplicate) {
+			if (_isTTY) renderActiveErrors()
 			broadcast({ type: 'error', file: display, time: item.time, errors: item.payload })
 			return
 		}
@@ -909,23 +927,29 @@ export function serve(entrypoint, flags) {
 		const wasStatusFile = key && _statusFile && sameFile(_statusFile, key)
 		const hadError = key ? !!takeError(key) : _activeErrors.size > 0
 
-		if (!key) _activeErrors.clear()
+		if (!key) {
+			_activeErrors.clear()
+			_terminalErrors.clear()
+		} else if (hadError) {
+			_terminalErrors.delete(terminalErrorKey(key))
+		}
 
-		if (!key || hadError || wasStatusFile) clearStatus(key)
+		let showedNext = false
+		if (_isTTY && _activeErrors.size) showedNext = renderActiveErrors()
+		else if (!key || hadError || wasStatusFile) clearStatus(key)
 
 		broadcast({ type: 'clear-error', file: key })
 
-		return { cleared: hadError || wasStatusFile, file: key, showedNext: false }
+		return { cleared: hadError || wasStatusFile, file: key, showedNext }
 	}
 
 	function markSuccess(file) {
 		const key = normalizeFile(file)
 		const result = clearError(key)
 		const active = _activeErrors.size
-		const shouldPrint = result?.cleared && !result.showedNext
+		const shouldPrint = result?.cleared && !result.showedNext && !active
 		if (shouldPrint) {
-			_terminalErrors.delete(terminalErrorKey(key))
-			printStatus(key, 'ok', null, { sticky: true })
+			printStatus(key, 'ok', null, { clearAfter: 3500 })
 		}
 		return { cleared: !!result?.cleared, printed: !!shouldPrint, showedNext: !!result?.showedNext, active }
 	}
@@ -1000,7 +1024,7 @@ export function serve(entrypoint, flags) {
 			// No change at all — skip
 			if (out.changeType === 'none' || out.changeType === 'cached') return
 
-			if (!success.printed && !success.showedNext && !success.active) printStatus(rel, 'ok')
+			if (!success.printed && !success.showedNext && !success.active) printStatus(rel, 'ok', null, { clearAfter: 3500 })
 			broadcast({ type: 'update', file: rel, slots: out.slots || 'shifted' })
 		} catch(e) {
 			if (!isCurrentChange(file, version)) return
