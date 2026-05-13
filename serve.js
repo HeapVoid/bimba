@@ -854,6 +854,7 @@ export function serve(entrypoint, flags) {
 		const list = Array.isArray(errors) ? errors : [errors]
 		const signature = errorSignature(list)
 		const previous = takeError(display)
+		const duplicate = previous?.signature === signature
 
 		const item = {
 			file: display,
@@ -863,7 +864,10 @@ export function serve(entrypoint, flags) {
 			time: new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
 		}
 		_activeErrors.set(key, item)
-		if (previous?.signature === signature && !_isTTY) {
+
+		// The terminal is append-only in many real shells. Repeated reports of the
+		// same active error update the browser overlay, but must not print again.
+		if (duplicate) {
 			broadcast({ type: 'error', file: display, time: item.time, errors: item.payload })
 			return
 		}
