@@ -409,6 +409,17 @@ function isMissingFileError(error) {
 	return error?.code === 'ENOENT' || String(error?.message || error).includes('ENOENT: no such file or directory')
 }
 
+function fileStamp(abs) {
+	try {
+		const stat = statSync(abs)
+		if (!stat.isFile()) return null
+		return `${stat.mtimeMs ?? stat.mtime?.getTime?.() ?? 0}:${stat.size ?? 0}`
+	} catch (error) {
+		if (isMissingFileError(error)) return null
+		throw error
+	}
+}
+
 function missingCompileResult(filepath) {
 	dropFileState(filepath)
 	return { js: '', errors: [], slots: null, changeType: 'missing', missing: true }
@@ -416,49 +427,59 @@ function missingCompileResult(filepath) {
 
 async function compileFile(filepath) {
 	const abs = path.resolve(filepath)
-	if (!existsSync(abs)) return missingCompileResult(abs)
 
-	const file = Bun.file(abs)
-	let stat
-	try {
-		stat = await file.stat()
-	} catch (error) {
-		if (isMissingFileError(error)) return missingCompileResult(abs)
-		throw error
+	while (true) {
+		const stamp = fileStamp(abs)
+		if (!stamp) return missingCompileResult(abs)
+
+		const cached = _compileCache.get(abs)
+		if (cached && cached.stamp === stamp) {
+			if (fileStamp(abs) !== stamp) continue
+			return _normalizeResult(cached.result, { changeType: 'cached' })
+		}
+
+		const file = Bun.file(abs)
+		let code
+		try {
+			code = await file.text()
+		} catch (error) {
+			if (isMissingFileError(error)) return missingCompileResult(abs)
+			throw error
+		}
+
+		// A save can land while an older request is compiling. Never publish,
+		// cache, or report a result unless it still matches the current file.
+		if (fileStamp(abs) !== stamp) continue
+
+		let result
+		try {
+			result = compiler.compile(code, {
+				sourcePath: filepath,
+				platform: 'browser',
+				sourcemap: 'inline',
+			})
+		} catch (error) {
+			result = { js: '', errors: [error], slots: null }
+		}
+
+		if (fileStamp(abs) !== stamp) continue
+
+		const errors = result.errors || []
+		if (!errors.length && result.js) {
+			const { js, slotCount } = stabilizeSymbols(result.js, abs)
+			result.js = rewriteBareImports(js)
+			const prev = _prevSlots.get(abs)
+			result.slots = (prev === undefined || prev === slotCount) ? 'stable' : 'shifted'
+			_prevSlots.set(abs, slotCount)
+		}
+
+		// Bake errors as an own property so caching/spreading preserves them.
+		const baked = { js: result.js, errors, slots: result.slots }
+		const changeType = _prevJs.get(abs) === baked.js ? 'none' : 'full'
+		_prevJs.set(abs, baked.js)
+		_compileCache.set(abs, { stamp, result: baked })
+		return _normalizeResult(baked, { changeType })
 	}
-	const stamp = `${stat.mtimeMs ?? stat.mtime?.getTime?.() ?? 0}:${stat.size ?? 0}`
-
-	const cached = _compileCache.get(abs)
-	if (cached && cached.stamp === stamp) return _normalizeResult(cached.result, { changeType: 'cached' })
-
-	let code
-	try {
-		code = await file.text()
-	} catch (error) {
-		if (isMissingFileError(error)) return missingCompileResult(abs)
-		throw error
-	}
-	const result = compiler.compile(code, {
-		sourcePath: filepath,
-		platform: 'browser',
-		sourcemap: 'inline',
-	})
-
-	const errors = result.errors || []
-	if (!errors.length && result.js) {
-		const { js, slotCount } = stabilizeSymbols(result.js, abs)
-		result.js = rewriteBareImports(js)
-		const prev = _prevSlots.get(abs)
-		result.slots = (prev === undefined || prev === slotCount) ? 'stable' : 'shifted'
-		_prevSlots.set(abs, slotCount)
-	}
-
-	// Bake errors as an own property so caching/spreading preserves them.
-	const baked = { js: result.js, errors, slots: result.slots }
-	const changeType = _prevJs.get(abs) === baked.js ? 'none' : 'full'
-	_prevJs.set(abs, baked.js)
-	_compileCache.set(abs, { stamp, result: baked })
-	return _normalizeResult(baked, { changeType })
 }
 
 // ─── HTML helpers ─────────────────────────────────────────────────────────────

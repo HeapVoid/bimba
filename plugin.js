@@ -45,6 +45,16 @@ function compileErrorKey(filepath) {
   return physicalCompileKey(filepath) || `path:${normalizeCompilePath(filepath)}`;
 }
 
+function compileFileStamp(filepath) {
+  try {
+    const stat = fs.statSync(filepath);
+    if (!stat.isFile()) return null;
+    return `${stat.mtimeMs ?? stat.mtime?.getTime?.() ?? 0}_${stat.size ?? 0}`;
+  } catch(_) {
+    return null;
+  }
+}
+
 function compileErrorMessage(error) {
   return error?.message || String(error);
 }
@@ -102,66 +112,82 @@ export const imbaPlugin = {
     build.onLoad({ filter: /\.imba$/ }, async ({ path }) => {
 
       const f = dir.parse(path)
-      let contents = '';
 
-      // return the cached version if exists (include target in hash to avoid cross-platform cache hits)
-      const cached = dir.join(cache, Bun.hash(path + ':' + target) + '_' + fs.statSync(path).mtimeMs + '.js');
-      if (fs.existsSync(cached)) {
-        clearCompileError(path);
-        stats.bundled++;
-        stats.cached++;
+      while (true) {
+        const stamp = compileFileStamp(path);
+        if (!stamp) {
+          clearCompileError(path);
+          return { contents: '', loader: "js" };
+        }
+
+        let contents = '';
+
+        // return the cached version if exists (include target in hash to avoid cross-platform cache hits)
+        const cached = dir.join(cache, Bun.hash(path + ':' + target) + '_' + stamp + '.js');
+        if (fs.existsSync(cached)) {
+          const cachedContents = await Bun.file(cached).text();
+          if (compileFileStamp(path) !== stamp) continue;
+          clearCompileError(path);
+          stats.bundled++;
+          stats.cached++;
+          return {
+            contents: cachedContents,
+            loader: "js",
+          };
+        }
+
+        // clear previous cached version
+        const glob = new Glob(Bun.hash(path + ':' + target) + '_' + "*.js");
+        for await (const file of glob.scan(cache)) if (fs.existsSync(dir.join(cache, file))) unlink(dir.join(cache, file));
+
+        // if no cached version read and compile it with the imba compiler
+        const file = await Bun.file(path).text();
+        if (compileFileStamp(path) !== stamp) continue;
+
+        const platform = target === 'node' || target === 'bun' ? 'node' : 'browser';
+        let out
+        try {
+          out = compiler.compile(file, {
+            sourcePath: path,
+            platform: platform,
+            comments: false
+          })
+        } catch (error) {
+          out = { js: '', errors: [error] }
+        }
+
+        // Never report or cache a result from an older source snapshot.
+        if (compileFileStamp(path) !== stamp) continue;
+
+        // the file has been successfully compiled
+        if (!out.errors?.length) {
+          clearCompileError(path);
+          console.log(theme.action("compiling: ") + theme.folder(dir.join(f.dir,'/')) + theme.filename(f.base) + " - " + theme.success("compiled"));
+          stats.bundled++;
+          stats.compiled++;
+          contents = out.js;
+          await Bun.write(cached, contents);
+        }
+        // there were errors during compilation
+        else {
+          const shouldPrint = shouldPrintCompileError(path, out.errors);
+          if (shouldPrint) console.log(theme.action("compiling: ") + theme.folder(dir.join(f.dir,'/')) + theme.filename(f.base) + " - " + theme.failure(" fail "));
+          stats.failed++;
+          if (shouldPrint) {
+            stats.reported++;
+            for (let i = 0; i < out.errors.length; i++) {
+              if(out.errors[i]) printCompileError(out.errors[i]);
+            }
+          }
+          stats.errors++;
+        }
+
+        // and return the compiled source code as "js"
         return {
-          contents: await Bun.file(cached).text(),
+          contents,
           loader: "js",
         };
       }
-
-      // clear previous cached version
-      const glob = new Glob(Bun.hash(path + ':' + target) + '_' + "*.js");
-      for await (const file of glob.scan(cache)) if (fs.existsSync(dir.join(cache, file))) unlink(dir.join(cache, file));
-
-      // if no cached version read and compile it with the imba compiler
-      const file = await Bun.file(path).text();
-      const platform = target === 'node' || target === 'bun' ? 'node' : 'browser';
-      let out
-      try {
-        out = compiler.compile(file, {
-          sourcePath: path,
-          platform: platform,
-          comments: false
-        })
-      } catch (error) {
-        out = { js: '', errors: [error] }
-      }
-      
-      // the file has been successfully compiled
-      if (!out.errors?.length) {
-        clearCompileError(path);
-        console.log(theme.action("compiling: ") + theme.folder(dir.join(f.dir,'/')) + theme.filename(f.base) + " - " + theme.success("compiled"));
-        stats.bundled++;
-        stats.compiled++;
-        contents = out.js;
-        await Bun.write(cached, contents);
-      }
-      // there were errors during compilation
-      else {
-        const shouldPrint = shouldPrintCompileError(path, out.errors);
-        if (shouldPrint) console.log(theme.action("compiling: ") + theme.folder(dir.join(f.dir,'/')) + theme.filename(f.base) + " - " + theme.failure(" fail "));
-        stats.failed++;
-        if (shouldPrint) {
-          stats.reported++;
-          for (let i = 0; i < out.errors.length; i++) {
-            if(out.errors[i]) printCompileError(out.errors[i]);
-          }
-        }
-        stats.errors++;
-      }
-      
-      // and return the compiled source code as "js"
-      return {
-        contents,
-        loader: "js",
-      };
     });
   }
 };
