@@ -22,12 +22,27 @@ export let stats = {
 const _activeCompileErrors = new Map();
 
 function normalizeCompilePath(filepath) {
-  let value = String(filepath || '');
+  let value = String(filepath || '').split(/[?#]/)[0];
   if (dir.isAbsolute(value)) {
     const rel = dir.relative(process.cwd(), value);
     if (!rel.startsWith('..')) value = rel;
   }
   return value.replaceAll('\\', '/');
+}
+
+function physicalCompileKey(filepath) {
+  try {
+    const stat = fs.statSync(filepath);
+    if (!stat.isFile()) return null;
+    const real = fs.realpathSync(filepath).replaceAll('\\', '/');
+    return `fs:${stat.dev}:${stat.ino}:${real}`;
+  } catch(_) {
+    return null;
+  }
+}
+
+function compileErrorKey(filepath) {
+  return physicalCompileKey(filepath) || `path:${normalizeCompilePath(filepath)}`;
 }
 
 function compileErrorMessage(error) {
@@ -53,15 +68,25 @@ function compileErrorSignature(errors) {
 }
 
 function shouldPrintCompileError(filepath, errors) {
-  const key = normalizeCompilePath(filepath);
+  const key = compileErrorKey(filepath);
   const signature = compileErrorSignature(errors);
   const previous = _activeCompileErrors.get(key);
-  _activeCompileErrors.set(key, { signature, time: Date.now() });
+  _activeCompileErrors.set(key, { file: normalizeCompilePath(filepath), signature, time: Date.now() });
   return previous?.signature !== signature;
 }
 
 function clearCompileError(filepath) {
-  _activeCompileErrors.delete(normalizeCompilePath(filepath));
+  _activeCompileErrors.delete(compileErrorKey(filepath));
+}
+
+function printCompileError(error) {
+  try {
+    printerr(error);
+  } catch(_) {
+    console.log('');
+    console.log('          ' + theme.error(' ' + compileErrorMessage(error) + ' '));
+    console.log('');
+  }
 }
 
 // Target platform for the Imba compiler: 'browser' or 'node'
@@ -98,11 +123,16 @@ export const imbaPlugin = {
       // if no cached version read and compile it with the imba compiler
       const file = await Bun.file(path).text();
       const platform = target === 'node' || target === 'bun' ? 'node' : 'browser';
-      const out = compiler.compile(file, {
+      let out
+      try {
+        out = compiler.compile(file, {
           sourcePath: path,
           platform: platform,
           comments: false
-      })
+        })
+      } catch (error) {
+        out = { js: '', errors: [error] }
+      }
       
       // the file has been successfully compiled
       if (!out.errors?.length) {
@@ -121,7 +151,7 @@ export const imbaPlugin = {
         if (shouldPrint) {
           stats.reported++;
           for (let i = 0; i < out.errors.length; i++) {
-            if(out.errors[i]) printerr(out.errors[i]);
+            if(out.errors[i]) printCompileError(out.errors[i]);
           }
         }
         stats.errors++;
