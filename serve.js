@@ -1,6 +1,6 @@
 import { serve as bunServe } from 'bun'
 import * as compiler from 'imba/compiler'
-import { mkdirSync, watch, existsSync, statSync, writeFileSync } from 'fs'
+import { mkdirSync, watch, existsSync, statSync, writeFileSync, realpathSync } from 'fs'
 import path from 'path'
 import { theme } from './utils.js'
 import { printerr } from './plugin.js'
@@ -707,7 +707,8 @@ export function serve(entrypoint, flags) {
 		_statusSaved = true
 		_statusKind = 'errors'
 
-		for (const [file, item] of _activeErrors.entries()) {
+		for (const item of _activeErrors.values()) {
+			const file = item.file
 			process.stdout.write(`  ${theme.folder(item.time)}  ${theme.filename(file)}  ${theme.failure(' fail ')}\n`)
 			for (const err of item.errors) {
 				try { printerr(err) } catch(_) { process.stdout.write('  ' + err.message + '\n') }
@@ -738,8 +739,12 @@ export function serve(entrypoint, flags) {
 	const srcRoot = path.resolve(srcDir)
 	const srcRel = normalizeFile(srcRoot)
 
+	function unprefixFile(file) {
+		return normalizeFile(file).replace(/^(?:html|css|js|static):/, '')
+	}
+
 	function fileVariants(file) {
-		const key = normalizeFile(file)
+		const key = unprefixFile(file)
 		const variants = new Set([key])
 
 		if (srcRel && key.startsWith(srcRel + '/')) variants.add(key.slice(srcRel.length + 1))
@@ -748,7 +753,38 @@ export function serve(entrypoint, flags) {
 		return Array.from(variants).filter(Boolean)
 	}
 
+	function fileCandidates(file) {
+		const candidates = []
+		for (const variant of fileVariants(file)) {
+			candidates.push(path.resolve(variant))
+			if (!variant.startsWith(srcRel + '/')) candidates.push(path.resolve(srcRoot, variant))
+		}
+		return candidates
+	}
+
+	function physicalFileKey(file) {
+		for (const candidate of fileCandidates(file)) {
+			try {
+				const stat = statSync(candidate)
+				if (!stat.isFile()) continue
+				const real = realpathSync(candidate).replaceAll('\\', '/')
+				return `fs:${stat.dev}:${stat.ino}:${real}`
+			} catch(_) {
+				// ignore non-existing aliases
+			}
+		}
+		return null
+	}
+
+	function errorKey(file) {
+		return physicalFileKey(file) || `path:${normalizeFile(file)}`
+	}
+
 	function sameFile(left, right) {
+		const leftPhysical = physicalFileKey(left)
+		const rightPhysical = physicalFileKey(right)
+		if (leftPhysical && rightPhysical && leftPhysical === rightPhysical) return true
+
 		const lefts = fileVariants(left)
 		const rights = fileVariants(right)
 
@@ -763,9 +799,12 @@ export function serve(entrypoint, flags) {
 
 	function takeError(file) {
 		let previous = null
+		const target = errorKey(file)
 		const keys = Array.from(_activeErrors.keys())
 		for (const key of keys) {
-			if (!sameFile(key, file)) continue
+			const item = _activeErrors.get(key)
+			const storedFile = item?.file || key.replace(/^path:/, '')
+			if (key !== target && !sameFile(storedFile, file)) continue
 			previous ||= _activeErrors.get(key)
 			_activeErrors.delete(key)
 		}
@@ -802,19 +841,22 @@ export function serve(entrypoint, flags) {
 			.join('\n---\n')
 	}
 
-	function showTrackedError(file, item) {
+	function showTrackedError(item) {
+		const file = item.file
 		if (_isTTY) renderErrorPanel()
 		else printStatus(file, 'fail', item.errors)
 		broadcast({ type: 'error', file, time: item.time, errors: item.payload })
 	}
 
 	function reportError(file, errors) {
-		const key = normalizeFile(file)
+		const display = normalizeFile(file)
+		const key = errorKey(display)
 		const list = Array.isArray(errors) ? errors : [errors]
 		const signature = errorSignature(list)
-		const previous = takeError(key)
+		const previous = takeError(display)
 
 		const item = {
+			file: display,
 			signature,
 			errors: list,
 			payload: serializeErrors(list),
@@ -822,11 +864,11 @@ export function serve(entrypoint, flags) {
 		}
 		_activeErrors.set(key, item)
 		if (previous?.signature === signature && !_isTTY) {
-			broadcast({ type: 'error', file: key, time: item.time, errors: item.payload })
+			broadcast({ type: 'error', file: display, time: item.time, errors: item.payload })
 			return
 		}
 
-		showTrackedError(key, item)
+		showTrackedError(item)
 	}
 
 	function errorText(errors) {
@@ -857,8 +899,8 @@ export function serve(entrypoint, flags) {
 		broadcast({ type: 'clear-error', file: key })
 
 		if (!_isTTY && wasStatusFile && _activeErrors.size) {
-			const [nextFile, nextItem] = Array.from(_activeErrors.entries()).at(-1)
-			showTrackedError(nextFile, nextItem)
+			const nextItem = Array.from(_activeErrors.values()).at(-1)
+			showTrackedError(nextItem)
 			showedNext = true
 		}
 
