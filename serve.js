@@ -653,7 +653,7 @@ export function serve(entrypoint, flags) {
 		_statusKind = null
 	}
 
-	function printStatus(file, state, errors) {
+	function printStatus(file, state, errors, options = {}) {
 		// non-TTY (pipes, Claude Code bash, CI): plain newline-terminated output,
 		// no ANSI cursor tricks, no fade-out — so logs stay readable.
 		if (!_isTTY) {
@@ -678,66 +678,45 @@ export function serve(entrypoint, flags) {
 		const now = new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
 		const status = state === 'ok' ? theme.success(' ok ') : theme.failure(' fail ')
 
+		if (errors?.length || options.sticky) {
+			process.stdout.write(`  ${theme.folder(now)}  ${theme.filename(file)}  ${status}\n`)
+			if (errors?.length) {
+				for (const err of errors) {
+					try { printerr(err) } catch(_) { process.stdout.write('  ' + err.message + '\n') }
+				}
+			}
+			_statusFile = null
+			_statusKind = null
+			return
+		}
+
 		process.stdout.write('\x1b[s')
 		_statusSaved = true
 		_statusFile = file
 		_statusKind = state
 
-		if (errors?.length) {
-			process.stdout.write(`  ${theme.folder(now)}  ${theme.filename(file)}  ${status}\n`)
-			for (const err of errors) {
-				try { printerr(err) } catch(_) { process.stdout.write('  ' + err.message + '\n') }
-			}
-		} else {
-			const myId = ++_fadeId
-			const plainLine = `  ${now}  ${file}   ok `
-			const total = plainLine.length
-			process.stdout.write(`  ${theme.folder(now)}  ${theme.filename(file)}  ${status}`)
-			for (let i = 1; i <= total; i++) {
-				_fadeTimers.push(setTimeout(() => {
-					if (_fadeId !== myId) return
-					process.stdout.write('\x1b[1D \x1b[1D')
-					if (i === total) {
-						_statusSaved = false
-						_statusFile = null
-						_statusKind = null
-					}
-				}, 5000 + i * 22))
-			}
+		const myId = ++_fadeId
+		const plainLine = `  ${now}  ${file}   ok `
+		const total = plainLine.length
+		process.stdout.write(`  ${theme.folder(now)}  ${theme.filename(file)}  ${status}`)
+		for (let i = 1; i <= total; i++) {
+			_fadeTimers.push(setTimeout(() => {
+				if (_fadeId !== myId) return
+				process.stdout.write('\x1b[1D \x1b[1D')
+				if (i === total) {
+					_statusSaved = false
+					_statusFile = null
+					_statusKind = null
+				}
+			}, 5000 + i * 22))
 		}
 	}
 
 	// ── File watcher ───────────────────────────────────────────────────────────
 
 	const _activeErrors = new Map()
-
-	function renderErrorPanel() {
-		if (!_isTTY) return false
-
-		cancelFade()
-		if (_statusSaved) {
-			process.stdout.write('\x1b[u\x1b[J')
-			_statusSaved = false
-		}
-		_statusFile = null
-		_statusKind = null
-
-		if (!_activeErrors.size) return false
-
-		process.stdout.write('\x1b[s')
-		_statusSaved = true
-		_statusKind = 'errors'
-
-		for (const item of _activeErrors.values()) {
-			const file = item.file
-			process.stdout.write(`  ${theme.folder(item.time)}  ${theme.filename(file)}  ${theme.failure(' fail ')}\n`)
-			for (const err of item.errors) {
-				try { printerr(err) } catch(_) { process.stdout.write('  ' + err.message + '\n') }
-			}
-		}
-
-		return true
-	}
+	const _terminalErrors = new Map()
+	const TERMINAL_DUPLICATE_MS = 5000
 
 	function broadcast(payload) {
 		const msg = JSON.stringify(payload)
@@ -772,6 +751,12 @@ export function serve(entrypoint, flags) {
 		else if (srcRel && key) variants.add(srcRel + '/' + key)
 
 		return Array.from(variants).filter(Boolean)
+	}
+
+	function terminalErrorKey(file) {
+		const variants = fileVariants(file)
+		const rooted = variants.find(variant => srcRel && variant.startsWith(srcRel + '/'))
+		return `path:${rooted || variants[0] || normalizeFile(file)}`
 	}
 
 	function fileCandidates(file) {
@@ -862,29 +847,42 @@ export function serve(entrypoint, flags) {
 			.join('\n---\n')
 	}
 
+	function terminalErrorSignature(errors) {
+		return serializeErrors(errors)
+			.map(error => error.message)
+			.join('\n---\n')
+	}
+
 	function showTrackedError(item) {
 		const file = item.file
-		if (_isTTY) renderErrorPanel()
-		else printStatus(file, 'fail', item.errors)
+		printStatus(file, 'fail', item.errors)
 		broadcast({ type: 'error', file, time: item.time, errors: item.payload })
 	}
 
 	function reportError(file, errors) {
 		const display = normalizeFile(file)
 		const key = errorKey(display)
+		const terminalKey = terminalErrorKey(display)
 		const list = Array.isArray(errors) ? errors : [errors]
 		const signature = errorSignature(list)
+		const printSignature = terminalErrorSignature(list)
 		const previous = takeError(display)
+		const now = Date.now()
+		const recent = _terminalErrors.get(terminalKey)
 		const duplicate = previous?.signature === signature
+			|| previous?.printSignature === printSignature
+			|| (recent?.signature === printSignature && now - recent.time < TERMINAL_DUPLICATE_MS)
 
 		const item = {
 			file: display,
 			signature,
+			printSignature,
 			errors: list,
 			payload: serializeErrors(list),
 			time: new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
 		}
 		_activeErrors.set(key, item)
+		_terminalErrors.set(terminalKey, { signature: printSignature, time: now })
 
 		// The terminal is append-only in many real shells. Repeated reports of the
 		// same active error update the browser overlay, but must not print again.
@@ -908,36 +906,27 @@ export function serve(entrypoint, flags) {
 
 	function clearError(file) {
 		const key = file ? normalizeFile(file) : null
-		const hadPanel = _statusKind === 'errors'
 		const wasStatusFile = key && _statusFile && sameFile(_statusFile, key)
 		const hadError = key ? !!takeError(key) : _activeErrors.size > 0
 
 		if (!key) _activeErrors.clear()
 
-		let showedNext = false
-		if (_isTTY && (hadError || wasStatusFile || hadPanel)) {
-			showedNext = renderErrorPanel()
-		} else if (!key || hadError || wasStatusFile) {
-			clearStatus(key)
-		}
+		if (!key || hadError || wasStatusFile) clearStatus(key)
 
 		broadcast({ type: 'clear-error', file: key })
 
-		if (!_isTTY && wasStatusFile && _activeErrors.size) {
-			const nextItem = Array.from(_activeErrors.values()).at(-1)
-			showTrackedError(nextItem)
-			showedNext = true
-		}
-
-		return { cleared: hadError || wasStatusFile, file: key, showedNext }
+		return { cleared: hadError || wasStatusFile, file: key, showedNext: false }
 	}
 
 	function markSuccess(file) {
 		const key = normalizeFile(file)
 		const result = clearError(key)
 		const active = _activeErrors.size
-		const shouldPrint = result?.cleared && !result.showedNext && !active
-		if (shouldPrint) printStatus(key, 'ok')
+		const shouldPrint = result?.cleared && !result.showedNext
+		if (shouldPrint) {
+			_terminalErrors.delete(terminalErrorKey(key))
+			printStatus(key, 'ok', null, { sticky: true })
+		}
 		return { cleared: !!result?.cleared, printed: !!shouldPrint, showedNext: !!result?.showedNext, active }
 	}
 
