@@ -632,6 +632,9 @@ export function serve(entrypoint, flags) {
 	let _statusRows = 0
 	let _statusTimer = null
 	let _statusFile = null
+	let _statusInline = false
+	let _statusWidth = 0
+	let _eraseTimers = []
 	const _isTTY = process.stdout.isTTY
 
 	function stripAnsi(text) {
@@ -652,11 +655,17 @@ export function serve(entrypoint, flags) {
 			clearTimeout(_statusTimer)
 			_statusTimer = null
 		}
-		if (_isTTY && _statusRows) {
+		_eraseTimers.forEach(timer => clearTimeout(timer))
+		_eraseTimers = []
+		if (_isTTY && _statusInline) {
+			process.stdout.write('\r\x1b[J')
+		} else if (_isTTY && _statusRows) {
 			process.stdout.write(`\x1b[${_statusRows}A\r\x1b[J`)
 		}
 		_statusRows = 0
 		_statusFile = null
+		_statusInline = false
+		_statusWidth = 0
 		return true
 	}
 
@@ -703,10 +712,44 @@ export function serve(entrypoint, flags) {
 		clearStatus()
 		_statusFile = file
 		const lines = statusLines(file, state, errors)
+		if (options.fadeAfter && lines.length === 1) {
+			const plain = stripAnsi(lines[0])
+			process.stdout.write(lines[0])
+			_statusRows = 1
+			_statusInline = true
+			_statusWidth = plain.length
+			_statusTimer = setTimeout(() => eraseStatus(file), options.fadeAfter)
+			return
+		}
+
 		process.stdout.write(lines.join('\n') + '\n')
 		_statusRows = renderedRows(lines)
 
 		if (options.clearAfter) _statusTimer = setTimeout(() => clearStatus(file), options.clearAfter)
+	}
+
+	function eraseStatus(file) {
+		if (file && _statusFile && _statusFile !== file) return
+		_statusTimer = null
+		if (!_isTTY || !_statusInline) {
+			clearStatus(file)
+			return
+		}
+
+		const total = _statusWidth
+		for (let i = 1; i <= total; i++) {
+			_eraseTimers.push(setTimeout(() => {
+				if (!_statusInline || _statusFile !== file) return
+				process.stdout.write('\x1b[1D \x1b[1D')
+				if (i === total) {
+					_statusRows = 0
+					_statusFile = null
+					_statusInline = false
+					_statusWidth = 0
+					_eraseTimers = []
+				}
+			}, i * 22))
+		}
 	}
 
 	// ── File watcher ───────────────────────────────────────────────────────────
@@ -869,6 +912,49 @@ export function serve(entrypoint, flags) {
 		return true
 	}
 
+	function existingFileForError(file) {
+		for (const candidate of fileCandidates(file)) {
+			try {
+				const stat = statSync(candidate)
+				if (stat.isFile()) return candidate
+			} catch(_) {
+				// ignore aliases that no longer exist
+			}
+		}
+		return null
+	}
+
+	async function reconcileActiveErrors() {
+		if (!_activeErrors.size) return false
+
+		let changed = false
+		const items = Array.from(_activeErrors.values())
+		for (const item of items) {
+			const filepath = existingFileForError(item.file)
+			if (!filepath) {
+				if (takeError(item.file)) {
+					_terminalErrors.delete(terminalErrorKey(item.file))
+					broadcast({ type: 'clear-error', file: item.file })
+					changed = true
+				}
+				continue
+			}
+
+			if (!filepath.endsWith('.imba')) continue
+
+			const out = await compileFile(filepath)
+			if (out.errors?.length) continue
+
+			if (takeError(item.file)) {
+				_terminalErrors.delete(terminalErrorKey(item.file))
+				broadcast({ type: 'clear-error', file: item.file })
+				changed = true
+			}
+		}
+
+		return changed
+	}
+
 	function showTrackedError(item) {
 		const file = item.file
 		if (_isTTY) renderActiveErrors()
@@ -943,15 +1029,20 @@ export function serve(entrypoint, flags) {
 		return { cleared: hadError || wasStatusFile, file: key, showedNext }
 	}
 
-	function markSuccess(file) {
+	async function markSuccess(file) {
 		const key = normalizeFile(file)
 		const result = clearError(key)
+		const reconciled = await reconcileActiveErrors()
 		const active = _activeErrors.size
-		const shouldPrint = result?.cleared && !result.showedNext && !active
+		let showedNext = false
+		if (active && _isTTY) showedNext = renderActiveErrors()
+		else if (_isTTY && (reconciled || result.showedNext)) clearStatus()
+		else showedNext = result.showedNext
+		const shouldPrint = (result?.cleared || reconciled) && !showedNext && !active
 		if (shouldPrint) {
-			printStatus(key, 'ok', null, { clearAfter: 3500 })
+			printStatus(key, 'ok', null, { fadeAfter: 3500 })
 		}
-		return { cleared: !!result?.cleared, printed: !!shouldPrint, showedNext: !!result?.showedNext, active }
+		return { cleared: !!result?.cleared || reconciled, printed: !!shouldPrint, showedNext: !!showedNext, active }
 	}
 
 	const _debounce = new Map()
@@ -1019,12 +1110,12 @@ export function serve(entrypoint, flags) {
 				return
 			}
 
-			const success = markSuccess(rel)
+			const success = await markSuccess(rel)
 
 			// No change at all — skip
 			if (out.changeType === 'none' || out.changeType === 'cached') return
 
-			if (!success.printed && !success.showedNext && !success.active) printStatus(rel, 'ok', null, { clearAfter: 3500 })
+			if (!success.printed && !success.showedNext && !success.active) printStatus(rel, 'ok', null, { fadeAfter: 3500 })
 			broadcast({ type: 'update', file: rel, slots: out.slots || 'shifted' })
 		} catch(e) {
 			if (!isCurrentChange(file, version)) return
@@ -1062,7 +1153,7 @@ export function serve(entrypoint, flags) {
 				const file = 'vendor:' + (specifier || pathname)
 				const bundled = specifier ? await bundleVendor(specifier) : null
 				if (bundled?.code) {
-					markSuccess(file)
+					await markSuccess(file)
 					return new Response(bundled.code, { headers: { 'Content-Type': 'application/javascript' } })
 				}
 
@@ -1075,7 +1166,7 @@ export function serve(entrypoint, flags) {
 				const file = 'html:' + normalizeFile(htmlFile)
 				try {
 					let html = await Bun.file(htmlFile).text()
-					markSuccess(file)
+					await markSuccess(file)
 					return new Response(transformHtml(html, entrypoint), {
 						headers: { 'Content-Type': 'text/html' },
 					})
@@ -1101,7 +1192,7 @@ export function serve(entrypoint, flags) {
 					if (out.errors?.length) {
 						return errorResponse(file, out.errors)
 					}
-					markSuccess(file)
+					await markSuccess(file)
 					return new Response(out.js, { headers: { 'Content-Type': 'application/javascript' } })
 				} catch(e) {
 					if (isMissingFileError(e)) {
@@ -1123,7 +1214,7 @@ export function serve(entrypoint, flags) {
 				try {
 					if (cssFile && await cssFile.exists()) {
 						if (req.headers.get('sec-fetch-dest') === 'style') {
-							markSuccess(file)
+							await markSuccess(file)
 							return new Response(cssFile, { headers: { 'Content-Type': 'text/css' } })
 						}
 
@@ -1135,7 +1226,7 @@ export function serve(entrypoint, flags) {
 							`if (!el) { el = document.createElement('style'); el.setAttribute('data-bimba-css', id); document.head.appendChild(el); }`,
 							`el.textContent = ${JSON.stringify(css)};`,
 						].join('\n')
-						markSuccess(file)
+						await markSuccess(file)
 						return new Response(js, { headers: { 'Content-Type': 'application/javascript' } })
 					}
 				} catch (error) {
@@ -1153,7 +1244,7 @@ export function serve(entrypoint, flags) {
 					const file = 'js:' + normalizeFile(jsFile)
 					try {
 						const response = await serveJavaScriptFile(jsFile)
-						markSuccess(file)
+						await markSuccess(file)
 						return response
 					} catch (error) {
 						if (isMissingFileError(error)) {
@@ -1180,7 +1271,7 @@ export function serve(entrypoint, flags) {
 					if (out.errors?.length) {
 						return errorResponse(file, out.errors)
 					}
-					markSuccess(file)
+					await markSuccess(file)
 					return new Response(out.js, { headers: { 'Content-Type': 'application/javascript' } })
 				}
 
@@ -1188,7 +1279,7 @@ export function serve(entrypoint, flags) {
 					const file = 'vendor:' + normalizeFile(pathname)
 					const bundled = await bundleVendor(path.resolve(resolved))
 					if (bundled?.code) {
-						markSuccess(file)
+						await markSuccess(file)
 						return new Response(bundled.code, { headers: { 'Content-Type': 'application/javascript' } })
 					}
 					return errorResponse(file, bundled?.errors || [`Could not bundle ${pathname}`])
@@ -1200,13 +1291,13 @@ export function serve(entrypoint, flags) {
 				const inHtmlDirPath = path.join(htmlDir, pathname)
 				const inHtmlDir = Bun.file(inHtmlDirPath)
 				if (await inHtmlDir.exists()) {
-					markSuccess('static:' + normalizeFile(inHtmlDirPath))
+					await markSuccess('static:' + normalizeFile(inHtmlDirPath))
 					return new Response(inHtmlDir)
 				}
 				const inRootPath = '.' + pathname
 				const inRoot = Bun.file(inRootPath)
 				if (await inRoot.exists()) {
-					markSuccess('static:' + normalizeFile(inRootPath))
+					await markSuccess('static:' + normalizeFile(inRootPath))
 					return new Response(inRoot)
 				}
 			} catch (error) {
@@ -1228,7 +1319,7 @@ export function serve(entrypoint, flags) {
 					if (out.errors?.length) {
 						return errorResponse(file, out.errors)
 					}
-					markSuccess(file)
+					await markSuccess(file)
 					return new Response(out.js, { headers: { 'Content-Type': 'application/javascript' } })
 				}
 				for (const ext of ['.js', '.mjs']) {
@@ -1237,7 +1328,7 @@ export function serve(entrypoint, flags) {
 						const file = 'js:' + normalizeFile(withExt)
 						try {
 							const response = await serveJavaScriptFile(withExt)
-							markSuccess(file)
+							await markSuccess(file)
 							return response
 						} catch (error) {
 							if (isMissingFileError(error)) {
@@ -1255,7 +1346,7 @@ export function serve(entrypoint, flags) {
 				const file = 'html:' + normalizeFile(htmlPath)
 				try {
 					let html = await Bun.file(htmlPath).text()
-					markSuccess(file)
+					await markSuccess(file)
 					return new Response(transformHtml(html, entrypoint), {
 						headers: { 'Content-Type': 'text/html' },
 					})
