@@ -2,6 +2,7 @@ import { serve as bunServe } from 'bun'
 import * as compiler from 'imba/compiler'
 import { mkdirSync, watch, existsSync, statSync, writeFileSync, realpathSync } from 'fs'
 import path from 'path'
+import { imbaPlugin } from './plugin.js'
 import { theme } from './utils.js'
 
 // ─── HMR Client (injected into browser) ──────────────────────────────────────
@@ -492,6 +493,11 @@ function findHtml(flagHtml) {
 // ─── Vendor modules ──────────────────────────────────────────────────────────
 
 const _vendorCache = new Map() // entrypoint → { mtime, code }
+const IMBA_VENDOR_EXTERNALS = ['imba', 'imba/*']
+
+function shouldExternalizeImbaForVendor(entrypoint) {
+	return entrypoint !== 'imba' && !entrypoint.startsWith('imba/')
+}
 
 function vendorUrl(specifier) {
 	return '/__bimba_vendor__/' + encodeURIComponent(specifier)
@@ -557,6 +563,7 @@ async function bundleVendor(entrypoint) {
 		if (cached && cached.mtime === mtime) return cached
 
 		const buildEntrypoint = vendorEntrypoint(entrypoint)
+		const externalizeImba = shouldExternalizeImbaForVendor(entrypoint)
 		const result = await Bun.build({
 			entrypoints: [buildEntrypoint],
 			target: 'browser',
@@ -565,6 +572,8 @@ async function bundleVendor(entrypoint) {
 			minify: false,
 			sourcemap: 'none',
 			packages: 'bundle',
+			external: externalizeImba ? IMBA_VENDOR_EXTERNALS : [],
+			plugins: [imbaPlugin],
 		})
 
 		if (!result.success) {
@@ -575,6 +584,7 @@ async function bundleVendor(entrypoint) {
 		if (!output) return { mtime, errors: ['Bun.build did not return a JavaScript output'] }
 
 		let code = await output.text()
+		if (externalizeImba) code = rewriteBareImports(code)
 		const css = (await Promise.all(
 			result.outputs
 				.filter(output => output.path.endsWith('.css'))
@@ -756,7 +766,6 @@ export function serve(entrypoint, flags) {
 
 	const _activeErrors = new Map()
 	const _terminalErrors = new Map()
-	const TERMINAL_DUPLICATE_MS = 5000
 
 	function broadcast(payload) {
 		const msg = JSON.stringify(payload)
@@ -889,7 +898,7 @@ export function serve(entrypoint, flags) {
 
 	function terminalErrorSignature(errors) {
 		return serializeErrors(errors)
-			.map(error => error.message)
+			.map(error => [error.message, error.line || ''].join('\n'))
 			.join('\n---\n')
 	}
 
@@ -974,7 +983,7 @@ export function serve(entrypoint, flags) {
 		const recent = _terminalErrors.get(terminalKey)
 		const duplicate = previous?.signature === signature
 			|| previous?.printSignature === printSignature
-			|| (recent?.signature === printSignature && now - recent.time < TERMINAL_DUPLICATE_MS)
+			|| recent?.signature === printSignature
 
 		const item = {
 			file: display,
@@ -987,10 +996,9 @@ export function serve(entrypoint, flags) {
 		_activeErrors.set(key, item)
 		_terminalErrors.set(terminalKey, { signature: printSignature, time: now })
 
-		// Repeated reports of the same active error update the live status and
-		// browser overlay, but do not create another terminal entry.
+		// Repeated reports of the same active error update the browser overlay,
+		// but never print or re-render another terminal entry until clear-error.
 		if (duplicate) {
-			if (_isTTY) renderActiveErrors()
 			broadcast({ type: 'error', file: display, time: item.time, errors: item.payload })
 			return
 		}

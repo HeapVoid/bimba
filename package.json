@@ -1,6 +1,6 @@
 {
   "name": "bimba-cli",
-  "version": "0.7.32",
+  "version": "0.7.35",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/HeapVoid/bimba.git"
