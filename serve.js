@@ -890,15 +890,35 @@ export function serve(entrypoint, flags) {
 		}))
 	}
 
+	function normalizeErrors(errors) {
+		const list = Array.isArray(errors) ? errors : [errors]
+		const seen = new Set()
+		const normalized = []
+
+		for (const error of list) {
+			const serialized = {
+				message: errorMessage(error),
+				line: errorLine(error),
+				snippet: errorSnippet(error),
+			}
+			const key = JSON.stringify(serialized)
+			if (seen.has(key)) continue
+			seen.add(key)
+			normalized.push(error)
+		}
+
+		return normalized
+	}
+
 	function errorSignature(errors) {
 		return serializeErrors(errors)
-			.map(error => [error.message, error.line || ''].join('\n'))
+			.map(error => [error.message, error.line ?? ''].join('\n'))
 			.join('\n---\n')
 	}
 
 	function terminalErrorSignature(errors) {
 		return serializeErrors(errors)
-			.map(error => [error.message, error.line || ''].join('\n'))
+			.map(error => [error.message, error.line ?? ''].join('\n'))
 			.join('\n---\n')
 	}
 
@@ -975,7 +995,7 @@ export function serve(entrypoint, flags) {
 		const display = normalizeFile(file)
 		const key = errorKey(display)
 		const terminalKey = terminalErrorKey(display)
-		const list = Array.isArray(errors) ? errors : [errors]
+		const list = normalizeErrors(errors)
 		const signature = errorSignature(list)
 		const printSignature = terminalErrorSignature(list)
 		const previous = takeError(display)
@@ -1007,7 +1027,7 @@ export function serve(entrypoint, flags) {
 	}
 
 	function errorText(errors) {
-		const list = Array.isArray(errors) ? errors : [errors]
+		const list = normalizeErrors(errors)
 		return list.map(errorMessage).join('\n')
 	}
 
@@ -1029,7 +1049,7 @@ export function serve(entrypoint, flags) {
 		}
 
 		let showedNext = false
-		if (_isTTY && _activeErrors.size) showedNext = renderActiveErrors()
+		if (_isTTY && _activeErrors.size && (!key || hadError || wasStatusFile)) showedNext = renderActiveErrors()
 		else if (!key || hadError || wasStatusFile) clearStatus(key)
 
 		broadcast({ type: 'clear-error', file: key })
@@ -1042,10 +1062,11 @@ export function serve(entrypoint, flags) {
 		const result = clearError(key)
 		const reconciled = await reconcileActiveErrors()
 		const active = _activeErrors.size
-		let showedNext = false
-		if (active && _isTTY) showedNext = renderActiveErrors()
-		else if (_isTTY && (reconciled || result.showedNext)) clearStatus()
-		else showedNext = result.showedNext
+		let showedNext = result.showedNext
+		if (_isTTY && reconciled) {
+			showedNext = active ? renderActiveErrors() : false
+			if (!showedNext && result.showedNext) clearStatus()
+		}
 		const shouldPrint = (result?.cleared || reconciled) && !showedNext && !active
 		if (shouldPrint) {
 			printStatus(key, 'ok', null, { fadeAfter: 3500 })
