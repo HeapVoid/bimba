@@ -11,10 +11,12 @@ bun add bimba-cli -d
 
 ## Backend development
 
-To run an .imba file in Bun's environment, create a `bunfig.toml` file in the root folder of your project:
+To run an .imba file in Bun's environment, Bun needs the bimba preload plugin in `bunfig.toml`:
 ```toml
 preload = ["bimba-cli/plugin.js"]
 ```
+
+bimba creates this minimal `bunfig.toml` automatically when you run a bimba CLI command in a project that does not have one yet. If `bunfig.toml` already exists, bimba leaves it unchanged and prints the line to add manually.
 
 Then use the usual Bun syntax:
 ```bash

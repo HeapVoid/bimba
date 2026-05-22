@@ -52,8 +52,9 @@ function ensureBunfigPreload() {
     const preloadLine = 'preload = ["bimba-cli/plugin.js"]';
 
     if (!fs.existsSync(bunfigPath)) {
-        console.log(theme.action("note: ") + theme.filename("bunfig.toml was not found, so bimba left it unchanged."));
-        console.log(theme.action("      ") + `Add ${theme.flags(preloadLine)} manually if you want Bun to preload the plugin.`);
+        fs.writeFileSync(bunfigPath, preloadLine + '\n');
+        console.log(theme.action("note: ") + theme.filename("bunfig.toml was not found, so bimba created it."));
+        console.log(theme.action("      ") + `Added ${theme.flags(preloadLine)} to preload the Imba plugin.`);
         return;
     }
 
