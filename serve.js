@@ -3,7 +3,7 @@ import * as compiler from 'imba/compiler'
 import { mkdirSync, watch, existsSync, statSync, writeFileSync, realpathSync } from 'fs'
 import path from 'path'
 import { imbaPlugin } from './plugin.js'
-import { theme } from './utils.js'
+import { IMBA_RUNTIME_DEFINES, theme } from './utils.js'
 
 // ─── HMR Client (injected into browser) ──────────────────────────────────────
 
@@ -573,6 +573,7 @@ async function bundleVendor(entrypoint) {
 			sourcemap: 'none',
 			packages: 'bundle',
 			external: externalizeImba ? IMBA_VENDOR_EXTERNALS : [],
+			define: IMBA_RUNTIME_DEFINES,
 			plugins: [imbaPlugin],
 		})
 

@@ -2,7 +2,7 @@
 
 import { parseArgs } from "util";
 import { imbaPlugin, stats, cache, setTarget } from './plugin.js'
-import {theme} from './utils.js';
+import { IMBA_RUNTIME_DEFINES, theme } from './utils.js';
 import fs from 'fs'
 import path from 'path';
 import { rmSync } from "node:fs";
@@ -189,6 +189,7 @@ async function bundle() {
             sourcemap: flags.sourcemap || 'none',
             minify: flags.minify ?? true,
             splitting: flags.splitting || false,
+            define: IMBA_RUNTIME_DEFINES,
             plugins: [imbaPlugin]
         };
         if (flags.external?.length) {

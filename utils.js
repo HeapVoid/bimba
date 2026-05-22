@@ -7,6 +7,10 @@ function colorize(text, fg, bg) {
     return result
 }
 
+export const IMBA_RUNTIME_DEFINES = {
+    ENV_EL_MOVING: String(2 ** 14),
+}
+
 // theme for messages printed in terminal
 // https://i.stack.imgur.com/KTSQa.png
 export const theme = {
