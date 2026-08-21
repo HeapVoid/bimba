@@ -249,28 +249,27 @@ serve.js
 │   ├── _compileCache (abs path → {mtime, result})
 │   └── _prevJs (abs path → js string, for change detection)
 │
-├── Import Graph
-│   ├── extractImports(js, absPath) — scan for .imba imports
-│   ├── updateImportGraph(from, deps) — maintain bidirectional graph
-│   └── _imports / _importers maps
+├── Local Source Modules
+│   ├── *.imba → compileFile() + symbol stabilization
+│   ├── *.ts / *.tsx → Bun.Transpiler → browser ESM
+│   └── *.js / *.mjs → bare-import rewriting
 │
 ├── File Watcher
-│   └── watch(srcDir) → compile → broadcast update via WebSocket
+│   ├── *.imba → compile → component HMR update
+│   └── *.ts / *.tsx / *.js / *.mjs → full-page reload
 │
 ├── HTTP Server
-│   ├── / → HTML with injected import map + HMR client
+│   ├── / → HTML with injected entrypoint + HMR client
 │   ├── *.imba → compile on demand → serve as JS
+│   ├── *.ts / *.tsx → transpile on demand → serve as JS
 │   ├── *.css → wrap as JS module (style injection)
-│   ├── /node_modules/* → resolve entry, compile .imba, wrap CJS
+│   ├── /__bimba_vendor__/* → bundle package through Bun
+│   ├── /node_modules/* → resolve and bundle through Bun
 │   └── Static files (htmlDir, then root)
 │
-├── Import Map (minimal, browser-side)
-│   └── bare specifier → /node_modules/pkg/ prefix mapping
-│
-└── Node Modules Resolution (server-side)
-    ├── resolveEntry(pkg.json) — exports/module/browser/main
-    ├── wrapCJS(code) — detect CJS, wrap as ESM
-    └── Extension fallback (.imba → .js → .mjs)
+└── Module Resolution
+    ├── bare specifier → /__bimba_vendor__/*
+    └── Extension fallback (.imba → .ts → .tsx → .js → .mjs)
 ```
 
 ---

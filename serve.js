@@ -113,6 +113,14 @@ const hmrClient = `
 			_collector = prev;
 		}
 
+		// Modules without custom elements cannot be patched in place. They are
+		// usually shared data, configuration, or global styles imported by other
+		// modules, so reload the dependency graph from a clean browser state.
+		if (!collected.length) {
+			location.reload();
+			return;
+		}
+
 		// Sync _ns_ (CSS namespace) from the new classes. imba_defineTag sets
 		// _ns_ on NewClass.prototype AFTER register$ calls customElements.define,
 		// so _patchClass missed it. Now that import is done, all _ns_ values are set.
@@ -506,11 +514,15 @@ function vendorUrl(specifier) {
 function resolveFileCandidate(filepath) {
 	const candidates = [
 		filepath,
+		filepath + '.ts',
+		filepath + '.tsx',
 		filepath + '.js',
 		filepath + '.mjs',
 		filepath + '.cjs',
 		filepath + '.imba',
 		filepath + '.css',
+		path.join(filepath, 'index.ts'),
+		path.join(filepath, 'index.tsx'),
 		path.join(filepath, 'index.js'),
 		path.join(filepath, 'index.mjs'),
 		path.join(filepath, 'index.cjs'),
@@ -611,6 +623,14 @@ async function bundleVendor(entrypoint) {
 
 async function serveJavaScriptFile(filepath) {
 	const js = rewriteBareImports(await Bun.file(filepath).text())
+	return new Response(js, { headers: { 'Content-Type': 'application/javascript' } })
+}
+
+async function serveTypeScriptFile(filepath) {
+	const loader = filepath.endsWith('.tsx') ? 'tsx' : 'ts'
+	const transpiler = new Bun.Transpiler({ loader, target: 'browser' })
+	const source = await Bun.file(filepath).text()
+	const js = rewriteBareImports(await transpiler.transform(source))
 	return new Response(js, { headers: { 'Content-Type': 'application/javascript' } })
 }
 
@@ -790,7 +810,7 @@ export function serve(entrypoint, flags) {
 	const srcRel = normalizeFile(srcRoot)
 
 	function unprefixFile(file) {
-		return normalizeFile(file).replace(/^(?:html|css|js|static):/, '')
+		return normalizeFile(file).replace(/^(?:html|css|js|ts|static):/, '')
 	}
 
 	function fileVariants(file) {
@@ -1098,7 +1118,7 @@ export function serve(entrypoint, flags) {
 
 	function scheduleCompile(filename) {
 		const file = watchedFile(filename)
-		if (!file || !file.rel.endsWith('.imba')) return
+		if (!file || !/\.(?:imba|ts|tsx|js|mjs)$/.test(file.rel)) return
 
 		const version = (_watchVersion.get(file.rel) || 0) + 1
 		_watchVersion.set(file.rel, version)
@@ -1108,12 +1128,20 @@ export function serve(entrypoint, flags) {
 
 		_debounce.set(file.rel, setTimeout(() => {
 			_debounce.delete(file.rel)
-			compileChangedFile(file, version)
+			if (file.rel.endsWith('.imba')) compileChangedFile(file, version)
+			else reloadChangedFile(file, version)
 		}, 150))
 	}
 
 	function isCurrentChange(file, version) {
 		return _watchVersion.get(file.rel) === version
+	}
+
+	function reloadChangedFile(file, version) {
+		if (!isCurrentChange(file, version)) return
+		clearError(file.rel)
+		printStatus(file.rel, 'ok', null, { fadeAfter: 3500 })
+		broadcast({ type: 'reload' })
 	}
 
 	async function compileChangedFile(file, version) {
@@ -1286,6 +1314,26 @@ export function serve(entrypoint, flags) {
 				}
 			}
 
+			// Local TypeScript modules: strip types and preserve ESM imports so
+			// .imba files can import typed data/configuration during development.
+			if (!pathname.startsWith('/node_modules/') && (pathname.endsWith('.ts') || pathname.endsWith('.tsx'))) {
+				const tsFile = resolveFileCandidate(path.join(htmlDir, pathname)) || resolveFileCandidate('.' + pathname)
+				if (tsFile) {
+					const file = 'ts:' + normalizeFile(tsFile)
+					try {
+						const response = await serveTypeScriptFile(tsFile)
+						await markSuccess(file)
+						return response
+					} catch (error) {
+						if (isMissingFileError(error)) {
+							clearError(file)
+							return new Response('Not Found', { status: 404 })
+						}
+						return errorResponse(file, [error])
+					}
+				}
+			}
+
 			// Direct node_modules URLs (from user import maps or explicit imports)
 			// are bundled through Bun too, so browser/cjs/exports handling stays
 			// in one place.
@@ -1337,7 +1385,7 @@ export function serve(entrypoint, flags) {
 			// Try extensions for extensionless paths (e.g. node_modules imports)
 			const lastSegment = pathname.split('/').pop()
 			if (!lastSegment.includes('.')) {
-				// Try .imba first (compile on the fly), then .js/.mjs
+				// Try .imba first (compile on the fly), then TypeScript and JavaScript.
 				const imbaPath = '.' + pathname + '.imba'
 				if (existsSync(imbaPath)) {
 					const out = await compileFile(imbaPath)
@@ -1352,12 +1400,15 @@ export function serve(entrypoint, flags) {
 					await markSuccess(file)
 					return new Response(out.js, { headers: { 'Content-Type': 'application/javascript' } })
 				}
-				for (const ext of ['.js', '.mjs']) {
+				for (const ext of ['.ts', '.tsx', '.js', '.mjs']) {
 					const withExt = '.' + pathname + ext
 					if (existsSync(withExt)) {
-						const file = 'js:' + normalizeFile(withExt)
+						const typed = ext === '.ts' || ext === '.tsx'
+						const file = (typed ? 'ts:' : 'js:') + normalizeFile(withExt)
 						try {
-							const response = await serveJavaScriptFile(withExt)
+							const response = typed
+								? await serveTypeScriptFile(withExt)
+								: await serveJavaScriptFile(withExt)
 							await markSuccess(file)
 							return response
 						} catch (error) {

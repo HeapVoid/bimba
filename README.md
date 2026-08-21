@@ -38,11 +38,13 @@ bunx bimba src/index.imba --serve --port 5200 --html public/index.html
 
 **How it works:**
 - Serves your HTML file and compiles `.imba` files on demand (no bundling step)
+- Transpiles local `.ts` and `.tsx` modules on demand through Bun
 - Watches `src/` for changes and pushes updates over WebSocket
 - Rewrites bare package imports in served JS modules to `__bimba_vendor__/*` URLs
 - CSS files imported from JS (e.g. `import 'some-lib/styles.css'`) are automatically wrapped as JS modules that inject `<style>` tags
 - npm packages are bundled on demand by Bun (`target: "browser"`), so Bun owns `exports`, `browser`, CommonJS interop, and nested dependency resolution
 - Injects an HMR client that swaps component prototypes without a full page reload
+- Reloads the page when shared TypeScript, JavaScript, or data-only Imba modules change
 
 **HMR internals:**
 
@@ -74,7 +76,7 @@ For a deep dive into how Imba compiles tags, how the render cache works, and how
 
 `--html <path>` — path to your HTML file (auto-detected from `./index.html`, `./public/index.html`, `./src/index.html` if omitted)
 
-Static files are resolved relative to the HTML file's directory first, then from the project root (for `node_modules`, `src`, etc.). Extensionless imports are resolved by trying `.imba`, `.js`, and `.mjs` extensions automatically.
+Static files are resolved relative to the HTML file's directory first, then from the project root (for `node_modules`, `src`, etc.). Extensionless imports are resolved by trying `.imba`, `.ts`, `.tsx`, `.js`, and `.mjs` extensions automatically.
 
 **npm package resolution:** The dev server scans each served JS module and rewrites bare imports such as `imba/runtime`, `@scope/pkg`, and `pkg/subpath` to `__bimba_vendor__/*` URLs. Those vendor URLs are bundled on demand with Bun (`target: "browser"`). Imba source files still compile separately for HMR, while Bun owns dependency resolution, `exports`, `browser` fields, nested `node_modules`, and CommonJS interop.
 
