@@ -1,6 +1,6 @@
 {
   "name": "bimba-cli",
-  "version": "0.7.39",
+  "version": "0.7.40",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/HeapVoid/bimba.git"
@@ -14,10 +14,16 @@
     "upload": "bun test && npm publish"
   },
   "description": "The CLI tool to run Imba projects under Bun",
-  "keywords": ["imba", "bun", "plugin"],
+  "keywords": [
+    "imba",
+    "bun",
+    "plugin"
+  ],
   "license": "MIT",
   "type": "module",
   "devDependencies": {
-    "imba": "latest"
+    "imba": "latest",
+    "typescript": "5.9.3",
+    "typescript-imba-plugin": "1.8.3"
   }
 }

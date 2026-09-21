@@ -107,7 +107,11 @@ bunx bimba src/index.imba --typecheck
 bunx bimba src --typecheck
 ```
 
-This mode requires `typescript` in the project and `typescript-imba-plugin` either in `node_modules` or in an installed Imba editor extension.
+This mode requires `typescript` and `imba` in the project, and `typescript-imba-plugin` either in `node_modules` or in an installed Imba editor extension. The scanned files must be included in a real `tsconfig.json` or `jsconfig.json` (for example, `"include": ["src/**/*"]`). Files excluded from the project and unconfigured projects fail with an actionable error rather than silently passing.
+
+The project Imba compiler checks syntax before TypeScript diagnostics. The CLI registers `.imba` before loading projects, waits for project initialization, and reports configuration errors and unexpected server exits directly. A successful result requires syntax, semantic, and suggestion diagnostic responses for every scanned file. If a project refresh interrupts a diagnostic batch, the CLI checks the remaining files within the same timeout. Run `bun test tests/typecheck.test.js` for the real compiler/tsserver regressions.
+
+The TypeScript session timeout defaults to 120 seconds to accommodate larger projects. Set `BIMBA_TYPECHECK_TIMEOUT` (milliseconds) to override it.
 
 ---
 

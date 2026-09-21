@@ -110,10 +110,7 @@ function parseMessages(buffer, onMessage) {
         const body = buffer.slice(bodyStart, bodyStart + length).toString('utf8');
         buffer = buffer.slice(bodyStart + length);
 
-        try {
-            onMessage(JSON.parse(body));
-        }
-        catch {}
+        onMessage(JSON.parse(body));
     }
 }
 
@@ -157,7 +154,7 @@ function send(server, seq, command, args) {
 
 export async function checkImbaTypes(entrypoint, options = {}) {
     const cwd = options.cwd || process.cwd();
-    const timeout = Number(options.timeout || process.env.BIMBA_TYPECHECK_TIMEOUT || process.env.IMBA_TS_CHECK_TIMEOUT || 30000);
+    const timeout = Number(options.timeout || process.env.BIMBA_TYPECHECK_TIMEOUT || process.env.IMBA_TS_CHECK_TIMEOUT || 120000);
     const scanRoot = getScanRoot(entrypoint, cwd);
     const files = collectImbaFiles(scanRoot);
 
@@ -173,11 +170,38 @@ export async function checkImbaTypes(entrypoint, options = {}) {
     console.log(theme.folder('──────────────────────────────────────────────────────────────────────'));
     console.log(theme.start(`Start checking TypeScript diagnostics for ${theme.count(files.length)} Imba file${files.length > 1 ? 's' : ''}`));
 
+    // The language-service plugin can return no diagnostics when Imba cannot
+    // produce a virtual TypeScript file. Validate syntax with the project compiler
+    // first so a broken source file cannot be reported as a successful typecheck.
+    const compilerPath = canResolve('imba/compiler', cwd);
+    if (!compilerPath) throw new Error('Could not find the Imba compiler. Install it in this project: bun add -d imba');
+    const compiler = require(compilerPath);
+    let syntaxErrors = 0;
+    for (const file of files) {
+        let errors;
+        try {
+            errors = compiler.compile(fs.readFileSync(file, 'utf8'), { sourcePath: file, platform: 'browser', comments: false }).errors || [];
+        }
+        catch (error) { errors = [error]; }
+        for (const error of errors) {
+            syntaxErrors++;
+            const line = (error.range?.start?.line || 0) + 1;
+            const column = (error.range?.start?.character || 0) + 1;
+            console.log(`${theme.filedir(path.relative(cwd, file))}:${line}:${column} ${theme.failure(' Imba ')} ${error.message}`);
+        }
+    }
+    if (syntaxErrors) {
+        console.log(theme.failure(' Failure ') + ` Imba compiler found ${syntaxErrors} error(s)`);
+        return false;
+    }
+
     return await new Promise((resolve) => {
         let settled = false;
         let buffer = Buffer.alloc(0);
         const seq = { value: 1 };
-        const diagnostics = [];
+        const diagnostics = new Map();
+        const pending = new Map();
+        const checked = new Set();
         let geterrSeq = null;
 
         const server = spawn(runner, [
@@ -193,11 +217,13 @@ export async function checkImbaTypes(entrypoint, options = {}) {
             settled = true;
             clearTimeout(timer);
             server.kill();
+            for (const request of pending.values()) request.reject(new Error('TypeScript session ended'));
+            pending.clear();
             resolve(success);
         }
 
         function finishWithDiagnostics() {
-            const unique = uniqueDiagnostics(diagnostics);
+            const unique = uniqueDiagnostics([...diagnostics.values()].flat());
 
             if (!unique.length) {
                 console.log(theme.success('Success') + ' No Imba TypeScript diagnostics');
@@ -215,52 +241,101 @@ export async function checkImbaTypes(entrypoint, options = {}) {
             finish(false);
         }, timeout);
 
-        server.on('error', (error) => {
-            console.log(theme.failure(' Failure ') + ` Could not start ${runner}: ${error.message}`);
+        function fail(error) {
+            if (settled) return;
+            console.log(theme.failure(' Failure ') + ` ${error.message}`);
             finish(false);
-        });
+        }
 
+        function request(command, args) {
+            if (settled) return Promise.reject(new Error('TypeScript session ended'));
+            const id = seq.value;
+            return new Promise((resolve, reject) => {
+                pending.set(id, { resolve, reject });
+                send(server, seq, command, args);
+            });
+        }
+
+        server.on('error', fail);
+        server.on('exit', (code, signal) => fail(new Error(`TypeScript exited before diagnostics completed (${signal || code})`)));
+        server.stdin.on('error', fail);
         server.stderr.on('data', chunk => process.stderr.write(chunk));
 
+        // Config diagnostics name their file differently and can be cleared after
+        // the plugin refreshes the project. Keep the latest result per file/kind.
+        function receive(msg) {
+            if (settled) return;
+            if (msg.type == 'response') {
+                const waiting = pending.get(msg.request_seq);
+                if (!waiting) return;
+                pending.delete(msg.request_seq);
+                if (msg.success) waiting.resolve(msg.body);
+                else waiting.reject(new Error(`${msg.command}: ${msg.message || 'TypeScript request failed'}`));
+                return;
+            }
+            if (msg.type != 'event') return;
+
+            if (msg.event == 'requestCompleted' && msg.body?.request_seq == geterrSeq) {
+                const missing = files.filter(file => ['syntaxDiag', 'semanticDiag', 'suggestionDiag']
+                    .some(kind => !checked.has(`${kind}\0${file}`)));
+                if (missing.length) requestDiagnostics(missing);
+                else finishWithDiagnostics();
+                return;
+            }
+            if (!/Diag$/.test(msg.event) || !msg.body?.diagnostics) return;
+
+            const file = msg.body.file || msg.body.configFile;
+            if (!file) throw new Error(`TypeScript ${msg.event} did not identify its file`);
+            if (geterrSeq !== null) checked.add(`${msg.event}\0${file}`);
+            recordDiagnostics(msg.event, file, msg.body.diagnostics);
+        }
+
+        function recordDiagnostics(kind, file, result) {
+            if (!Array.isArray(result)) throw new Error(`TypeScript did not return ${kind} diagnostics for ${file}`);
+            const items = result.map(diagnostic => ({
+                ...diagnostic,
+                file,
+                kind,
+                key: [kind, file, diagnostic.start?.line, diagnostic.start?.offset,
+                    diagnostic.code, flattenMessage(diagnostic.text)].join('\0'),
+            }));
+            diagnostics.set(`${kind}\0${file}`, items);
+        }
+
         server.stdout.on('data', chunk => {
-            buffer = Buffer.concat([buffer, chunk]);
-            buffer = parseMessages(buffer, msg => {
-                if (msg.type != 'event') return;
-
-                if (msg.event == 'requestCompleted' && msg.body?.request_seq == geterrSeq) {
-                    finishWithDiagnostics();
-                    return;
-                }
-
-                if (!/Diag$/.test(msg.event)) return;
-                if (!msg.body?.diagnostics?.length) return;
-
-                for (const diagnostic of msg.body.diagnostics) {
-                    const key = [
-                        msg.event,
-                        msg.body.file,
-                        diagnostic.start?.line,
-                        diagnostic.start?.offset,
-                        diagnostic.code,
-                        flattenMessage(diagnostic.text),
-                    ].join('\0');
-
-                    diagnostics.push({
-                        key,
-                        kind: msg.event,
-                        file: msg.body.file,
-                        ...diagnostic,
-                    });
-                }
-            });
+            try {
+                buffer = parseMessages(Buffer.concat([buffer, chunk]), receive);
+            }
+            catch (error) { fail(error); }
         });
 
-        setTimeout(() => {
-            if (settled) return;
-            send(server, seq, 'configure', { preferences: {}, hostInfo: 'bimba-typecheck' });
-            for (const file of files) send(server, seq, 'open', { file, projectRootPath: cwd });
+        function requestDiagnostics(batch) {
+            // A project refresh can cancel geterr partway through but still emit
+            // requestCompleted. Retry files missing any diagnostic response;
+            // the session timeout bounds retries. Keep the event protocol because
+            // the Imba plugin maps its positions back to the original source.
             geterrSeq = seq.value;
-            send(server, seq, 'geterr', { files, delay: 0 });
-        }, 100);
+            send(server, seq, 'geterr', { files: batch, delay: 0 });
+        }
+
+        // Register Imba before opening files. Otherwise tsserver can finish an
+        // empty initial project before the plugin adds the extension, reporting
+        // a false success or a transient "No inputs" configuration error.
+        async function check() {
+            await request('configure', {
+                preferences: {}, hostInfo: 'bimba-typecheck',
+                extraFileExtensions: [{ extension: '.imba', isMixedContent: false, scriptKind: 7 }],
+            });
+            for (const file of files) await request('open', { file, projectRootPath: cwd });
+            for (const file of files) {
+                const project = await request('projectInfo', { file, needFileNameList: false });
+                if (project.languageServiceDisabled) throw new Error(`TypeScript language service is disabled for ${file}`);
+                if (!project.configFileName || !fs.existsSync(project.configFileName)) {
+                    throw new Error(`${file} is not included in a project configuration. Add it to the include/files of tsconfig.json or jsconfig.json.`);
+                }
+            }
+            requestDiagnostics(files);
+        }
+        check().catch(fail);
     });
 }
