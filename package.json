@@ -1,6 +1,6 @@
 {
   "name": "bimba-cli",
-  "version": "0.7.41",
+  "version": "0.7.42",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/HeapVoid/bimba.git"
@@ -22,6 +22,7 @@
   "license": "MIT",
   "type": "module",
   "devDependencies": {
+    "happy-dom": "20.14.5",
     "imba": "latest",
     "typescript": "5.9.3",
     "typescript-imba-plugin": "1.8.3"

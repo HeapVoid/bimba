@@ -33,6 +33,10 @@ const hmrClient = `
 	// Track listeners installed on that element during render, so we can remove
 	// them before HMR without touching listeners installed by mount/user code.
 	const _renderListeners = new WeakMap();
+	const _renderSymbols = new WeakMap();
+	const _classVersions = new WeakMap();
+	const _renderState = new WeakMap();
+	let _version = 0;
 	let _rendering = null;
 	const _addListener = EventTarget.prototype.addEventListener;
 	EventTarget.prototype.addEventListener = function(type, listener, options) {
@@ -50,9 +54,24 @@ const hmrClient = `
 		const render = descriptor.value;
 		Object.defineProperty(cls.prototype, 'render', { ...descriptor, value: function(...args) {
 			const previous = _rendering;
+			const version = _versionOf(this);
+			if (previous !== this && _renderState.has(this) && _renderState.get(this).version !== version) {
+				_resetRender(this);
+			}
+			_renderState.set(this, { version, flags: this.flags$ns || '' });
+			const before = new Set(Object.getOwnPropertySymbols(this));
 			_rendering = this;
 			try { return render.apply(this, args); }
-			finally { _rendering = previous; }
+			finally {
+				// Only this renderer's caches belong to it. The same element can
+				// also hold parent-owned loop caches and application Symbols.
+				let symbols = _renderSymbols.get(this);
+				if (!symbols) _renderSymbols.set(this, symbols = new Set());
+				for (const key of Object.getOwnPropertySymbols(this)) {
+					if (!before.has(key) && key.description === undefined && Symbol.keyFor(key) === undefined) symbols.add(key);
+				}
+				_rendering = previous;
+			}
 		} });
 	}
 
@@ -94,6 +113,52 @@ const hmrClient = `
 	function _patchClass(target, source) {
 		_copyDescriptors(target.prototype, source.prototype, k => k === 'constructor');
 		_copyDescriptors(target, source, k => _skipStatics.has(k));
+		_classVersions.set(target.prototype, ++_version);
+	}
+
+	// A detached conditional branch can outlive several updates. Its next
+	// render must invalidate the old cache too; a document-only sweep misses it.
+	function _versionOf(el) {
+		let version = 0;
+		for (let proto = Object.getPrototypeOf(el); proto; proto = Object.getPrototypeOf(proto)) {
+			version = Math.max(version, _classVersions.get(proto) || 0);
+		}
+		return version;
+	}
+
+	function _resetRender(el) {
+		for (const { type, listener, capture } of _renderListeners.get(el) || []) {
+			el.removeEventListener(type, listener, capture);
+		}
+		_renderListeners.delete(el);
+		for (const sym of _renderSymbols.get(el) || []) {
+			delete el[sym];
+		}
+		_renderSymbols.delete(el);
+		// Named tags ($menu, $panel, etc.) are a second compiler cache.
+		// Reusing them after a destructive render appends new children to
+		// their old DOM/slots. Dev compilation makes these caches removable.
+		for (const key of Object.getOwnPropertyNames(el)) {
+			if (!key.startsWith('$')) continue;
+			const descriptor = Object.getOwnPropertyDescriptor(el, key);
+			if (descriptor.enumerable || descriptor.writable) continue;
+			if (descriptor.value instanceof Node && !Reflect.deleteProperty(el, key)) {
+				throw new Error('Cannot reset named Imba reference: ' + key);
+			}
+		}
+		// Incoming slots belong to the caller. Detach through Imba so its
+		// fragment clears parentNode, then let the new template reinsert it.
+		// innerHTML alone leaves a stale slot parent when <slot> is on <self>.
+		for (const slot of Object.values(el.__slots || {})) {
+			if (slot?.parentNode) slot[Symbol.for('#removeFrom')](slot.parentNode);
+		}
+		// Native DOM removal runs descendant teardown. The retained element
+		// stays mounted; manually calling its lifecycle hooks duplicates work.
+		el.innerHTML = '';
+		// Detached instances also missed the document-wide CSS class update.
+		const flags = el.flags$ns || '';
+		el.className = _replaceTokens(el.className, _renderState.get(el)?.flags || '', flags);
+		_renderState.set(el, { version: _versionOf(el), flags });
 	}
 
 	function _replaceTokens(value, before, after) {
@@ -201,17 +266,7 @@ const hmrClient = `
 		for (const el of elementsBefore) {
 			// Include subclasses, and skip children already replaced by a parent.
 			if (!el.isConnected || !changedClasses.some(cls => el instanceof cls)) continue;
-			for (const { type, listener, capture } of _renderListeners.get(el) || []) {
-				el.removeEventListener(type, listener, capture);
-			}
-			_renderListeners.delete(el);
-			for (const sym of Object.getOwnPropertySymbols(el)) {
-				if (Symbol.keyFor(sym) !== undefined) continue;
-				try { delete el[sym]; } catch(_) {}
-			}
-			// Native DOM removal runs descendant teardown. The retained element
-			// stays mounted; manually calling its lifecycle hooks duplicates work.
-			el.innerHTML = '';
+			if (_renderState.get(el)?.version !== _versionOf(el)) _resetRender(el);
 			if (el.render) el.render();
 		}
 
@@ -400,7 +455,12 @@ function dropFileState(filepath) {
 // Stability is keyed by name, not meaning. Slot counts are diagnostic only;
 // even equal counts can accompany changed static text or attributes. The
 // client therefore always rebuilds the affected inner DOM.
-function stabilizeSymbols(js, filepath) {
+export function prepareHotModule(js, filepath) {
+	// Imba's lazy named-element getters cache non-configurable own properties.
+	// Permit the HMR client to discard those references with their render tree.
+	// Only the compiler's generated cache expression is rewritten, in dev mode.
+	js = js.replace(/Object\.defineProperty\(this,(['"])(\$[\p{ID_Continue}$]+)\1,\{value:el\}\)/gu,
+		(_match, quote, name) => `Object.defineProperty(this,${quote}${name}${quote},{value:el,configurable:true})`)
 	let count = 0
 	const out = js.replace(
 		/([A-Za-z_$][\w$]*)\s*=\s*Symbol\(\)/g,
@@ -520,7 +580,7 @@ async function compileFile(filepath) {
 
 		const errors = result.errors || []
 		if (!errors.length && result.js) {
-			const { js, slotCount } = stabilizeSymbols(result.js, abs)
+			const { js, slotCount } = prepareHotModule(result.js, abs)
 			result.js = rewriteBareImports(js)
 			const prev = _prevSlots.get(abs)
 			result.slots = (prev === undefined || prev === slotCount) ? 'stable' : 'shifted'
@@ -691,7 +751,7 @@ function transformHtml(html, entrypoint) {
 
 	const entryUrl = '/' + entrypoint.replace(/^\.\//, '').replaceAll('\\', '/')
 
-	html = html.replace('</head>',
+	html = html.replace('</head>', () =>
 		`\t\t<script type='module' src='${entryUrl}'></script>\n${hmrClient}\n\t</head>`
 	)
 	return html

@@ -130,7 +130,7 @@ Browsers have no built-in HMR for custom elements:
 
 ## 3. How Bimba's HMR Works
 
-### 3.1 Symbol Stabilization (server-side)
+### 3.1 Development Module Preparation (server-side)
 
 **Problem:** Each `var $7 = Symbol()` creates a unique symbol. Re-importing the module creates a NEW `$7` symbol. Existing elements have DOM cached under the OLD `$7`. The new render method looks up `this[NEW_$7]` — not found → creates duplicate DOM.
 
@@ -151,6 +151,8 @@ First load: creates symbols, stores in cache.
 HMR reload: reuses same symbols from cache → render finds cached DOM → REUSE mode.
 
 **Critical:** The file path key MUST be normalized (absolute via `path.resolve`). Different string representations of the same file (e.g., `./src/foo.imba` vs `src/foo.imba`) produce different cache keys → different symbols → duplication. This was the root cause of the v0.7.8 fix.
+
+Named element references form a separate render cache. The compiler emits a lazy getter for `$menu` that stores the element with `Object.defineProperty(this, '$menu', {value: el})`. That property is non-configurable by default, survives deleting Symbol caches, and can reuse a popup whose slot already contains the old children. Development compilation (`prepareHotModule`) makes this generated property configurable so the client can remove it when discarding the render tree. Production compilation is unchanged.
 
 ### 3.2 Slot Stability Detection
 
@@ -204,17 +206,20 @@ but the client ignores it. Every HMR update does:
 3. For existing instances of affected tags and their subclasses, in DOM order:
    - Skip descendants already replaced by an affected parent
    - Remove listeners installed on the retained element during its previous render
-   - Delete all anonymous Symbol properties (render cache) — skip `Symbol.for(...)` ones
+   - Delete only anonymous, undescribed Symbols created by that instance's render; preserve parent-owned loop caches and application state
+   - Delete compiler-generated named DOM references (`$menu`, `$panel`, etc.), so the new render cannot append children to their old slots
+   - Detach incoming `__slots` through Imba's fragment API, preserving their contents and clearing their old insertion parent
    - `innerHTML = ''` — wipe DOM; the browser disconnects descendants once
-   - `el.render()` — rebuild DOM from scratch with new render method
+   - `el.render()` — rebuild DOM from scratch with the new render method
 4. `imba.commit()` for final sync
+
+The render wrapper tracks a version derived from the element's prototype chain. Detached conditional components miss the document sweep, so their next render performs the same reset if their class or a base class changed. An element already refreshed by its parent during the update does not reset twice.
+
+Slot ownership matters: the updated child's incoming slots belong to its caller and must survive. Its own named references belong to its renderer and must be discarded. Clearing every Symbol or only clearing `innerHTML` violates that boundary.
 
 The retained element's fields and mount-installed listeners stay in place. Do not manually invoke `connectedCallback`, `mount`, or `remount`: the element has not moved or disconnected. In Imba 2.0.0-alpha.253, the default `remount()` calls `mount()`, so substituting it would still duplicate subscriptions. Render failures propagate to the reload fallback.
 
-**Trade-off:** Input focus, scroll position, and popup state are lost on every
-edit. This is acceptable because correctness beats convenience — a "stable"
-update that silently ignores the change is far more confusing than losing
-transient UI state.
+**Trade-off:** Fields on the retained component survive. Recreated descendants, including named popup references, lose their local state; a popup can close when its owner is edited. Input focus and scroll position can reset. Editing only a popup template preserves its caller-owned slot contents.
 
 ### 3.6 Entrypoint and Update Delivery
 
@@ -222,7 +227,7 @@ Entrypoint edits trigger a full page reload before re-importing any bootstrap co
 
 The compile cache and delivered-update baseline are separate. HTTP requests and error reconciliation may compile a saved file before the watcher's debounce expires. They must not advance `_prevJs` after its initial baseline; only publishing an update does that. Otherwise the watcher sees a cache hit and silently skips an edit still needed by connected browsers. The watcher also rechecks its version after asynchronous error reconciliation.
 
-`tests/serve-hmr.test.js` exercises the injected client with native event dispatch and a small DOM model, plus real Bun HTTP/WebSocket/watch integration. Browser verification should additionally cover repeated sidebar edits, self handlers, inherited templates, and adding/removing `css self`.
+`tests/serve-hmr.test.js` exercises the injected client with native event dispatch and a small DOM model, plus real Bun HTTP/WebSocket/watch integration and validation of the injected script. `tests/serve-hmr-runtime.test.js` compiles real Imba components and executes the client with the actual Imba runtime in Happy DOM. It covers repeated popup edits, named references, direct and teleported slots, parent loop caches, handlers, and detached components (including inheritance). Browser verification also uses the actual served modules and file watcher.
 
 ---
 
@@ -233,12 +238,12 @@ serve.js
 ├── HMR Client (injected as <script> into HTML)
 │   ├── customElements.define hook
 │   ├── _patchClass / _copyDescriptors
-│   ├── _doUpdate (stable/shifted paths)
+│   ├── _doUpdate / _trackRender / _resetRender
 │   ├── WebSocket connection
 │   └── Error overlay
 │
-├── Symbol Stabilization
-│   ├── stabilizeSymbols(js, absPath)
+├── Development Module Preparation
+│   ├── prepareHotModule(js, absPath)
 │   └── Slot count tracking (_prevSlots)
 │
 ├── Compiler

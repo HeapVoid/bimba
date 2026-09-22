@@ -246,6 +246,20 @@ async function server() {
 }
 
 describe('HMR watcher', () => {
+	test('serves a valid HMR client and resettable named-element caches', async () => {
+		const env = await server()
+		try {
+			const html = await (await fetch(env.url)).text()
+			const scripts = [...html.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/g)].map(match => match[1])
+			const client = scripts.find(script => script.includes('const _classes'))
+			expect(client).toBeDefined()
+			expect(() => new vm.Script(client)).not.toThrow()
+			await Bun.write(join(env.fixture, 'src/sidebar.imba'), "tag audit-sidebar\n\t<self>\n\t\t<button$action> 'Action'\n")
+			const js = await (await fetch(env.url + '/src/sidebar.imba')).text()
+			expect(js).toContain("Object.defineProperty(this,'$action',{value:el,configurable:true})")
+		} finally { env.socket.close() }
+	})
+
 	test('sends an update even when an HTTP request compiled the saved file first', async () => {
 		const env = await server()
 		try {
