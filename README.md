@@ -44,7 +44,7 @@ bunx bimba src/index.imba --serve --port 5200 --html public/index.html
 - CSS files imported from JS (e.g. `import 'some-lib/styles.css'`) are automatically wrapped as JS modules that inject `<style>` tags
 - npm packages are bundled on demand by Bun (`target: "browser"`), so Bun owns `exports`, `browser`, CommonJS interop, and nested dependency resolution
 - Injects an HMR client that swaps component prototypes without a full page reload
-- Reloads the page when shared TypeScript, JavaScript, or data-only Imba modules change
+- Reloads the page when the entrypoint, shared TypeScript, JavaScript, or data-only Imba modules change
 
 **HMR internals:**
 
@@ -52,13 +52,15 @@ When a file changes, the server recompiles it and sends an `update` message over
 
 Since Imba custom elements can't be registered twice (`customElements.define` throws on duplicates), bimba intercepts all `define` calls. On first load the class is registered normally and stored in a map. On hot reload, instead of registering again, bimba copies all methods and static properties from the new class onto the original class prototype — so existing element instances in the DOM immediately get the new `render()` and other methods without losing their state (`el.active`, `el.count`, etc.).
 
-After patching, bimba clears each element's Imba render cache (anonymous `Symbol` keys pointing to DOM nodes) and sets `innerHTML = ''`, so the new render method starts from a clean slate. Then `imba.commit()` triggers a re-render of all mounted components.
+After patching, bimba clears each affected element's Imba render cache and rebuilds its inner DOM. This includes instances of subclasses. Listeners created by the old render on `<self>` are removed before rendering again; listeners installed by `mount()` are retained. The element stays mounted, so HMR does not call `mount()`, `remount()`, or `connectedCallback()` again. Descendant lifecycle hooks run through normal DOM removal and insertion.
 
-CSS is handled automatically: Imba's runtime calls `imba_styles.register()` during module execution, which updates the `<style>` tag in place — no extra DOM work needed. CSS files from npm packages (e.g. `import 'pkg/styles.css'`) are served as JS modules that inject and update `<style>` tags.
+Imba's runtime updates stylesheets during module execution. Bimba also synchronizes CSS namespaces and `css self` classes on existing elements, including when styles are added or removed. CSS files from npm packages (e.g. `import 'pkg/styles.css'`) are served as JS modules that inject and update `<style>` tags.
 
-Duplicate root elements (caused by `imba.mount()` running again on re-import) are removed by a dedup pass over `document.body.children` before any other HMR logic runs.
+Entrypoint edits reload the page so bootstrap code, root mounts, and subscriptions start once. Component modules should keep application bootstrapping in the entrypoint.
 
-**Smart HMR:** bimba detects whether a change affects the template structure (adding/removing elements) or just CSS/logic. CSS-only and logic-only changes patch prototypes in place without wiping innerHTML — preserving input focus, scroll position, and open popups. Template-structural changes do a full wipe-and-rerender to ensure correctness.
+**State preservation:** Fields on retained component instances survive HMR. Their inner DOM is rebuilt on every update, including CSS and logic edits, so input focus, scroll position, and descendant state may reset. A render failure falls back to a full page reload.
+
+Run `bun test tests/serve-hmr.test.js` for the client lifecycle, inheritance, CSS, and watcher/cache regressions.
 
 For a deep dive into how Imba compiles tags, how the render cache works, and how bimba hooks into it — see [INTERNALS.md](INTERNALS.md).
 

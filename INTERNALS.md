@@ -157,8 +157,10 @@ HMR reload: reuses same symbols from cache → render finds cached DOM → REUSE
 If the user adds/removes template elements, the number of `Symbol()` declarations changes. Variable names shift (`$7` now means a different DOM slot). Even with stable symbols, the SEMANTICS change.
 
 Detection: count `Symbol()` calls per file. Compare to previous compilation:
-- Same count → `slots: 'stable'` → safe for in-place HMR
-- Different count → `slots: 'shifted'` → must do destructive HMR
+- Same count → `slots: 'stable'`
+- Different count → `slots: 'shifted'`
+
+These are diagnostic hints, not proof that the render cache can be reused. The client always rebuilds the affected inner DOM (see 3.5).
 
 ### 3.3 Prototype Patching (browser-side)
 
@@ -175,18 +177,9 @@ Effect: all existing element instances immediately get new methods via the proto
 
 ### 3.4 CSS Namespace Sync
 
-When CSS changes, Imba generates a new hash → new `_ns_` (e.g., `"z1abc_xy "` → `"z9def_gh "`). The issue:
+Imba exposes scoped CSS through `_ns_` and root CSS classes through `flags$ns`. The current runtime sets this metadata in `defineTag` before custom-element registration; older versions used a different order. Bimba saves the previous values before patching and synchronizes both fields after the module finishes loading.
 
-1. `register$` → `customElements.define` → bimba's hook → `_patchClass` runs
-2. `defineTag` runs AFTER `register$` — sets `_ns_` on the NEW class prototype
-3. But `_patchClass` already ran, so the OLD prototype still has the old `_ns_`
-
-Solution: after `import()` completes, sync `_ns_` manually:
-```js
-oldCls.prototype._ns_ = newCls.prototype._ns_;
-```
-
-Then patch `className` on ALL custom elements in the DOM, replacing old hash parts with new ones.
+Existing DOM elements also need their classes updated: adding the first `css self` rule does not rerun the constructor that initially installs `flags$ns`. Bimba adds/removes these tokens while preserving application classes. Subclasses can have their own copies of inherited CSS metadata, so those copies are updated too.
 
 ### 3.5 Always-Destructive HMR
 
@@ -207,25 +200,29 @@ The `slots` field is still computed and broadcast (for potential future use),
 but the client ignores it. Every HMR update does:
 
 1. `_patchClass` updates prototype (during import)
-2. `_ns_` is synced
-3. For each instance of each affected tag:
-   - Save instance properties (`Object.keys(el)`)
-   - Call `disconnectedCallback` on all descendant custom elements
+2. CSS metadata and classes are synced
+3. For existing instances of affected tags and their subclasses, in DOM order:
+   - Skip descendants already replaced by an affected parent
+   - Remove listeners installed on the retained element during its previous render
    - Delete all anonymous Symbol properties (render cache) — skip `Symbol.for(...)` ones
-   - `innerHTML = ''` — wipe DOM
-   - Restore instance properties
+   - `innerHTML = ''` — wipe DOM; the browser disconnects descendants once
    - `el.render()` — rebuild DOM from scratch with new render method
-   - `el.connectedCallback()`, `el.mount()` — re-initialize
 4. `imba.commit()` for final sync
+
+The retained element's fields and mount-installed listeners stay in place. Do not manually invoke `connectedCallback`, `mount`, or `remount`: the element has not moved or disconnected. In Imba 2.0.0-alpha.253, the default `remount()` calls `mount()`, so substituting it would still duplicate subscriptions. Render failures propagate to the reload fallback.
 
 **Trade-off:** Input focus, scroll position, and popup state are lost on every
 edit. This is acceptable because correctness beats convenience — a "stable"
 update that silently ignores the change is far more confusing than losing
 transient UI state.
 
-### 3.6 Body-level Deduplication
+### 3.6 Entrypoint and Update Delivery
 
-Some modules call `imba.mount(<app-root>)` at top level. Re-importing the module would create a second root element. After each HMR import, bimba checks for new body children with the same tag name as existing ones and removes duplicates.
+Entrypoint edits trigger a full page reload before re-importing any bootstrap code. This avoids repeated mounts and application subscriptions. Component modules should not bootstrap the application. The legacy body-child deduplication remains for other modules, but cannot undo arbitrary module side effects. It runs immediately after import, before rendering: running it after rendering mistakenly removes replacement `<global>` portals with the same tag name as their previous body content.
+
+The compile cache and delivered-update baseline are separate. HTTP requests and error reconciliation may compile a saved file before the watcher's debounce expires. They must not advance `_prevJs` after its initial baseline; only publishing an update does that. Otherwise the watcher sees a cache hit and silently skips an edit still needed by connected browsers. The watcher also rechecks its version after asynchronous error reconciliation.
+
+`tests/serve-hmr.test.js` exercises the injected client with native event dispatch and a small DOM model, plus real Bun HTTP/WebSocket/watch integration. Browser verification should additionally cover repeated sidebar edits, self handlers, inherited templates, and adding/removing `css self`.
 
 ---
 

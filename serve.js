@@ -16,8 +16,8 @@ const hmrClient = `
 	// store the class in _classes map.
 	//
 	// On hot reload: the re-imported module calls customElements.define() again.
-	// The tag is already registered (browser ignores duplicate defines).
-	// Instead of ignoring the new class, we patch the prototype of the original
+	// The tag is already registered (a duplicate native define would throw).
+	// Instead of registering the new class, we patch the prototype of the original
 	// class with all new methods. This means:
 	//   - Existing element instances immediately get new render/methods
 	//   - Instance properties (el.active, el.count, etc.) are preserved
@@ -26,10 +26,38 @@ const hmrClient = `
 	const _origDefine = customElements.define.bind(customElements);
 	const _classes = new Map(); // tagName → first-registered constructor
 	const _newClasses = new Map(); // tagName → latest class from HMR import
-	const _oldNs = new Map();  // tagName → previous _ns_ (saved before _patchClass wipes it)
+	const _oldCss = new Map(); // CSS metadata before _patchClass overwrites it
 	let _collector = null;      // when set, captures tag names defined during one HMR import
 
+	// A destructive render recreates <self> handlers on the retained element.
+	// Track listeners installed on that element during render, so we can remove
+	// them before HMR without touching listeners installed by mount/user code.
+	const _renderListeners = new WeakMap();
+	let _rendering = null;
+	const _addListener = EventTarget.prototype.addEventListener;
+	EventTarget.prototype.addEventListener = function(type, listener, options) {
+		if (this === _rendering && listener) {
+			let listeners = _renderListeners.get(this);
+			if (!listeners) _renderListeners.set(this, listeners = []);
+			listeners.push({ type, listener, capture: typeof options === 'boolean' ? options : !!options?.capture });
+		}
+		return _addListener.call(this, type, listener, options);
+	};
+
+	function _trackRender(cls) {
+		const descriptor = Object.getOwnPropertyDescriptor(cls.prototype, 'render');
+		if (typeof descriptor?.value !== 'function') return;
+		const render = descriptor.value;
+		Object.defineProperty(cls.prototype, 'render', { ...descriptor, value: function(...args) {
+			const previous = _rendering;
+			_rendering = this;
+			try { return render.apply(this, args); }
+			finally { _rendering = previous; }
+		} });
+	}
+
 	customElements.define = function(name, cls, opts) {
+		_trackRender(cls);
 		if (_collector) _collector.push(name);
 		const existing = customElements.get(name);
 		if (!existing) {
@@ -39,8 +67,8 @@ const hmrClient = `
 			_newClasses.set(name, cls);
 			const target = _classes.get(name);
 			if (target) {
-				// Save old _ns_ before _patchClass overwrites prototype descriptors
-				if (target.prototype._ns_) _oldNs.set(name, target.prototype._ns_);
+				// Save CSS metadata before _patchClass overwrites prototype descriptors.
+				_oldCss.set(name, { ns: target.prototype._ns_ || '', flags: target.prototype.flags$ns || '' });
 				// Always patch: even CSS-only changes may update methods.
 				_patchClass(target, cls);
 			}
@@ -68,6 +96,13 @@ const hmrClient = `
 		_copyDescriptors(target, source, k => _skipStatics.has(k));
 	}
 
+	function _replaceTokens(value, before, after) {
+		const tokens = new Set(String(value || '').trim().split(/\\s+/).filter(Boolean));
+		for (const token of before.trim().split(/\\s+/).filter(Boolean)) tokens.delete(token);
+		for (const token of after.trim().split(/\\s+/).filter(Boolean)) tokens.add(token);
+		return Array.from(tokens).join(' ');
+	}
+
 	// ── HMR update handler ─────────────────────────────────────────────────────
 
 	// Updates are serialized via a promise queue. Without this, two file edits
@@ -85,24 +120,13 @@ const hmrClient = `
 		});
 	}
 
-	// Walk a subtree and call disconnectedCallback on each custom element.
-	// Used before destroying inner DOM on the shifted path so imba/web-component
-	// teardown logic (event listeners, observers, etc.) runs cleanly.
-	function _disconnectDescendants(root) {
-		const all = root.querySelectorAll('*');
-		for (const el of all) {
-			if (el.tagName.includes('-')) {
-				try { el.disconnectedCallback && el.disconnectedCallback(); } catch(_) {}
-			}
-		}
-	}
-
 	async function _doUpdate(file, slots) {
 		clearError(file);
 
 		const bodyBefore = new Set(document.body.children);
 		const tagsBefore = new Set();
 		for (const el of bodyBefore) tagsBefore.add(el.tagName.toLowerCase());
+		const elementsBefore = Array.from(document.querySelectorAll('*'));
 
 		const collected = [];
 		const prev = _collector;
@@ -113,6 +137,13 @@ const hmrClient = `
 			_collector = prev;
 		}
 
+		// Remove roots duplicated by module execution before rendering retained
+		// components. A later pass would also delete fresh <global> portal content.
+		for (const el of [...document.body.children]) {
+			if (bodyBefore.has(el)) continue;
+			if (tagsBefore.has(el.tagName.toLowerCase())) el.remove();
+		}
+
 		// Modules without custom elements cannot be patched in place. They are
 		// usually shared data, configuration, or global styles imported by other
 		// modules, so reload the dependency graph from a clean browser state.
@@ -121,16 +152,16 @@ const hmrClient = `
 			return;
 		}
 
-		// Sync _ns_ (CSS namespace) from the new classes. imba_defineTag sets
-		// _ns_ on NewClass.prototype AFTER register$ calls customElements.define,
-		// so _patchClass missed it. Now that import is done, all _ns_ values are set.
-		// Save old→new mapping for className patching below.
+		// Sync completed CSS metadata, including versions of Imba that set it
+		// after custom-element registration. Save old→new class mappings.
 		const _nsPatches = []; // [{ oldParts, newParts }]
+		const _flagPatches = [];
 		for (const tag of collected) {
 			const newCls = _newClasses.get(tag);
 			const oldCls = _classes.get(tag);
 			const newNs = newCls?.prototype._ns_;
-			const oldNs = _oldNs.get(tag);
+			const previousCss = _oldCss.get(tag);
+			const oldNs = previousCss?.ns;
 			if (oldNs && newNs && oldNs !== newNs) {
 				oldCls.prototype._ns_ = newNs;
 				// _ns_ uses '_' separator (z12kthg6_bc), className uses '-' (z12kthg6-bc)
@@ -141,7 +172,23 @@ const hmrClient = `
 			} else if (newNs && oldCls && oldCls.prototype._ns_ !== newNs) {
 				oldCls.prototype._ns_ = newNs;
 			}
-			_oldNs.delete(tag);
+			if (newCls && oldCls && previousCss) {
+				const flags = newCls.prototype.flags$ns || '';
+				oldCls.prototype.flags$ns = flags;
+				oldCls.prototype._ns_ = newNs || '';
+				_flagPatches.push({ cls: oldCls, before: previousCss.flags, after: flags });
+				// Imba copies inherited CSS metadata when defining a subclass.
+				// Keep those copies current for both existing and future instances.
+				for (const [name, cls] of _classes) {
+					if (collected.includes(name) || !oldCls.prototype.isPrototypeOf(cls.prototype)) continue;
+					for (const [key, before, after] of [['_ns_', oldNs || '', newNs || ''], ['flags$ns', previousCss.flags, flags]]) {
+						if (!Object.hasOwn(cls.prototype, key)) continue;
+						const value = _replaceTokens(cls.prototype[key], before, after);
+						cls.prototype[key] = value ? value + ' ' : '';
+					}
+				}
+			}
+			_oldCss.delete(tag);
 		}
 
 		// Destructive HMR: wipe inner DOM and re-render each collected tag.
@@ -150,22 +197,29 @@ const hmrClient = `
 		// elements on re-render. Even "stable" edits (static text, attributes)
 		// won't apply unless we clear those symbols and force a fresh render.
 		// _patchClass already ran above, so the new render() method is in place.
-		for (const tag of collected) {
-			const els = document.querySelectorAll(tag);
-			els.forEach(el => {
-				const state = {};
-				for (const k of Object.keys(el)) state[k] = el[k];
-				_disconnectDescendants(el);
-				for (const sym of Object.getOwnPropertySymbols(el)) {
-					if (Symbol.keyFor(sym) !== undefined) continue;
-					try { delete el[sym]; } catch(_) {}
-				}
-				el.innerHTML = '';
-				Object.assign(el, state);
-				try { el.render && el.render(); } catch(e) { console.error('[bimba] render error:', e); }
-				try { el.connectedCallback && el.connectedCallback(); } catch(_) {}
-				try { el.mount && el.mount(); } catch(_) {}
-			});
+		const changedClasses = collected.map(tag => _classes.get(tag)).filter(Boolean);
+		for (const el of elementsBefore) {
+			// Include subclasses, and skip children already replaced by a parent.
+			if (!el.isConnected || !changedClasses.some(cls => el instanceof cls)) continue;
+			for (const { type, listener, capture } of _renderListeners.get(el) || []) {
+				el.removeEventListener(type, listener, capture);
+			}
+			_renderListeners.delete(el);
+			for (const sym of Object.getOwnPropertySymbols(el)) {
+				if (Symbol.keyFor(sym) !== undefined) continue;
+				try { delete el[sym]; } catch(_) {}
+			}
+			// Native DOM removal runs descendant teardown. The retained element
+			// stays mounted; manually calling its lifecycle hooks duplicates work.
+			el.innerHTML = '';
+			if (el.render) el.render();
+		}
+
+		for (const el of document.querySelectorAll('*')) {
+			for (const { cls, before, after } of _flagPatches) {
+				if (!(el instanceof cls)) continue;
+				el.className = _replaceTokens(el.className, before, after);
+			}
 		}
 
 		if (typeof imba !== 'undefined') imba.commit();
@@ -192,11 +246,6 @@ const hmrClient = `
 			});
 		}
 
-		// Smart body dedupe: remove duplicate top-level elements created by re-import
-		for (const el of [...document.body.children]) {
-			if (bodyBefore.has(el)) continue;
-			if (tagsBefore.has(el.tagName.toLowerCase())) el.remove();
-		}
 	}
 
 	// ── WebSocket connection ───────────────────────────────────────────────────
@@ -325,7 +374,7 @@ const hmrClient = `
 // ─── Server-side compile cache ────────────────────────────────────────────────
 
 const _compileCache = new Map()  // filepath → { stamp, result }
-const _prevJs = new Map()  // filepath → compiled js — for change detection
+const _prevJs = new Map()  // filepath → initial / last broadcast JS, independent of cache reads
 const _prevSlots = new Map()  // filepath → previous symbol slot count
 const _importScanner = new Bun.Transpiler({ loader: 'js' })
 
@@ -348,12 +397,9 @@ function dropFileState(filepath) {
 // objects are reused, slot keys stay stable, and imba's renderer happily
 // diff-updates existing DOM in place.
 //
-// Caveat: stability is keyed by name. If the user adds/removes elements in the
-// template, slot indices shift and the same name now points to a semantically
-// different slot. We detect this by counting slots — if the count changes vs
-// the previous compilation, we mark the file `slots: 'shifted'` and the client
-// falls back to the destructive wipe-and-render path. Pure CSS/text edits keep
-// counts unchanged → true in-place HMR.
+// Stability is keyed by name, not meaning. Slot counts are diagnostic only;
+// even equal counts can accompany changed static text or attributes. The
+// client therefore always rebuilds the affected inner DOM.
 function stabilizeSymbols(js, filepath) {
 	let count = 0
 	const out = js.replace(
@@ -443,7 +489,7 @@ async function compileFile(filepath) {
 		const cached = _compileCache.get(abs)
 		if (cached && cached.stamp === stamp) {
 			if (fileStamp(abs) !== stamp) continue
-			return _normalizeResult(cached.result, { changeType: 'cached' })
+			return _normalizeResult(cached.result, { changeType: _prevJs.get(abs) === cached.result.js ? 'none' : 'full' })
 		}
 
 		const file = Bun.file(abs)
@@ -484,7 +530,9 @@ async function compileFile(filepath) {
 		// Bake errors as an own property so caching/spreading preserves them.
 		const baked = { js: result.js, errors, slots: result.slots }
 		const changeType = _prevJs.get(abs) === baked.js ? 'none' : 'full'
-		_prevJs.set(abs, baked.js)
+		// HTTP requests and error reconciliation can compile before the watcher.
+		// They establish the initial baseline but must not consume later updates.
+		if (!_prevJs.has(abs)) _prevJs.set(abs, baked.js)
 		_compileCache.set(abs, { stamp, result: baked })
 		return _normalizeResult(baked, { changeType })
 	}
@@ -1169,12 +1217,16 @@ export function serve(entrypoint, flags) {
 			}
 
 			const success = await markSuccess(rel)
+			if (!isCurrentChange(file, version)) return
 
 			// No change at all — skip
-			if (out.changeType === 'none' || out.changeType === 'cached') return
+			if (out.changeType === 'none') return
 
 			if (!success.printed && !success.showedNext && !success.active) printStatus(rel, 'ok', null, { fadeAfter: 3500 })
-			broadcast({ type: 'update', file: rel, slots: out.slots || 'shifted' })
+			_prevJs.set(path.resolve(filepath), out.js)
+			// Bootstrapping the entrypoint again repeats mounts and subscriptions.
+			if (path.resolve(filepath) === path.resolve(entrypoint)) broadcast({ type: 'reload' })
+			else broadcast({ type: 'update', file: rel, slots: out.slots || 'shifted' })
 		} catch(e) {
 			if (!isCurrentChange(file, version)) return
 			if (isMissingFileError(e)) {
