@@ -1,6 +1,6 @@
 {
   "name": "bimba-cli",
-  "version": "0.7.42",
+  "version": "0.7.43",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/HeapVoid/bimba.git"
@@ -26,5 +26,8 @@
     "imba": "latest",
     "typescript": "5.9.3",
     "typescript-imba-plugin": "1.8.3"
+  },
+  "dependencies": {
+    "acorn": "^8.18.0"
   }
 }

@@ -98,7 +98,7 @@ imba_styles.register('z1abc', "...");
 | **Create vs Reuse** | `this[$7] === 1` is the master flag. `$5=0` = first render (create all), `$5=1` = re-render (reuse cached). |
 | **Static children** | Guarded by `$5 \|\| (...)` — created only on first render, never recreated. |
 | **Conditional children** | Each branch has its own cache slot (`$19` for `if`, `$24` for `else`). `$placeChild$` swaps them in/out. |
-| **CSS namespace** | `_ns_` on prototype (e.g. `"z1abc_xy "`). Used as className prefix. Hash changes when CSS content changes. |
+| **CSS namespace** | `_ns_` on prototype (e.g. `"z1abc_xy "`). Used as className prefix. Development HMR mode keeps it stable across CSS-only edits. |
 | **Tag registration** | `register$` → `customElements.define()`. `defineTag` → sets `_ns_`, `cssid`, registers in Imba's internal tag registry (`J[name]`, `xh[name]`). |
 | **Lifecycle** | `__init__$` (property defaults), `connectedCallback` (DOM attachment), `mount` (post-connect, user code), `render` (DOM creation/update). |
 
@@ -154,15 +154,13 @@ HMR reload: reuses same symbols from cache → render finds cached DOM → REUSE
 
 Named element references form a separate render cache. The compiler emits a lazy getter for `$menu` that stores the element with `Object.defineProperty(this, '$menu', {value: el})`. That property is non-configurable by default, survives deleting Symbol caches, and can reuse a popup whose slot already contains the old children. Development compilation (`prepareHotModule`) makes this generated property configurable so the client can remove it when discarding the render tree. Production compilation is unchanged.
 
-### 3.2 Slot Stability Detection
+### 3.2 Separate CSS and Executable Code
 
-If the user adds/removes template elements, the number of `Symbol()` declarations changes. Variable names shift (`$7` now means a different DOM slot). Even with stable symbols, the SEMANTICS change.
+`hot-module.js` compiles with `sourcePath: path.resolve(file)`, `hmr: true`, `styles: 'extern'` and `resolveColors: true`. HMR mode assigns CSS scopes before rules exist, so adding the first CSS rule does not require changing the template. Initial modules register their extracted CSS through Imba's `styles.register`, including empty stylesheets and the runtime reset stylesheet.
 
-Detection: count `Symbol()` calls per file. Compare to previous compilation:
-- Same count → `slots: 'stable'`
-- Different count → `slots: 'shifted'`
+Bun's JavaScript parser/transpiler normalizes code for comparison; comments, whitespace and inline source maps do not turn a CSS edit into a code edit. The original compiled JavaScript is still served. Equal code with changed CSS yields a `css` packet. The browser updates `styles.register(styleId, css)` only if that stylesheet is already loaded, without reexecuting the component module or rendering any component. The same path applies to entrypoint and global-only styles. Local `.css` files use their served URL to update style nodes or stylesheet links.
 
-These are diagnostic hints, not proof that the render cache can be reused. The client always rebuilds the affected inner DOM (see 3.5).
+Acorn parses generated code to stabilize anonymous compiler Symbol declarations and make generated named getter caches configurable, without rewriting lookalike text inside strings or application calls. Cache counts are not used to decide whether a template is safe to retain.
 
 ### 3.3 Prototype Patching (browser-side)
 
@@ -181,51 +179,34 @@ Effect: all existing element instances immediately get new methods via the proto
 
 Imba exposes scoped CSS through `_ns_` and root CSS classes through `flags$ns`. The current runtime sets this metadata in `defineTag` before custom-element registration; older versions used a different order. Bimba saves the previous values before patching and synchronizes both fields after the module finishes loading.
 
-Existing DOM elements also need their classes updated: adding the first `css self` rule does not rerun the constructor that initially installs `flags$ns`. Bimba adds/removes these tokens while preserving application classes. Subclasses can have their own copies of inherited CSS metadata, so those copies are updated too.
+With `hmr: true`, CSS-only edits keep these scopes stable, including adding the first `css self` rule. For template/code updates that change scope metadata, Bimba adds/removes the corresponding tokens while preserving application classes. Subclasses can have their own copies of inherited CSS metadata, so those copies are updated too.
 
-### 3.5 Always-Destructive HMR
+### 3.5 Selective Template Invalidation
 
-> **History:** Earlier versions (≤0.7.8) had two paths — "stable" (in-place
-> prototype patching + `imba.commit()`) and "shifted" (destructive wipe +
-> re-render). The stable path was meant to preserve DOM state (inputs, focus,
-> popups) when only CSS or logic changed without adding/removing template
-> elements. However, it fundamentally didn't work: imba's reconciliation uses
-> slot-tracking symbols (`this[$sym] === 1`) to skip re-creating elements on
-> re-render. Even when `_patchClass` installs a new `render()` method, calling
-> `render()` (or `imba.commit()`) does nothing — the slot check says "already
-> created" and skips `createElement`. Static text, attributes, and other
-> arguments baked into `createElement` calls never update.
->
-> Since 0.7.9, bimba always takes the destructive path.
+Before wrapping `render`, the client records a signature of the class's original render function, named-element getters and methods containing compiled tag creation/render-context code. Reimports still patch prototypes, but only changed template signatures advance the class's render-cache version. Ordinary method changes retain the existing render caches and DOM. An unchanged parent in the same module keeps its named child components and their state.
 
-The `slots` field is still computed and broadcast (for potential future use),
-but the client ignores it. Every HMR update does:
+The server also compares module context outside component methods. Changes to imports, top-level variables/functions, ordinary classes, tag registration or inheritance invalidate templates in the module: an unchanged render function may contain a cached closure over an old module-local variable. Comparing only `render.toString()` would miss this case.
 
-1. `_patchClass` updates prototype (during import)
-2. CSS metadata and classes are synced
-3. For existing instances of affected tags and their subclasses, in DOM order:
-   - Skip descendants already replaced by an affected parent
-   - Remove listeners installed on the retained element during its previous render
-   - Delete only anonymous, undescribed Symbols created by that instance's render; preserve parent-owned loop caches and application state
-   - Delete compiler-generated named DOM references (`$menu`, `$panel`, etc.), so the new render cannot append children to their old slots
-   - Detach incoming `__slots` through Imba's fragment API, preserving their contents and clearing their old insertion parent
-   - `innerHTML = ''` — wipe DOM; the browser disconnects descendants once
-   - `el.render()` — rebuild DOM from scratch with the new render method
-4. `imba.commit()` for final sync
+For a stale template, existing instances of affected tags and subclasses reset in DOM order:
 
-The render wrapper tracks a version derived from the element's prototype chain. Detached conditional components miss the document sweep, so their next render performs the same reset if their class or a base class changed. An element already refreshed by its parent during the update does not reset twice.
+1. Skip descendants already replaced by an affected parent.
+2. Remove listeners installed on the retained element during its previous render.
+3. Delete only anonymous, undescribed Symbols owned by that renderer; preserve parent-owned loop caches and application state.
+4. Delete compiler-generated named DOM references (`$menu`, `$panel`, etc.).
+5. Detach incoming `__slots` through Imba's fragment API, preserving their contents and clearing their old insertion parent.
+6. Clear inner DOM and render the new template. Native removal/insertion handles descendant lifecycle.
 
-Slot ownership matters: the updated child's incoming slots belong to its caller and must survive. Its own named references belong to its renderer and must be discarded. Clearing every Symbol or only clearing `innerHTML` violates that boundary.
+The render wrapper tracks a version derived from the element's prototype chain. Detached conditional components miss the document sweep, so their next render performs the same reset if their class or a base class has a stale template. An element already refreshed by its parent during the update does not reset twice.
 
-The retained element's fields and mount-installed listeners stay in place. Do not manually invoke `connectedCallback`, `mount`, or `remount`: the element has not moved or disconnected. In Imba 2.0.0-alpha.253, the default `remount()` calls `mount()`, so substituting it would still duplicate subscriptions. Render failures propagate to the reload fallback.
+Do not manually invoke `connectedCallback`, `mount`, or `remount` on retained elements: they have not disconnected. In Imba 2.0.0-alpha.253, the default `remount()` calls `mount()`, so substituting it duplicates subscriptions.
 
-**Trade-off:** Fields on the retained component survive. Recreated descendants, including named popup references, lose their local state; a popup can close when its owner is edited. Input focus and scroll position can reset. Editing only a popup template preserves its caller-owned slot contents.
+**Preservation boundary:** CSS and ordinary method edits preserve DOM. Template edits preserve fields on retained components and caller-owned slots, but may recreate descendants, losing their focus, scroll or component state. Arbitrary structural edits do not promise complete state preservation. Render failures propagate to the reload fallback.
 
 ### 3.6 Entrypoint and Update Delivery
 
-Entrypoint edits trigger a full page reload before re-importing any bootstrap code. This avoids repeated mounts and application subscriptions. Component modules should not bootstrap the application. The legacy body-child deduplication remains for other modules, but cannot undo arbitrary module side effects. It runs immediately after import, before rendering: running it after rendering mistakenly removes replacement `<global>` portals with the same tag name as their previous body content.
+Entrypoint JavaScript edits trigger a full page reload before re-importing any bootstrap code. This avoids repeated mounts and application subscriptions. Component modules should not bootstrap the application. The legacy body-child deduplication remains for other modules, but cannot undo arbitrary module side effects. It runs immediately after import, before rendering: running it after rendering mistakenly removes replacement `<global>` portals with the same tag name as their previous body content.
 
-The compile cache and delivered-update baseline are separate. HTTP requests and error reconciliation may compile a saved file before the watcher's debounce expires. They must not advance `_prevJs` after its initial baseline; only publishing an update does that. Otherwise the watcher sees a cache hit and silently skips an edit still needed by connected browsers. The watcher also rechecks its version after asynchronous error reconciliation.
+The compile cache and delivered-update baseline are separate. HTTP requests and error reconciliation may compile a saved file before the watcher's debounce expires. They must not advance `_published` after its initial baseline; only publishing an update does that. Otherwise the watcher sees a cache hit and silently skips an edit still needed by connected browsers. The watcher also rechecks its version after asynchronous error reconciliation.
 
 `tests/serve-hmr.test.js` exercises the injected client with native event dispatch and a small DOM model, plus real Bun HTTP/WebSocket/watch integration and validation of the injected script. `tests/serve-hmr-runtime.test.js` compiles real Imba components and executes the client with the actual Imba runtime in Happy DOM. It covers repeated popup edits, named references, direct and teleported slots, parent loop caches, handlers, and detached components (including inheritance). Browser verification also uses the actual served modules and file watcher.
 

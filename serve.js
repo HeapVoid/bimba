@@ -1,9 +1,10 @@
 import { serve as bunServe } from 'bun'
-import * as compiler from 'imba/compiler'
 import { mkdirSync, watch, existsSync, statSync, writeFileSync, realpathSync } from 'fs'
 import path from 'path'
 import { imbaPlugin } from './plugin.js'
 import { IMBA_RUNTIME_DEFINES, theme } from './utils.js'
+import { compileHotModule, classifyHotUpdate } from './hot-module.js'
+export { prepareHotModule } from './hot-module.js'
 
 // ─── HMR Client (injected into browser) ──────────────────────────────────────
 
@@ -27,6 +28,9 @@ const hmrClient = `
 	const _classes = new Map(); // tagName → first-registered constructor
 	const _newClasses = new Map(); // tagName → latest class from HMR import
 	const _oldCss = new Map(); // CSS metadata before _patchClass overwrites it
+	const _templates = new WeakMap();
+	const _classKeys = new WeakMap();
+	let _contextChanged = true;
 	let _collector = null;      // when set, captures tag names defined during one HMR import
 
 	// A destructive render recreates <self> handlers on the retained element.
@@ -75,21 +79,45 @@ const hmrClient = `
 		} });
 	}
 
+	// Compare the actual template functions before wrapping render(). Ordinary
+	// methods can be patched without discarding DOM. Named getters and helpers
+	// that construct tags are templates too, even when render() itself is equal.
+	function _templateSignature(cls) {
+		const templates = [];
+		for (const key of Reflect.ownKeys(cls.prototype)) {
+			if (key === 'constructor') continue;
+			const descriptor = Object.getOwnPropertyDescriptor(cls.prototype, key);
+			for (const kind of ['value', 'get', 'set']) {
+				const fn = descriptor[kind];
+				if (typeof fn !== 'function') continue;
+				const code = Function.prototype.toString.call(fn);
+				if (key === 'render' || String(key).startsWith('$') || /imba_(?:create|[gG]etRenderContext)/.test(code)) {
+					templates.push([String(key), kind, code]);
+				}
+			}
+		}
+		return JSON.stringify(templates);
+	}
+
 	customElements.define = function(name, cls, opts) {
+		const template = _templateSignature(cls);
 		_trackRender(cls);
+		const keys = { prototype: Reflect.ownKeys(cls.prototype), statics: Reflect.ownKeys(cls) };
 		if (_collector) _collector.push(name);
 		const existing = customElements.get(name);
 		if (!existing) {
 			_origDefine(name, cls, opts);
 			_classes.set(name, cls);
+			_templates.set(cls, template);
+			_classKeys.set(cls, keys);
 		} else {
 			_newClasses.set(name, cls);
 			const target = _classes.get(name);
 			if (target) {
 				// Save CSS metadata before _patchClass overwrites prototype descriptors.
 				_oldCss.set(name, { ns: target.prototype._ns_ || '', flags: target.prototype.flags$ns || '' });
-				// Always patch: even CSS-only changes may update methods.
-				_patchClass(target, cls);
+				_patchClass(target, cls, _contextChanged || _templates.get(target) !== template, keys);
+				_templates.set(target, template);
 			}
 		}
 	};
@@ -110,10 +138,21 @@ const hmrClient = `
 		}
 	}
 
-	function _patchClass(target, source) {
+	function _patchClass(target, source, reset, keys) {
+		// Remove deleted overrides so inheritance can take effect. Only keys
+		// observed on the previously supplied class belong to this module;
+		// runtime/application descriptors added later are left alone.
+		const previous = _classKeys.get(target);
+		for (const key of previous?.prototype || []) {
+			if (key !== 'constructor' && !keys.prototype.includes(key)) Reflect.deleteProperty(target.prototype, key);
+		}
+		for (const key of previous?.statics || []) {
+			if (!_skipStatics.has(key) && !keys.statics.includes(key)) Reflect.deleteProperty(target, key);
+		}
 		_copyDescriptors(target.prototype, source.prototype, k => k === 'constructor');
 		_copyDescriptors(target, source, k => _skipStatics.has(k));
-		_classVersions.set(target.prototype, ++_version);
+		_classKeys.set(target, keys);
+		if (reset) _classVersions.set(target.prototype, ++_version);
 	}
 
 	// A detached conditional branch can outlive several updates. Its next
@@ -176,8 +215,8 @@ const hmrClient = `
 	// the first.
 	let _queue = Promise.resolve();
 
-	function _applyUpdate(file, slots) {
-		_queue = _queue.then(() => _doUpdate(file, slots)).catch(err => {
+	function _applyUpdate(msg) {
+		_queue = _queue.then(() => msg.type === 'css' ? _doStyleUpdate(msg) : _doUpdate(msg)).catch(err => {
 			// Safety net: any uncaught failure during HMR → full reload.
 			// Better to lose state than to leave a broken page.
 			console.error('[bimba HMR] reload due to error:', err);
@@ -185,7 +224,7 @@ const hmrClient = `
 		});
 	}
 
-	async function _doUpdate(file, slots) {
+	async function _doUpdate({ file, contextChanged = true }) {
 		clearError(file);
 
 		const bodyBefore = new Set(document.body.children);
@@ -196,10 +235,12 @@ const hmrClient = `
 		const collected = [];
 		const prev = _collector;
 		_collector = collected;
+		_contextChanged = contextChanged;
 		try {
 			await import('/' + file + '?t=' + Date.now());
 		} finally {
 			_collector = prev;
+			_contextChanged = true;
 		}
 
 		// Remove roots duplicated by module execution before rendering retained
@@ -256,12 +297,8 @@ const hmrClient = `
 			_oldCss.delete(tag);
 		}
 
-		// Destructive HMR: wipe inner DOM and re-render each collected tag.
-		// Always destructive regardless of slots value. Imba's reconciliation
-		// uses slot-tracking symbols (this[$sym] === 1) to skip re-creating
-		// elements on re-render. Even "stable" edits (static text, attributes)
-		// won't apply unless we clear those symbols and force a fresh render.
-		// _patchClass already ran above, so the new render() method is in place.
+		// Rebuild only changed templates (or closures over changed module code).
+		// Unchanged templates keep their caches, named children and open popups.
 		const changedClasses = collected.map(tag => _classes.get(tag)).filter(Boolean);
 		for (const el of elementsBefore) {
 			// Include subclasses, and skip children already replaced by a parent.
@@ -303,6 +340,27 @@ const hmrClient = `
 
 	}
 
+	async function _doStyleUpdate({ file, styleId, css, paths }) {
+		clearError(file);
+		if (styleId) {
+			const { styles } = await import('/__bimba_vendor__/imba');
+			// A watched file need not be imported by this tab. Do not activate its
+			// global rules until the application actually loads the module.
+			if (styles.entries[styleId]) styles.register(styleId, css);
+		} else {
+			for (const el of document.querySelectorAll('style[data-bimba-css]')) {
+				if (paths.includes(el.getAttribute('data-bimba-css'))) el.textContent = css;
+			}
+			for (const el of document.querySelectorAll('link[rel="stylesheet"]')) {
+				const url = new URL(el.href);
+				if (url.origin === location.origin && paths.includes(url.pathname)) {
+					url.searchParams.set('t', Date.now());
+					el.href = url.href;
+				}
+			}
+		}
+	}
+
 	// ── WebSocket connection ───────────────────────────────────────────────────
 
 	let _connected = false;
@@ -317,7 +375,7 @@ const hmrClient = `
 
 		ws.onmessage = (e) => {
 			const msg = JSON.parse(e.data);
-			if      (msg.type === 'update')      _applyUpdate(msg.file, msg.slots);
+			if      (msg.type === 'update' || msg.type === 'css') _applyUpdate(msg);
 			else if (msg.type === 'reload')      location.reload();
 			else if (msg.type === 'error')       showError(msg.file, msg.errors, msg.time);
 			else if (msg.type === 'clear-error') clearError(msg.file);
@@ -429,60 +487,19 @@ const hmrClient = `
 // ─── Server-side compile cache ────────────────────────────────────────────────
 
 const _compileCache = new Map()  // filepath → { stamp, result }
-const _prevJs = new Map()  // filepath → initial / last broadcast JS, independent of cache reads
-const _prevSlots = new Map()  // filepath → previous symbol slot count
+// Baselines advance only after broadcast, never during an HTTP cache read.
+const _published = new Map()
 const _importScanner = new Bun.Transpiler({ loader: 'js' })
 
 function dropFileState(filepath) {
 	const abs = path.resolve(filepath)
 	_compileCache.delete(abs)
-	_prevJs.delete(abs)
-	_prevSlots.delete(abs)
+	_published.delete(abs)
 }
 
-// Imba compiles tag render-cache slots as anonymous local Symbols at module top
-// level: `var $4 = Symbol(), $11 = Symbol(), ...; let c$0 = Symbol();`. Each
-// re-import of the file creates fresh Symbol objects, so old slot data on live
-// element instances no longer matches the new render's keys, and imba's diff
-// can't reuse cached children — it appends new ones, causing duplication.
-//
-// We rewrite each `<name> = Symbol()` clause so that the Symbol is read from a
-// per-file global cache, keyed by the variable name. On the first compilation
-// the cache is populated; on every subsequent compilation the same Symbol
-// objects are reused, slot keys stay stable, and imba's renderer happily
-// diff-updates existing DOM in place.
-//
-// Stability is keyed by name, not meaning. Slot counts are diagnostic only;
-// even equal counts can accompany changed static text or attributes. The
-// client therefore always rebuilds the affected inner DOM.
-export function prepareHotModule(js, filepath) {
-	// Imba's lazy named-element getters cache non-configurable own properties.
-	// Permit the HMR client to discard those references with their render tree.
-	// Only the compiler's generated cache expression is rewritten, in dev mode.
-	js = js.replace(/Object\.defineProperty\(this,(['"])(\$[\p{ID_Continue}$]+)\1,\{value:el\}\)/gu,
-		(_match, quote, name) => `Object.defineProperty(this,${quote}${name}${quote},{value:el,configurable:true})`)
-	let count = 0
-	const out = js.replace(
-		/([A-Za-z_$][\w$]*)\s*=\s*Symbol\(\)/g,
-		(_m, name) => { count++; return `${name} = (__bsyms__[${JSON.stringify(name)}] ||= Symbol())` }
-	)
-	if (count === 0) return { js, slotCount: 0 }
-	const fileKey = JSON.stringify(filepath)
-	const bootstrap = `const __bsyms__ = ((globalThis.__bimba_syms ||= {})[${fileKey}] ||= {});\n`
-	return { js: bootstrap + out, slotCount: count }
-}
-
-// Imba's compile result puts `errors` on the prototype as a getter, so plain
-// object spread (`{...result}`) silently strips it. We always normalize to a
-// plain shape with `errors` as an own property — otherwise downstream callers
-// see no errors and serve empty 200s for broken files.
-function _normalizeResult(result, extras) {
-	return {
-		js: result.js,
-		errors: result.errors || [],
-		slots: result.slots,
-		...extras,
-	}
+function classified(result, abs) {
+	const previous = _published.get(abs)
+	return { ...result, changeType: classifyHotUpdate(previous, result), contextChanged: !previous || previous.context !== result.context }
 }
 
 function isBareSpecifier(specifier) {
@@ -549,7 +566,7 @@ async function compileFile(filepath) {
 		const cached = _compileCache.get(abs)
 		if (cached && cached.stamp === stamp) {
 			if (fileStamp(abs) !== stamp) continue
-			return _normalizeResult(cached.result, { changeType: _prevJs.get(abs) === cached.result.js ? 'none' : 'full' })
+			return classified(cached.result, abs)
 		}
 
 		const file = Bun.file(abs)
@@ -565,36 +582,16 @@ async function compileFile(filepath) {
 		// cache, or report a result unless it still matches the current file.
 		if (fileStamp(abs) !== stamp) continue
 
-		let result
-		try {
-			result = compiler.compile(code, {
-				sourcePath: filepath,
-				platform: 'browser',
-				sourcemap: 'inline',
-			})
-		} catch (error) {
-			result = { js: '', errors: [error], slots: null }
-		}
-
+		const result = compileHotModule(code, abs)
 		if (fileStamp(abs) !== stamp) continue
 
-		const errors = result.errors || []
-		if (!errors.length && result.js) {
-			const { js, slotCount } = prepareHotModule(result.js, abs)
-			result.js = rewriteBareImports(js)
-			const prev = _prevSlots.get(abs)
-			result.slots = (prev === undefined || prev === slotCount) ? 'stable' : 'shifted'
-			_prevSlots.set(abs, slotCount)
-		}
-
-		// Bake errors as an own property so caching/spreading preserves them.
-		const baked = { js: result.js, errors, slots: result.slots }
-		const changeType = _prevJs.get(abs) === baked.js ? 'none' : 'full'
-		// HTTP requests and error reconciliation can compile before the watcher.
-		// They establish the initial baseline but must not consume later updates.
-		if (!_prevJs.has(abs)) _prevJs.set(abs, baked.js)
+		const baked = { ...result, js: rewriteBareImports(result.js) }
+		const out = classified(baked, abs)
+		// A successful first request establishes the baseline. Failed compiles
+		// cannot replace the last working module used by open browser tabs.
+		if (!_published.has(abs) && !baked.errors.length) _published.set(abs, baked)
 		_compileCache.set(abs, { stamp, result: baked })
-		return _normalizeResult(baked, { changeType })
+		return out
 	}
 }
 
@@ -765,6 +762,8 @@ export function serve(entrypoint, flags) {
 	const htmlDir  = path.dirname(htmlPath)
 	const srcDir   = path.dirname(entrypoint)
 	const sockets  = new Set()
+	const cssUrls = new Map()
+	const publishedCss = new Map()
 
 	// ── Live status block (shows only the current compile state) ───────────────
 
@@ -1226,7 +1225,7 @@ export function serve(entrypoint, flags) {
 
 	function scheduleCompile(filename) {
 		const file = watchedFile(filename)
-		if (!file || !/\.(?:imba|ts|tsx|js|mjs)$/.test(file.rel)) return
+		if (!file || !/\.(?:imba|ts|tsx|js|mjs|css)$/.test(file.rel)) return
 
 		const version = (_watchVersion.get(file.rel) || 0) + 1
 		_watchVersion.set(file.rel, version)
@@ -1237,6 +1236,7 @@ export function serve(entrypoint, flags) {
 		_debounce.set(file.rel, setTimeout(() => {
 			_debounce.delete(file.rel)
 			if (file.rel.endsWith('.imba')) compileChangedFile(file, version)
+			else if (file.rel.endsWith('.css')) updateCssFile(file, version)
 			else reloadChangedFile(file, version)
 		}, 150))
 	}
@@ -1250,6 +1250,19 @@ export function serve(entrypoint, flags) {
 		clearError(file.rel)
 		printStatus(file.rel, 'ok', null, { fadeAfter: 3500 })
 		broadcast({ type: 'reload' })
+	}
+
+	async function updateCssFile(file, version) {
+		try {
+			const css = existsSync(file.filepath) ? await Bun.file(file.filepath).text() : ''
+			if (!isCurrentChange(file, version) || publishedCss.get(file.filepath) === css) return
+			publishedCss.set(file.filepath, css)
+			clearError(file.rel)
+			printStatus(file.rel, 'ok', null, { fadeAfter: 3500 })
+			broadcast({ type: 'css', file: file.rel, css, paths: [...(cssUrls.get(file.filepath) || [])] })
+		} catch (error) {
+			if (isCurrentChange(file, version)) reportError(file.rel, [error])
+		}
 	}
 
 	async function compileChangedFile(file, version) {
@@ -1283,10 +1296,11 @@ export function serve(entrypoint, flags) {
 			if (out.changeType === 'none') return
 
 			if (!success.printed && !success.showedNext && !success.active) printStatus(rel, 'ok', null, { fadeAfter: 3500 })
-			_prevJs.set(path.resolve(filepath), out.js)
+			_published.set(path.resolve(filepath), out)
 			// Bootstrapping the entrypoint again repeats mounts and subscriptions.
-			if (path.resolve(filepath) === path.resolve(entrypoint)) broadcast({ type: 'reload' })
-			else broadcast({ type: 'update', file: rel, slots: out.slots || 'shifted' })
+			if (out.changeType === 'css') broadcast({ type: 'css', file: rel, styleId: out.styleId, css: out.css })
+			else if (path.resolve(filepath) === path.resolve(entrypoint)) broadcast({ type: 'reload' })
+			else broadcast({ type: 'update', file: rel, contextChanged: out.contextChanged })
 		} catch(e) {
 			if (!isCurrentChange(file, version)) return
 			if (isMissingFileError(e)) {
@@ -1383,12 +1397,16 @@ export function serve(entrypoint, flags) {
 				const file = 'css:' + normalizeFile(cssPath || pathname)
 				try {
 					if (cssFile && await cssFile.exists()) {
+						const css = await cssFile.text()
+						const abs = path.resolve(cssPath)
+						if (!cssUrls.has(abs)) cssUrls.set(abs, new Set())
+						cssUrls.get(abs).add(pathname)
+						if (!publishedCss.has(abs)) publishedCss.set(abs, css)
 						if (req.headers.get('sec-fetch-dest') === 'style') {
 							await markSuccess(file)
-							return new Response(cssFile, { headers: { 'Content-Type': 'text/css' } })
+							return new Response(css, { headers: { 'Content-Type': 'text/css' } })
 						}
 
-						const css = await cssFile.text()
 						const id = JSON.stringify(pathname)
 						const js = [
 							`const id = ${id};`,

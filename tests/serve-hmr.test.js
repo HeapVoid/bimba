@@ -246,6 +246,63 @@ async function server() {
 }
 
 describe('HMR watcher', () => {
+	test.each(['sidebar.imba', 'app.imba'])('updates only CSS in %s, including the first and last rule', async name => {
+		const env = await server()
+		try {
+			const source = "tag audit-sidebar\n\t<self> 'before'\n"
+			const file = join(env.fixture, 'src', name)
+			await Bun.write(file, source)
+			await fetch(env.url + '/src/' + name)
+			await Bun.sleep(400)
+			env.messages.length = 0
+			for (const color of ['red5', 'blue5', null]) {
+				await Bun.write(file, color ? source.replace('\t<self>', `\tcss self bg:${color}\n\t<self>`) : source)
+				// HTTP compilation must not consume the pending CSS update.
+				await fetch(env.url + '/src/' + name)
+				await Bun.sleep(350)
+				const css = env.messages.filter(msg => msg.type === 'css')
+				expect(css).toHaveLength(color === 'red5' ? 1 : color === 'blue5' ? 2 : 3)
+				expect(css.at(-1).styleId).toBeTruthy()
+				expect(css.at(-1).css).not.toContain('/*#*/')
+				if (color === null) expect(css.at(-1).css).not.toContain('background:')
+			}
+			expect(env.messages.filter(msg => msg.type === 'update' || msg.type === 'reload')).toHaveLength(0)
+		} finally { env.socket.close() }
+	})
+
+	test('updates global Imba styles without importing a component module', async () => {
+		const env = await server()
+		try {
+			const file = join(env.fixture, 'src/global.imba')
+			await Bun.write(file, 'css body bg:red5\n')
+			await fetch(env.url + '/src/global.imba')
+			await Bun.sleep(300)
+			env.messages.length = 0
+			await Bun.write(file, 'css body bg:blue5\n')
+			await Bun.sleep(350)
+			expect(env.messages.filter(msg => msg.type === 'css')).toHaveLength(1)
+			expect(env.messages.filter(msg => msg.type === 'update' || msg.type === 'reload')).toHaveLength(0)
+		} finally { env.socket.close() }
+	})
+
+	test('updates imported CSS files through their served URL', async () => {
+		const env = await server()
+		try {
+			const file = join(env.fixture, 'src/theme.css')
+			await Bun.write(file, 'body { background: red; }')
+			await fetch(env.url + '/src/theme.css')
+			await Bun.sleep(300)
+			env.messages.length = 0
+			await Bun.write(file, 'body { background: blue; }')
+			await fetch(env.url + '/src/theme.css')
+			await Bun.sleep(350)
+			expect(env.messages.filter(msg => msg.type === 'css')).toEqual([
+				{ type: 'css', file: 'src/theme.css', paths: ['/src/theme.css'], css: 'body { background: blue; }' },
+			])
+			expect(env.messages.filter(msg => msg.type === 'reload')).toHaveLength(0)
+		} finally { env.socket.close() }
+	})
+
 	test('serves a valid HMR client and resettable named-element caches', async () => {
 		const env = await server()
 		try {
