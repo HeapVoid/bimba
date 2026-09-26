@@ -104,11 +104,15 @@ To check TypeScript diagnostics reported by the Imba language-service plugin:
 bunx bimba --typecheck
 ```
 
-By default this scans `src/` when it exists, otherwise the project root. You can also pass a specific file or folder:
+By default this scans `src/` when it exists, otherwise the project root. A file path checks exactly that file; a folder path checks its `.imba` files recursively. Pass several paths to check them in one TypeScript session:
 ```bash
 bunx bimba src/index.imba --typecheck
+bunx bimba src/chat/history.imba src/chat/panel.imba --typecheck
 bunx bimba src --typecheck
 ```
+
+The check still uses the project's TypeScript configuration and resolves imports;
+the paths limit which Imba files receive direct diagnostics and syntax checks.
 
 This mode requires `typescript` and `imba` in the project, and `typescript-imba-plugin` either in `node_modules` or in an installed Imba editor extension. The scanned files must be included in a real `tsconfig.json` or `jsconfig.json` (for example, `"include": ["src/**/*"]`). Files excluded from the project and unconfigured projects fail with an actionable error rather than silently passing.
 

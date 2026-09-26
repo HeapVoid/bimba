@@ -12,6 +12,7 @@ import { checkImbaTypes } from './typecheck.js';
 
 let flags = {}
 let entrypoint = ''
+let entrypoints = []
 
 try {
     const { values, positionals } = parseArgs({
@@ -37,6 +38,7 @@ try {
         allowPositionals: true,
     });
     flags = values;
+    entrypoints = positionals;
     entrypoint = positionals[0] || '';
 }
 catch (error) {
@@ -97,7 +99,7 @@ let watchTimer = null;
 // typecheck mode
 if (flags.typecheck || flags.tscheck) {
     try {
-        const success = await checkImbaTypes(entrypoint);
+        const success = await checkImbaTypes(entrypoints);
         process.exit(success ? 0 : 1);
     }
     catch (error) {

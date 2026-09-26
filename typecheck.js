@@ -60,23 +60,9 @@ function findPluginProbe(cwd) {
     throw new Error('Could not find typescript-imba-plugin. Install the Imba VSCode extension or add the plugin to node_modules.');
 }
 
-function getScanRoot(entrypoint, cwd) {
-    if (!entrypoint) {
-        const src = path.join(cwd, 'src');
-        return fs.existsSync(src) ? src : cwd;
-    }
-
-    const resolved = path.resolve(cwd, entrypoint);
-    if (!fs.existsSync(resolved)) {
-        throw new Error(`The specified typecheck path does not exist: ${entrypoint}`);
-    }
-
-    const stat = fs.statSync(resolved);
-    return stat.isDirectory() ? resolved : path.dirname(resolved);
-}
-
-function collectImbaFiles(root) {
-    const files = [];
+function collectImbaFiles(entrypoints, cwd) {
+    const targets = entrypoints.length ? entrypoints : [fs.existsSync(path.join(cwd, 'src')) ? 'src' : '.'];
+    const files = new Set();
 
     function walk(dir) {
         for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -84,14 +70,20 @@ function collectImbaFiles(root) {
                 if (!SKIP_DIRS.has(entry.name)) walk(path.join(dir, entry.name));
             }
             else if (entry.isFile() && entry.name.endsWith('.imba')) {
-                files.push(path.join(dir, entry.name));
+                files.add(path.join(dir, entry.name));
             }
         }
     }
 
-    walk(root);
-    files.sort();
-    return files;
+    for (const target of targets) {
+        const resolved = path.resolve(cwd, target);
+        if (!fs.existsSync(resolved)) throw new Error(`The specified typecheck path does not exist: ${target}`);
+        const stat = fs.statSync(resolved);
+        if (stat.isDirectory()) walk(resolved);
+        else if (stat.isFile() && resolved.endsWith('.imba')) files.add(resolved);
+        else throw new Error(`The specified typecheck path is not an Imba file or directory: ${target}`);
+    }
+    return { files: [...files].sort(), targets };
 }
 
 function parseMessages(buffer, onMessage) {
@@ -155,11 +147,11 @@ function send(server, seq, command, args) {
 export async function checkImbaTypes(entrypoint, options = {}) {
     const cwd = options.cwd || process.cwd();
     const timeout = Number(options.timeout || process.env.BIMBA_TYPECHECK_TIMEOUT || process.env.IMBA_TS_CHECK_TIMEOUT || 120000);
-    const scanRoot = getScanRoot(entrypoint, cwd);
-    const files = collectImbaFiles(scanRoot);
+    const entrypoints = Array.isArray(entrypoint) ? entrypoint : (entrypoint ? [entrypoint] : []);
+    const { files, targets } = collectImbaFiles(entrypoints, cwd);
 
     if (!files.length) {
-        console.log(theme.success('Success') + ` No Imba files found in ${theme.filedir(path.relative(cwd, scanRoot) || '.')}`);
+        console.log(theme.success('Success') + ` No Imba files found in ${theme.filedir(targets.join(', '))}`);
         return true;
     }
 

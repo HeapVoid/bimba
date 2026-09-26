@@ -22,8 +22,8 @@ async function fixture(config = true) {
 	return cwd
 }
 
-async function check(cwd, env = {}) {
-	const child = Bun.spawn(['bun', join(root, 'index.js'), 'src', '--typecheck'], {
+async function check(cwd, env = {}, paths = ['src']) {
+	const child = Bun.spawn(['bun', join(root, 'index.js'), ...paths, '--typecheck'], {
 		cwd, env: { ...process.env, BIMBA_TYPECHECK_TIMEOUT: '10000', ...env }, stdout: 'pipe', stderr: 'pipe',
 	})
 	const [out, err, code] = await Promise.all([
@@ -33,6 +33,29 @@ async function check(cwd, env = {}) {
 }
 
 describe('Imba TypeScript diagnostics', () => {
+	test('checks only selected files and batches several paths in one session', async () => {
+		const cwd = await fixture()
+		await Bun.write(join(cwd, 'src/good.imba'), 'const value = 42\nvalue.toFixed!\n')
+		await Bun.write(join(cwd, 'src/bad.imba'), "const value = 'wrong type'\nvalue.toFixed!\n")
+		const single = await check(cwd, {}, ['src/good.imba'])
+		expect(single.code).toBe(0)
+		expect(single.output).toContain('for 1 Imba file')
+		expect(single.output).not.toContain('src/bad.imba')
+		const batch = await check(cwd, {}, ['src/good.imba', 'src/bad.imba', 'src/good.imba'])
+		expect(batch.code).toBe(1)
+		expect(batch.output).toContain('for 2 Imba files')
+		expect(batch.output).toContain('src/bad.imba:2:7')
+		expect(batch.output).toContain('TS2551')
+	}, 30000)
+
+	test('rejects a non-Imba file passed to typecheck', async () => {
+		const cwd = await fixture()
+		await Bun.write(join(cwd, 'src/other.js'), 'console.log(42)\n')
+		const result = await check(cwd, {}, ['src/other.js'])
+		expect(result.code).toBe(1)
+		expect(result.output).toContain('not an Imba file')
+	}, 15000)
+
 	test('checks real types in an Imba-only project', async () => {
 		const cwd = await fixture()
 		const source = join(cwd, 'src/probe.imba')
