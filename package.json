@@ -10,8 +10,7 @@
     "bimba": "index.js"
   },
   "scripts": {
-    "test": "bun test",
-    "upload": "bun test && npm publish"
+    "test": "bun test"
   },
   "description": "The CLI tool to run Imba projects under Bun",
   "keywords": [
