@@ -120,6 +120,15 @@ The project Imba compiler checks syntax before TypeScript diagnostics. The CLI r
 
 The TypeScript session timeout defaults to 120 seconds to accommodate larger projects. Set `BIMBA_TYPECHECK_TIMEOUT` (milliseconds) to override it.
 
+### Releasing
+
+The `publish.yml` workflow publishes a `v<package version>` tag from GitHub
+Actions after installing locked dependencies and passing `bun test`. It uses
+npm Trusted Publishing (OIDC), with no stored npm token. Configure the
+`bimba-cli` trusted publisher on npmjs.com for GitHub repository
+`HeapVoid/bimba`, workflow filename `publish.yml`, and allow direct
+`npm publish`. The tag must match `package.json` exactly.
+
 ---
 
 ### All CLI flags
