@@ -7,7 +7,7 @@ import fs from 'fs'
 import path from 'path';
 import { rmSync } from "node:fs";
 import { serve } from './serve.js';
-import { checkImbaTypes } from './typecheck.js';
+import { checkImbaTypes, startDevTypecheckServer } from './typecheck.js';
 
 
 let flags = {}
@@ -117,6 +117,9 @@ else if (flags.serve) {
     }
     ensureBunfigPreload();
     serve(entrypoint, { port: parseInt(flags.port) || 5200, html: flags.html });
+    startDevTypecheckServer(entrypoint).catch(error => {
+        console.error(`TypeScript server unavailable: ${error.message}`);
+    });
 }
 // no entrypoint or outdir
 else if(!entrypoint || !flags.outdir) {

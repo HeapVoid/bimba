@@ -3,6 +3,8 @@ import { createRequire } from 'module';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { performance } from 'node:perf_hooks';
+import { connectTypecheckServer, launchDevTypecheckServer } from './typecheck-transport.js';
 import { theme } from './utils.js';
 
 const require = createRequire(import.meta.url);
@@ -144,11 +146,29 @@ function send(server, seq, command, args) {
     server.stdin.write(JSON.stringify({ seq: seq.value++, type: 'request', command, arguments: args }) + '\n');
 }
 
+export async function startDevTypecheckServer(entrypoint, options = {}) {
+    if (process.env.CI || process.env.BIMBA_NO_TYPECHECK_DAEMON === '1') return;
+    const cwd = options.cwd || process.cwd();
+    const tsserver = findTypeScript(cwd);
+    const pluginProbe = findPluginProbe(cwd);
+    const runner = process.env.BIMBA_NODE || process.env.NODE || 'node';
+    await launchDevTypecheckServer({ cwd, tsserver, pluginProbe, runner });
+    await checkImbaTypes(entrypoint, { cwd });
+    console.log(theme.success('TypeScript server ready for file checks'));
+}
+
 export async function checkImbaTypes(entrypoint, options = {}) {
+    const started = performance.now();
+    const profile = process.env.BIMBA_PROFILE_TYPECHECK;
+    const mark = phase => {
+        if (profile) console.error(`[bimba typecheck] ${phase}: ${(performance.now() - started).toFixed(1)} ms`);
+    };
     const cwd = options.cwd || process.cwd();
     const timeout = Number(options.timeout || process.env.BIMBA_TYPECHECK_TIMEOUT || process.env.IMBA_TS_CHECK_TIMEOUT || 120000);
     const entrypoints = Array.isArray(entrypoint) ? entrypoint : (entrypoint ? [entrypoint] : []);
     const { files, targets } = collectImbaFiles(entrypoints, cwd);
+    const selectedByRealPath = new Map(files.map(file => [fs.realpathSync(file), file]));
+    mark('collect files');
 
     if (!files.length) {
         console.log(theme.success('Success') + ` No Imba files found in ${theme.filedir(targets.join(', '))}`);
@@ -158,6 +178,7 @@ export async function checkImbaTypes(entrypoint, options = {}) {
     const tsserver = findTypeScript(cwd);
     const pluginProbe = findPluginProbe(cwd);
     const runner = process.env.BIMBA_NODE || process.env.NODE || 'node';
+    mark('resolve toolchain');
 
     console.log(theme.folder('──────────────────────────────────────────────────────────────────────'));
     console.log(theme.start(`Start checking TypeScript diagnostics for ${theme.count(files.length)} Imba file${files.length > 1 ? 's' : ''}`));
@@ -168,6 +189,7 @@ export async function checkImbaTypes(entrypoint, options = {}) {
     const compilerPath = canResolve('imba/compiler', cwd);
     if (!compilerPath) throw new Error('Could not find the Imba compiler. Install it in this project: bun add -d imba');
     const compiler = require(compilerPath);
+    mark('load Imba compiler');
     let syntaxErrors = 0;
     for (const file of files) {
         let errors;
@@ -186,6 +208,22 @@ export async function checkImbaTypes(entrypoint, options = {}) {
         console.log(theme.failure(' Failure ') + ` Imba compiler found ${syntaxErrors} error(s)`);
         return false;
     }
+    mark('compile selected files');
+
+    const useDaemon = entrypoints.length > 0 && entrypoints.every(target => target.endsWith('.imba'));
+    let shared = null;
+    if (useDaemon) {
+        try { shared = await connectTypecheckServer({ cwd, tsserver, pluginProbe, runner }); }
+        catch (error) { console.error(`Bimba typecheck server unavailable; using a one-shot session: ${error.message}`); }
+    }
+    const server = shared || spawn(runner, [
+        tsserver,
+        '--globalPlugins',
+        'typescript-imba-plugin',
+        '--pluginProbeLocations',
+        pluginProbe,
+    ], { cwd });
+    mark(shared ? 'connect warm tsserver' : 'spawn tsserver');
 
     return await new Promise((resolve) => {
         let settled = false;
@@ -195,14 +233,6 @@ export async function checkImbaTypes(entrypoint, options = {}) {
         const pending = new Map();
         const checked = new Set();
         let geterrSeq = null;
-
-        const server = spawn(runner, [
-            tsserver,
-            '--globalPlugins',
-            'typescript-imba-plugin',
-            '--pluginProbeLocations',
-            pluginProbe,
-        ], { cwd });
 
         function finish(success) {
             if (settled) return;
@@ -268,6 +298,7 @@ export async function checkImbaTypes(entrypoint, options = {}) {
             if (msg.type != 'event') return;
 
             if (msg.event == 'requestCompleted' && msg.body?.request_seq == geterrSeq) {
+                mark('diagnostics complete');
                 const missing = files.filter(file => ['syntaxDiag', 'semanticDiag', 'suggestionDiag']
                     .some(kind => !checked.has(`${kind}\0${file}`)));
                 if (missing.length) requestDiagnostics(missing);
@@ -275,9 +306,13 @@ export async function checkImbaTypes(entrypoint, options = {}) {
                 return;
             }
             if (!/Diag$/.test(msg.event) || !msg.body?.diagnostics) return;
+            mark(msg.event);
 
-            const file = msg.body.file || msg.body.configFile;
-            if (!file) throw new Error(`TypeScript ${msg.event} did not identify its file`);
+            const reported = msg.body.file || msg.body.configFile;
+            if (!reported) throw new Error(`TypeScript ${msg.event} did not identify its file`);
+            const realPath = fs.existsSync(reported) ? fs.realpathSync(reported) : reported;
+            if (!msg.body.configFile && !selectedByRealPath.has(realPath)) return;
+            const file = selectedByRealPath.get(realPath) || reported;
             if (geterrSeq !== null) checked.add(`${msg.event}\0${file}`);
             recordDiagnostics(msg.event, file, msg.body.diagnostics);
         }
@@ -314,11 +349,21 @@ export async function checkImbaTypes(entrypoint, options = {}) {
         // empty initial project before the plugin adds the extension, reporting
         // a false success or a transient "No inputs" configuration error.
         async function check() {
-            await request('configure', {
+            if (!shared) await request('configure', {
                 preferences: {}, hostInfo: 'bimba-typecheck',
                 extraFileExtensions: [{ extension: '.imba', isMixedContent: false, scriptKind: 7 }],
             });
-            for (const file of files) await request('open', { file, projectRootPath: cwd });
+            mark('configure tsserver');
+            if (shared) {
+                const sync = await request('bimbaSync', {
+                    files: files.map(file => ({ file, content: fs.readFileSync(file, 'utf8') })),
+                });
+                if (sync.changed) await new Promise(resolve => setTimeout(resolve, 100));
+            }
+            for (const file of files) {
+                await request('open', { file, projectRootPath: cwd });
+            }
+            mark('open selected files');
             for (const file of files) {
                 const project = await request('projectInfo', { file, needFileNameList: false });
                 if (project.languageServiceDisabled) throw new Error(`TypeScript language service is disabled for ${file}`);
@@ -326,6 +371,7 @@ export async function checkImbaTypes(entrypoint, options = {}) {
                     throw new Error(`${file} is not included in a project configuration. Add it to the include/files of tsconfig.json or jsconfig.json.`);
                 }
             }
+            mark('project info');
             requestDiagnostics(files);
         }
         check().catch(fail);
