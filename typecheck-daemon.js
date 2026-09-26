@@ -8,6 +8,7 @@ const [socketPath, tsserverPath, pluginProbe, runner, cwd, parentArg] = process.
 const parentPid = Number(parentArg);
 const clients = [];
 const sourceByFile = new Map();
+const deletedSourceByFile = new Map();
 const openedFiles = new Set();
 const skipDirs = new Set(['.bimba', '.cache', '.git', '.worktrees', 'build', 'dist', 'node_modules', 'public']);
 let active = null;
@@ -60,7 +61,13 @@ function syncSources(selected) {
     const currentFiles = new Set(files);
     for (const file of sourceByFile.keys()) {
         if (!currentFiles.has(file)) {
+            // Keep the previous text so a recreated Imba file can update the
+            // plugin's cached virtual source, even after tsserver closed it.
+            deletedSourceByFile.set(file, sourceByFile.get(file));
             sourceByFile.delete(file);
+            if (openedFiles.has(file)) tsserver.stdin.write(JSON.stringify({
+                seq: 0, type: 'request', command: 'close', arguments: { file },
+            }) + '\n');
             openedFiles.delete(file);
             structureChanged = true;
         }
@@ -72,10 +79,12 @@ function syncSources(selected) {
             if (error.code === 'ENOENT') continue;
             throw error;
         }
-        const previous = sourceByFile.get(file);
+        const wasDeleted = deletedSourceByFile.has(file);
+        const previous = sourceByFile.get(file) ?? deletedSourceByFile.get(file);
         sourceByFile.set(file, content);
-        if (previous === undefined && hadSnapshot) structureChanged = true;
-        if (previous === undefined || previous === content) continue;
+        deletedSourceByFile.delete(file);
+        if (wasDeleted || (previous === undefined && hadSnapshot)) structureChanged = true;
+        if (previous === undefined || (previous === content && !wasDeleted)) continue;
         changed = true;
         if (!openedFiles.has(file)) {
             tsserver.stdin.write(JSON.stringify({

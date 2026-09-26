@@ -99,6 +99,42 @@ describe('Imba TypeScript diagnostics', () => {
 			const deletedDependency = await check(cwd, fast, ['src/probe.imba'])
 			expect(deletedDependency.code).toBe(1)
 			expect(deletedDependency.output).toContain('TS2307')
+
+			await Bun.write(dependency, 'export const value = 42\n')
+			const allValid = await check(cwd, fast, ['src'])
+			expect(allValid.code).toBe(0)
+			expect(allValid.output).toContain('connect warm tsserver')
+			const coldValid = await check(cwd, { BIMBA_PROFILE_TYPECHECK: '1' }, ['src'])
+			expect(coldValid.code).toBe(0)
+			expect(coldValid.output).toContain('spawn tsserver')
+			await rm(dependency)
+			expect((await check(cwd, fast, ['src'])).output).toContain('TS2307')
+			await Bun.write(dependency, 'export const value = 42\n')
+			expect((await check(cwd, fast, ['src'])).code).toBe(0)
+			const other = join(cwd, 'src/other.imba')
+			await Bun.write(other, "const value = 'wrong type'\nvalue.toFixed!\n")
+			const allWithError = await check(cwd, fast, ['src'])
+			expect(allWithError.code).toBe(1)
+			expect(allWithError.output).toContain('src/other.imba:2:7')
+			await Bun.write(other, 'const value = 42\nvalue.toFixed!\n')
+			expect((await check(cwd, fast, [])).code).toBe(0)
+
+			const jsDependency = join(cwd, 'src/dep.js')
+			await Bun.write(jsDependency, 'export const value = 42\n')
+			await Bun.write(source, "import { value } from './dep.js'\nvalue.toFixed!\n")
+			expect((await check(cwd, fast, ['src'])).code).toBe(0)
+			await Bun.write(jsDependency, "export const value = 'wrong type'\n")
+			const changedJs = await check(cwd, fast, ['src'])
+			expect(changedJs.code).toBe(1)
+			expect(changedJs.output).toContain('TS2551')
+
+			await Bun.write(jsDependency, 'export const value = 42\n')
+			await Bun.write(join(cwd, 'tsconfig.json'), JSON.stringify({
+				compilerOptions: { target: 'broken-target' }, include: ['src/**/*'],
+			}))
+			const changedConfig = await check(cwd, fast, ['src'])
+			expect(changedConfig.code).toBe(1)
+			expect(changedConfig.output).toContain('TS6046')
 		} finally {
 			dev.kill()
 			await dev.exited

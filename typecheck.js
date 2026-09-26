@@ -154,7 +154,7 @@ export async function startDevTypecheckServer(entrypoint, options = {}) {
     const runner = process.env.BIMBA_NODE || process.env.NODE || 'node';
     await launchDevTypecheckServer({ cwd, tsserver, pluginProbe, runner });
     await checkImbaTypes(entrypoint, { cwd });
-    console.log(theme.success('TypeScript server ready for file checks'));
+    console.log(theme.success('TypeScript server ready for checks'));
 }
 
 export async function checkImbaTypes(entrypoint, options = {}) {
@@ -210,12 +210,9 @@ export async function checkImbaTypes(entrypoint, options = {}) {
     }
     mark('compile selected files');
 
-    const useDaemon = entrypoints.length > 0 && entrypoints.every(target => target.endsWith('.imba'));
     let shared = null;
-    if (useDaemon) {
-        try { shared = await connectTypecheckServer({ cwd, tsserver, pluginProbe, runner }); }
-        catch (error) { console.error(`Bimba typecheck server unavailable; using a one-shot session: ${error.message}`); }
-    }
+    try { shared = await connectTypecheckServer({ cwd, tsserver, pluginProbe, runner }); }
+    catch (error) { console.error(`Bimba typecheck server unavailable; using a one-shot session: ${error.message}`); }
     const server = shared || spawn(runner, [
         tsserver,
         '--globalPlugins',

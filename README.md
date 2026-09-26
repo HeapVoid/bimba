@@ -120,7 +120,7 @@ The project Imba compiler checks syntax before TypeScript diagnostics. The CLI r
 
 The TypeScript session timeout defaults to 120 seconds to accommodate larger projects. Set `BIMBA_TYPECHECK_TIMEOUT` (milliseconds) to override it.
 
-When `bimba --serve` is running, Bimba starts and warms a project TypeScript server alongside the dev server. Explicit file checks reuse its type graph and can finish in milliseconds. Bimba stops the TypeScript server when the dev server exits. Without a dev server, file checks use a fresh TypeScript session. Directory and full-project checks always use a fresh session, as do checks in CI. Set `BIMBA_NO_TYPECHECK_DAEMON=1` to force a fresh session while the dev server is running. Set `BIMBA_PROFILE_TYPECHECK=1` to print timings for each phase. The resident TypeScript server holds the project type graph in memory while the dev server is running.
+When `bimba --serve` is running, Bimba starts and warms a project TypeScript server alongside the dev server. File, directory, and full-project checks reuse its type graph. Bimba synchronizes changed Imba sources before requesting diagnostics and stops the TypeScript server when the dev server exits. Without a dev server, checks use a fresh TypeScript session. Checks in CI always use a fresh session. Set `BIMBA_NO_TYPECHECK_DAEMON=1` to force a fresh session while the dev server is running. Set `BIMBA_PROFILE_TYPECHECK=1` to print timings for each phase. The resident TypeScript server holds the project type graph in memory while the dev server is running.
 
 ### Releasing
 
