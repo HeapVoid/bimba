@@ -52,7 +52,7 @@ describe('dev server TypeScript modules', () => {
 		await opened(socket)
 		const reloaded = message(socket, 'reload')
 		await Bun.write(join(fixture, 'src/config.ts'), 'export const value: string = "updated"\n')
-		expect(await reloaded).toEqual({ type: 'reload' })
+		expect(await reloaded).toEqual({ type: 'reload', file: 'src/config.ts', paths: ['/src/config.ts', '/src/config'] })
 		socket.close()
 	})
 })

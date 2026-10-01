@@ -84,6 +84,12 @@ export function prepareHotModule(js, filepath) {
 	}
 }
 
+// Register only completed executions. A failed initial import still needs a
+// full reload when fixed, rather than patching a graph that never booted.
+export function registerHotModule(js, filepath) {
+	return js + `\n;(globalThis.__bimba_modules ||= new Set()).add(${JSON.stringify(path.resolve(filepath))});\n`
+}
+
 function moduleContext(js, ast) {
 	const definitions = new Set()
 	for (const statement of ast.body) {
@@ -131,7 +137,7 @@ export function compileHotModule(source, filepath) {
 		const registration = `\nimport {styles as __bimba_styles__} from 'imba';\n__bimba_styles__.register(${JSON.stringify(styleId)},${JSON.stringify(css)});\n`
 		const sourceMap = comments.find(comment => comment.type === 'Line' && /^#\s*sourceMappingURL=/.test(comment.value))
 		const offset = sourceMap?.start ?? result.js.length
-		const initial = result.js.slice(0, offset) + registration + result.js.slice(offset)
+		const initial = registerHotModule(result.js.slice(0, offset) + registration, absolute) + result.js.slice(offset)
 		const prepared = prepareHotModule(initial, absolute)
 		return { js: prepared.js, css, styleId, code, context, slots: prepared.slotCount, errors }
 	} catch (error) {

@@ -3,7 +3,7 @@ import { mkdirSync, watch, existsSync, statSync, writeFileSync, realpathSync } f
 import path from 'path'
 import { imbaPlugin } from './plugin.js'
 import { IMBA_RUNTIME_DEFINES, theme } from './utils.js'
-import { compileHotModule, classifyHotUpdate } from './hot-module.js'
+import { compileHotModule, classifyHotUpdate, registerHotModule } from './hot-module.js'
 export { prepareHotModule } from './hot-module.js'
 
 // ─── HMR Client (injected into browser) ──────────────────────────────────────
@@ -215,8 +215,44 @@ const hmrClient = `
 	// the first.
 	let _queue = Promise.resolve();
 
+	// Each tab owns its module set, including lazy imports and failed requests.
+	// Keep request history outside the browser's bounded resource timing buffer.
+	const _requestedPaths = new Set();
+	function _rememberRequest(name) {
+		try {
+			const url = new URL(name, location.href);
+			if (url.origin === location.origin) _requestedPaths.add(url.pathname);
+		} catch (_) {}
+	}
+	function _readRequests() {
+		for (const entry of performance.getEntriesByType('resource')) _rememberResource(entry);
+		for (const el of document.querySelectorAll('script[src],link[rel="stylesheet"][href]')) _rememberRequest(el.src || el.href);
+	}
+	_readRequests();
+	const _requestObserver = new PerformanceObserver(list => {
+		for (const entry of list.getEntries()) _rememberResource(entry);
+	});
+	_requestObserver.observe({ type: 'resource', buffered: true });
+	function _rememberResource(entry) {
+		if (['script', 'link', 'css'].includes(entry.initiatorType)) _rememberRequest(entry.name);
+	}
+
+	function _completedModule(file) {
+		for (const loaded of globalThis.__bimba_modules || []) if (sameFile(loaded, file)) return true;
+		return false;
+	}
+	function _usesModule(msg) {
+		if (!msg.file || _completedModule(msg.file)) return true;
+		_readRequests();
+		return (msg.paths || ['/' + normalizeFile(msg.file)]).some(url => _requestedPaths.has(url));
+	}
+
 	function _applyUpdate(msg) {
-		_queue = _queue.then(() => msg.type === 'css' ? _doStyleUpdate(msg) : _doUpdate(msg)).catch(err => {
+		_queue = _queue.then(() => {
+			if (!_usesModule(msg)) return;
+			if (msg.type === 'reload' || ((msg.type === 'update' || msg.styleId) && !_completedModule(msg.file))) return location.reload();
+			return msg.type === 'css' ? _doStyleUpdate(msg) : _doUpdate(msg);
+		}).catch(err => {
 			// Safety net: any uncaught failure during HMR → full reload.
 			// Better to lose state than to leave a broken page.
 			console.error('[bimba HMR] reload due to error:', err);
@@ -376,7 +412,7 @@ const hmrClient = `
 		ws.onmessage = (e) => {
 			const msg = JSON.parse(e.data);
 			if      (msg.type === 'update' || msg.type === 'css') _applyUpdate(msg);
-			else if (msg.type === 'reload')      location.reload();
+			else if (msg.type === 'reload')      _applyUpdate(msg);
 			else if (msg.type === 'error')       showError(msg.file, msg.errors, msg.time);
 			else if (msg.type === 'clear-error') clearError(msg.file);
 		};
@@ -727,7 +763,7 @@ async function bundleVendor(entrypoint) {
 }
 
 async function serveJavaScriptFile(filepath) {
-	const js = rewriteBareImports(await Bun.file(filepath).text())
+	const js = registerHotModule(rewriteBareImports(await Bun.file(filepath).text()), filepath)
 	return new Response(js, { headers: { 'Content-Type': 'application/javascript' } })
 }
 
@@ -735,7 +771,7 @@ async function serveTypeScriptFile(filepath) {
 	const loader = filepath.endsWith('.tsx') ? 'tsx' : 'ts'
 	const transpiler = new Bun.Transpiler({ loader, target: 'browser' })
 	const source = await Bun.file(filepath).text()
-	const js = rewriteBareImports(await transpiler.transform(source))
+	const js = registerHotModule(rewriteBareImports(await transpiler.transform(source)), filepath)
 	return new Response(js, { headers: { 'Content-Type': 'application/javascript' } })
 }
 
@@ -762,8 +798,18 @@ export function serve(entrypoint, flags) {
 	const htmlDir  = path.dirname(htmlPath)
 	const srcDir   = path.dirname(entrypoint)
 	const sockets  = new Set()
-	const cssUrls = new Map()
+	const moduleUrls = new Map()
 	const publishedCss = new Map()
+
+	function rememberModuleUrl(filepath, pathname) {
+		const absolute = path.resolve(filepath)
+		if (!moduleUrls.has(absolute)) moduleUrls.set(absolute, new Set())
+		moduleUrls.get(absolute).add(pathname)
+	}
+
+	function modulePaths(filepath) {
+		return [...new Set(['/' + normalizeFile(filepath), ...(moduleUrls.get(path.resolve(filepath)) || [])])]
+	}
 
 	// ── Live status block (shows only the current compile state) ───────────────
 
@@ -1249,7 +1295,7 @@ export function serve(entrypoint, flags) {
 		if (!isCurrentChange(file, version)) return
 		clearError(file.rel)
 		printStatus(file.rel, 'ok', null, { fadeAfter: 3500 })
-		broadcast({ type: 'reload' })
+		broadcast({ type: 'reload', file: file.rel, paths: modulePaths(file.filepath) })
 	}
 
 	async function updateCssFile(file, version) {
@@ -1259,7 +1305,7 @@ export function serve(entrypoint, flags) {
 			publishedCss.set(file.filepath, css)
 			clearError(file.rel)
 			printStatus(file.rel, 'ok', null, { fadeAfter: 3500 })
-			broadcast({ type: 'css', file: file.rel, css, paths: [...(cssUrls.get(file.filepath) || [])] })
+			broadcast({ type: 'css', file: file.rel, css, paths: modulePaths(file.filepath) })
 		} catch (error) {
 			if (isCurrentChange(file, version)) reportError(file.rel, [error])
 		}
@@ -1298,9 +1344,10 @@ export function serve(entrypoint, flags) {
 			if (!success.printed && !success.showedNext && !success.active) printStatus(rel, 'ok', null, { fadeAfter: 3500 })
 			_published.set(path.resolve(filepath), out)
 			// Bootstrapping the entrypoint again repeats mounts and subscriptions.
-			if (out.changeType === 'css') broadcast({ type: 'css', file: rel, styleId: out.styleId, css: out.css })
-			else if (path.resolve(filepath) === path.resolve(entrypoint)) broadcast({ type: 'reload' })
-			else broadcast({ type: 'update', file: rel, contextChanged: out.contextChanged })
+			const paths = modulePaths(filepath)
+			if (out.changeType === 'css') broadcast({ type: 'css', file: rel, paths, styleId: out.styleId, css: out.css })
+			else if (path.resolve(filepath) === path.resolve(entrypoint)) broadcast({ type: 'reload', file: rel, paths })
+			else broadcast({ type: 'update', file: rel, paths, contextChanged: out.contextChanged })
 		} catch(e) {
 			if (!isCurrentChange(file, version)) return
 			if (isMissingFileError(e)) {
@@ -1366,6 +1413,7 @@ export function serve(entrypoint, flags) {
 			// Imba files: compile on demand and serve as JS
 			if (pathname.endsWith('.imba')) {
 				const filepath = '.' + pathname
+				rememberModuleUrl(filepath, pathname)
 				const file = normalizeFile(pathname)
 				try {
 					const out = await compileFile(filepath)
@@ -1399,8 +1447,7 @@ export function serve(entrypoint, flags) {
 					if (cssFile && await cssFile.exists()) {
 						const css = await cssFile.text()
 						const abs = path.resolve(cssPath)
-						if (!cssUrls.has(abs)) cssUrls.set(abs, new Set())
-						cssUrls.get(abs).add(pathname)
+						rememberModuleUrl(abs, pathname)
 						if (!publishedCss.has(abs)) publishedCss.set(abs, css)
 						if (req.headers.get('sec-fetch-dest') === 'style') {
 							await markSuccess(file)
@@ -1429,6 +1476,7 @@ export function serve(entrypoint, flags) {
 			if (!pathname.startsWith('/node_modules/') && (pathname.endsWith('.js') || pathname.endsWith('.mjs'))) {
 				const jsFile = resolveFileCandidate(path.join(htmlDir, pathname)) || resolveFileCandidate('.' + pathname)
 				if (jsFile) {
+					rememberModuleUrl(jsFile, pathname)
 					const file = 'js:' + normalizeFile(jsFile)
 					try {
 						const response = await serveJavaScriptFile(jsFile)
@@ -1449,6 +1497,7 @@ export function serve(entrypoint, flags) {
 			if (!pathname.startsWith('/node_modules/') && (pathname.endsWith('.ts') || pathname.endsWith('.tsx'))) {
 				const tsFile = resolveFileCandidate(path.join(htmlDir, pathname)) || resolveFileCandidate('.' + pathname)
 				if (tsFile) {
+					rememberModuleUrl(tsFile, pathname)
 					const file = 'ts:' + normalizeFile(tsFile)
 					try {
 						const response = await serveTypeScriptFile(tsFile)
@@ -1470,6 +1519,7 @@ export function serve(entrypoint, flags) {
 			if (pathname.startsWith('/node_modules/')) {
 				const resolved = resolveFileCandidate('.' + pathname)
 				if (resolved?.endsWith('.imba')) {
+					rememberModuleUrl(resolved, pathname)
 					const out = await compileFile(resolved)
 					const file = normalizeFile(resolved)
 					if (out.missing) {
@@ -1518,6 +1568,7 @@ export function serve(entrypoint, flags) {
 				// Try .imba first (compile on the fly), then TypeScript and JavaScript.
 				const imbaPath = '.' + pathname + '.imba'
 				if (existsSync(imbaPath)) {
+					rememberModuleUrl(imbaPath, pathname)
 					const out = await compileFile(imbaPath)
 					const file = normalizeFile(imbaPath)
 					if (out.missing) {
@@ -1533,6 +1584,7 @@ export function serve(entrypoint, flags) {
 				for (const ext of ['.ts', '.tsx', '.js', '.mjs']) {
 					const withExt = '.' + pathname + ext
 					if (existsSync(withExt)) {
+						rememberModuleUrl(withExt, pathname)
 						const typed = ext === '.ts' || ext === '.tsx'
 						const file = (typed ? 'ts:' : 'js:') + normalizeFile(withExt)
 						try {

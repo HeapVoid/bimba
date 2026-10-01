@@ -204,7 +204,9 @@ Do not manually invoke `connectedCallback`, `mount`, or `remount` on retained el
 
 ### 3.6 Entrypoint and Update Delivery
 
-Entrypoint JavaScript edits trigger a full page reload before re-importing any bootstrap code. This avoids repeated mounts and application subscriptions. Component modules should not bootstrap the application. The legacy body-child deduplication remains for other modules, but cannot undo arbitrary module side effects. It runs immediately after import, before rendering: running it after rendering mistakenly removes replacement `<global>` portals with the same tag name as their previous body content.
+Each tab filters notices before importing or rendering. Development Imba and local JS/TS modules register their canonical file paths after successful execution. Script and stylesheet requests are retained through Resource Timing and a PerformanceObserver, including failed loads and extensionless URL aliases supplied by the server. Unused files are ignored; fixing a requested module that never completed execution reloads the incomplete graph. Lazy modules join the tab's module set when loaded.
+
+Entrypoint JavaScript edits trigger a full page reload in using tabs before re-importing any bootstrap code. This avoids repeated mounts and application subscriptions. Component modules should not bootstrap the application. The legacy body-child deduplication remains for other modules, but cannot undo arbitrary module side effects. It runs immediately after import, before rendering: running it after rendering mistakenly removes replacement `<global>` portals with the same tag name as their previous body content.
 
 The compile cache and delivered-update baseline are separate. HTTP requests and error reconciliation may compile a saved file before the watcher's debounce expires. They must not advance `_published` after its initial baseline; only publishing an update does that. Otherwise the watcher sees a cache hit and silently skips an edit still needed by connected browsers. The watcher also rechecks its version after asynchronous error reconciliation.
 

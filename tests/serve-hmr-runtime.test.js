@@ -105,6 +105,29 @@ ${version % 2 ? "\t\t\t<span.extra> 'Extra option'\n" : ''}
 `
 
 describe('HMR with the Imba compiler and runtime', () => {
+	test('does not execute an unused module, mount its tags or activate its global styles', async () => {
+		const env = client()
+		const before = env.moduleLoads
+		await env.update("globalThis.unusedRuns = 1\ncss body bg:red5\ntag unused-panel\n\t<self> 'Unused'\nimba.mount <unused-panel>\n", 'unused.imba')
+		expect(env.moduleLoads).toBe(before)
+		expect(env.window.unusedRuns).toBeUndefined()
+		expect(env.window.customElements.get('unused-panel')).toBeUndefined()
+		expect(env.document.querySelectorAll('style')).toHaveLength(0)
+		expect(env.document.body.children).toHaveLength(0)
+		expect(env.reloads).toBe(0)
+	})
+
+	test('reloads a used data module only in the tab that executed it', async () => {
+		const left = client(), right = client()
+		left.load('globalThis.dataRuns = 1\n', 'data.imba')
+		for (const env of [left, right]) await env.update('globalThis.dataRuns = 2\n', 'data.imba')
+		expect(left.window.dataRuns).toBe(2)
+		expect(left.reloads).toBe(1)
+		expect(right.window.dataRuns).toBeUndefined()
+		expect(right.moduleLoads).toBe(0)
+		expect(right.reloads).toBe(0)
+	})
+
 	test('CSS edits preserve an open same-module popup, input focus, selection and scroll', async () => {
 		const env = client()
 		const source = popup + '\n' + select(0)

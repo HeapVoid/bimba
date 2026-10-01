@@ -44,11 +44,14 @@ bunx bimba src/index.imba --serve --port 5200 --html public/index.html
 - CSS files imported from JS (e.g. `import 'some-lib/styles.css'`) are automatically wrapped as JS modules that inject `<style>` tags
 - npm packages are bundled on demand by Bun (`target: "browser"`), so Bun owns `exports`, `browser`, CommonJS interop, and nested dependency resolution
 - Injects an HMR client that swaps component prototypes without a full page reload
-- Reloads the page when JavaScript in the entrypoint, shared TypeScript/JavaScript, or data-only Imba modules changes
+- Applies updates only in tabs that loaded the changed module; unused files cause no import, render or reload
+- Reloads using tabs when JavaScript in the entrypoint, shared TypeScript/JavaScript, or data-only Imba modules changes
 
 **HMR internals:**
 
 Imba compiles JavaScript and CSS separately in development (`hmr: true`, `styles: 'extern'`). The server compares executable JavaScript independently of CSS, comments, formatting and source maps.
+
+Each tab tracks completed module executions and requested script/stylesheet URLs. Unused and not-yet-loaded lazy modules are ignored. Failed initial imports are remembered so fixing them can reload the incomplete module graph. Reload notices identify the changed file and its served URL aliases, including extensionless imports. Reconnecting after a dev-server restart still reloads the page.
 
 - **CSS edits:** update the existing stylesheet without importing the component module or rendering it again. Open popups, input values, focus, selection and scroll stay in place. This also covers first/last CSS rules, inline tag styles, global styles and CSS-only edits in the entrypoint. Local `.css` files in the watched source tree update their imported style node or stylesheet link.
 - **Ordinary method edits:** patch component prototypes and rerender using the existing caches. DOM nodes and descendant state survive when templates and module-level code are unchanged.

@@ -21,11 +21,14 @@ async function client() {
 	const source = await Bun.file(join(import.meta.dir, '../serve.js')).text()
 	const template = source.match(/const hmrClient = (`[\s\S]*?`)\n/)[1]
 	const html = vm.runInNewContext(template)
-	const code = html.replace(/^\s*<script>|<\/script>\s*$/g, '').replace('await import(', 'await loadModule(')
+	const code = html.replace(/^\s*<script>|<\/script>\s*$/g, '').replaceAll('await import(', 'await loadModule(')
 	const elements = []
 	const definitions = new Map()
-	let socket, load
-	let reloads = 0
+	const linked = []
+	const completed = new Set(['src/sidebar.imba'])
+	const resources = []
+	let socket, load, observeRequests
+	let reloads = 0, imports = 0
 	class DOMEventTarget extends EventTarget {
 		addEventListener(...args) { return super.addEventListener(...args) }
 		removeEventListener(...args) { return super.removeEventListener(...args) }
@@ -52,7 +55,7 @@ async function client() {
 	const document = {
 		body: { children: elements },
 		getElementById: () => null,
-		querySelectorAll: selector => elements.flatMap(el => [el, ...el.querySelectorAll()])
+		querySelectorAll: selector => selector === 'script[src],link[rel="stylesheet"][href]' ? linked : elements.flatMap(el => [el, ...el.querySelectorAll()])
 			.filter(el => el.isConnected && (selector === '*' || el.tagName.toLowerCase() === selector)),
 	}
 	const registry = {
@@ -62,13 +65,28 @@ async function client() {
 	vm.runInNewContext(code, {
 		EventTarget: DOMEventTarget, Element, HTMLElement: Element, document, customElements: registry,
 		WebSocket: class { constructor() { socket = this } },
-		location: { host: 'localhost', protocol: 'http:', reload: () => { reloads++ } },
+		location: { host: 'localhost', origin: 'http://localhost', href: 'http://localhost/', protocol: 'http:', reload: () => { reloads++ } },
+		URL, performance: { getEntriesByType: () => resources },
+		PerformanceObserver: class {
+			constructor(callback) { observeRequests = callback }
+			observe() {}
+		},
+		__bimba_modules: completed,
 		console: { error() {} }, setTimeout, clearTimeout,
-		imba: { commit() {} }, loadModule: () => load(),
+		imba: { commit() {} }, loadModule: () => { imports++; return load() },
 	})
 	return {
-		Element, registry, elements,
+		Element, registry, elements, completed, resources, linked,
 		get reloads() { return reloads },
+		get imports() { return imports },
+		requested(url, initiatorType = 'script') {
+			observeRequests({ getEntries: () => [{ name: url, initiatorType }] })
+		},
+		async message(msg, callback = () => {}) {
+			load = callback
+			socket.onmessage({ data: JSON.stringify(msg) })
+			await new Promise(resolve => setTimeout(resolve, 0))
+		},
 		async update(callback) {
 			load = callback
 			socket.onmessage({ data: JSON.stringify({ type: 'update', file: 'src/sidebar.imba' }) })
@@ -78,6 +96,77 @@ async function client() {
 }
 
 describe('HMR client', () => {
+	test('ignores unused component, data, JS/TS and CSS changes before importing anything', async () => {
+		const env = await client()
+		for (const msg of [
+			{ type: 'update', file: 'src/unrelated.imba' },
+			{ type: 'update', file: 'src/data.imba' },
+			{ type: 'reload', file: 'src/config.ts' },
+			{ type: 'reload', file: 'src/helper.js' },
+			{ type: 'css', file: 'src/unused.imba', styleId: 'unused', css: 'body{}' },
+			{ type: 'css', file: 'src/unused.css', paths: ['/src/unused.css'], css: 'body{}' },
+		]) await env.message(msg)
+		expect(env.imports).toBe(0)
+		expect(env.reloads).toBe(0)
+	})
+
+	test('starts applying lazy modules only after they have loaded in that tab', async () => {
+		const env = await client()
+		const msg = { type: 'update', file: 'src/lazy.imba' }
+		await env.message(msg)
+		expect(env.imports).toBe(0)
+		env.completed.add('/project/src/lazy.imba')
+		await env.message(msg)
+		expect(env.imports).toBe(1)
+		expect(env.reloads).toBe(1) // used data module has no patchable tags
+	})
+
+	test('reloads used JS/TS and entrypoints, while ignoring files used only in another tab', async () => {
+		const left = await client(), right = await client()
+		left.completed.add('/project/src/config.ts')
+		for (const env of [left, right]) await env.message({ type: 'reload', file: 'src/config.ts' })
+		expect(left.reloads).toBe(1)
+		expect(right.reloads).toBe(0)
+		await left.message({ type: 'reload', file: 'src/sidebar.imba' })
+		expect(left.reloads).toBe(2)
+		expect(left.imports).toBe(0)
+	})
+
+	test('recovers failed initial imports using aliases and retains requests after timing buffer eviction', async () => {
+		const env = await client()
+		env.requested('http://localhost/src/broken?t=123#fragment')
+		await env.message({ type: 'update', file: 'src/broken.imba', paths: ['/src/broken.imba', '/src/broken'] })
+		expect(env.reloads).toBe(1)
+		expect(env.imports).toBe(0)
+		await env.message({ type: 'css', file: 'src/broken.imba', paths: ['/src/broken'], styleId: 'broken', css: '' })
+		expect(env.reloads).toBe(2)
+	})
+
+	test('reads recent resource entries and skips plain fetches and other origins', async () => {
+		const env = await client()
+		env.resources.push({ name: 'http://localhost/src/failed.ts?t=1', initiatorType: 'script' })
+		await env.message({ type: 'reload', file: 'src/failed.ts' })
+		expect(env.reloads).toBe(1)
+		env.requested('http://localhost/src/fetched.ts', 'fetch')
+		env.requested('http://other.test/src/external.ts')
+		await env.message({ type: 'reload', file: 'src/fetched.ts' })
+		await env.message({ type: 'reload', file: 'src/external.ts' })
+		expect(env.reloads).toBe(1)
+	})
+
+	test('preserves explicit reload messages without a file', async () => {
+		const env = await client()
+		await env.message({ type: 'reload' })
+		expect(env.reloads).toBe(1)
+	})
+
+	test('recognizes a pending entry script before resource timing completes', async () => {
+		const env = await client()
+		env.linked.push({ src: 'http://localhost/src/entry.imba?t=1' })
+		await env.message({ type: 'reload', file: 'src/entry.imba' })
+		expect(env.reloads).toBe(1)
+	})
+
 	test('replaces self listeners without repeating mount or removing mount listeners', async () => {
 		const env = await client()
 		class Sidebar extends env.Element {
@@ -246,6 +335,23 @@ async function server() {
 }
 
 describe('HMR watcher', () => {
+	test('identifies the physical Imba file and extensionless URL even when its first compilation failed', async () => {
+		const env = await server()
+		try {
+			const file = join(env.fixture, 'src/sidebar.imba')
+			await Bun.write(file, 'tag audit-sidebar\n\t<self\n')
+			const response = await fetch(env.url + '/src/sidebar?t=1')
+			expect(response.status).toBe(500)
+			await Bun.sleep(300)
+			env.messages.length = 0
+			await Bun.write(file, "tag audit-sidebar\n\t<self> 'fixed'\n")
+			await Bun.sleep(350)
+			const updates = env.messages.filter(msg => msg.type === 'update')
+			expect(updates).toHaveLength(1)
+			expect(updates[0]).toMatchObject({ file: 'src/sidebar.imba', paths: ['/src/sidebar.imba', '/src/sidebar'] })
+		} finally { env.socket.close() }
+	})
+
 	test.each(['sidebar.imba', 'app.imba'])('updates only CSS in %s, including the first and last rule', async name => {
 		const env = await server()
 		try {

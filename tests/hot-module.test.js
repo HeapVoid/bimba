@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import path from 'node:path'
-import { classifyHotUpdate, compileHotModule, prepareHotModule } from '../hot-module.js'
+import vm from 'node:vm'
+import { classifyHotUpdate, compileHotModule, prepareHotModule, registerHotModule } from '../hot-module.js'
 
 const file = 'src/hot-module-test.imba'
 const source = (style = '', value = 1) => `tag test-popup
@@ -17,6 +18,19 @@ function compiled(code = source(), filename = file) {
 }
 
 describe('hot module compilation', () => {
+	test('records completed executions using canonical paths and excludes failed executions', () => {
+		const realm = vm.createContext({})
+		vm.runInContext(registerHotModule('globalThis.runs = 1 // trailing comment', 'src/data.js'), realm)
+		expect([...realm.__bimba_modules]).toEqual([path.resolve('src/data.js')])
+		expect(() => vm.runInContext(registerHotModule("throw new Error('failed')", 'src/failed.js'), realm)).toThrow('failed')
+		expect([...realm.__bimba_modules]).toEqual([path.resolve('src/data.js')])
+		const data = compiled('globalThis.runs = 2\n', 'src/data.imba')
+		const executable = data.js.replace(/import[^\n]+\n/g, '').replace(/__bimba_styles__.register[^\n]+\n/g, '')
+		vm.runInContext(executable, realm)
+		expect(realm.runs).toBe(2)
+		expect([...realm.__bimba_modules]).toEqual([path.resolve('src/data.js'), path.resolve('src/data.imba')])
+	})
+
 	test('canonicalizes relative and absolute compiler paths', () => {
 		const relative = compiled()
 		const absolute = compiled(source(), path.resolve(file))
