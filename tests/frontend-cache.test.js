@@ -108,6 +108,26 @@ describe('frontend compilation snapshots', () => {
         const result = await new FrontendProject({ cwd, directory: cache, force: true }).check({ diagnostics: async () => { forced = true; return true; } });
         expect(forced).toBe(true); expect(result.compiler.compiled).toBe(1);
     });
+    test('ignores unrelated reports but binds configured files and imported project inputs', async () => {
+        const cwd = fixture(), cache = directory(), project = new FrontendProject({ cwd, directory: cache });
+        write(cwd, 'src/probe.imba', 'export const value = 1\n');
+        fs.mkdirSync(path.join(cwd, 'reports')); write(cwd, 'reports/measurement.json', '{"duration":1}');
+        fs.mkdirSync(path.join(cwd, 'shared')); const shared = path.join(cwd, 'shared/value.js');
+        fs.writeFileSync(shared, 'export const value = 1;');
+        let calls = 0;
+        const diagnostics = async (_files, options) => { calls++; options.projectFiles([shared]); return true; };
+        expect((await project.check({ diagnostics })).passed).toBe(true);
+        expect(project.affected('reports/measurement.json')).toBe(false);
+        expect(project.affected('src/probe.imba')).toBe(true);
+        write(cwd, 'src/new.imba', 'export const value = 2\n');
+        expect(project.affected('src/new.imba')).toBe(true);
+        fs.unlinkSync(path.join(cwd, 'src/new.imba'));
+        expect(project.affected('src/new.imba')).toBe(true);
+        write(cwd, 'reports/measurement.json', '{"duration":2}');
+        expect((await project.check({ diagnostics })).mode).toBe('snapshot-reused'); expect(calls).toBe(1);
+        fs.writeFileSync(shared, 'export const value = 2;');
+        expect((await project.check({ diagnostics })).mode).toBe('diagnostics'); expect(calls).toBe(2);
+    });
     test('tracks actual external project files and refuses reuse after they change', async () => {
         const cwd = fixture(), cache = directory(), external = path.join(directory(), 'shared.d.ts');
         write(cwd, 'src/probe.imba', 'export const value = 1\n'); fs.writeFileSync(external, 'export type Shared = number');
@@ -119,6 +139,31 @@ describe('frontend compilation snapshots', () => {
         fs.writeFileSync(external, 'export type Shared = string');
         expect((await project.check({ diagnostics })).mode).toBe('diagnostics'); expect(calls).toBe(2);
     });
+    test('newly discovered imports cannot publish changed bytes as checked', async () => {
+        const cwd = fixture(), cache = directory(), project = new FrontendProject({ cwd, directory: cache });
+        write(cwd, 'src/probe.imba', 'export const value = 1\n');
+        fs.mkdirSync(path.join(cwd, 'shared'));
+        const shared = path.join(cwd, 'shared/value.imba');
+        fs.writeFileSync(shared, 'export const value = 1\n');
+        const result = await project.check({ diagnostics: async (_files, options) => {
+            options.projectFiles([shared]);
+            fs.writeFileSync(shared, 'export const value = "unchecked"\n');
+            return true;
+        }});
+        expect(result.passed).toBe(false); expect(result.stable).toBe(false);
+        expect(fs.existsSync(project.proofFile)).toBe(false);
+
+        const snapshot = project.snapshot.bind(project);
+        let snapshots = 0;
+        project.snapshot = (...args) => {
+            if (++snapshots === 3) write(cwd, 'src/probe.imba', 'export const value = "unchecked"\n');
+            return snapshot(...args);
+        };
+        expect((await project.check({ diagnostics: async (_files, options) => {
+            options.projectFiles([shared]); return true;
+        }})).passed).toBe(false);
+        expect(fs.existsSync(project.proofFile)).toBe(false);
+    });
     test('real diagnostics catch a consumer after its imported type changes and recover after repair', async () => {
         const cwd = fixture({ toolchain: true }), cache = directory();
         write(cwd, 'src/dependency.imba', 'export const value = 42\n');
@@ -128,6 +173,13 @@ describe('frontend compilation snapshots', () => {
         process.env.BIMBA_NO_TYPECHECK_DAEMON = '1';
         try {
         expect((await project.check()).passed).toBe(true);
+        expect((await project.check()).mode).toBe('snapshot-reused');
+        const clone = fixture({ toolchain: true });
+        for (const name of ['src/consumer.imba','src/dependency.imba']) write(clone, name, fs.readFileSync(path.join(cwd, name), 'utf8'));
+        expect((await new FrontendProject({ cwd: clone, directory: cache }).check()).mode).toBe('snapshot-reused');
+        write(cwd, 'src/consumer.imba', fs.readFileSync(path.join(cwd, 'src/consumer.imba'), 'utf8') + '\n' + tag(10));
+        expect((await project.check()).passed).toBe(true);
+        write(cwd, 'src/consumer.imba', fs.readFileSync(path.join(cwd, 'src/consumer.imba'), 'utf8').replace('w:10px', 'w:20px'));
         expect((await project.check()).mode).toBe('snapshot-reused');
         write(cwd, 'src/dependency.imba', 'export const value = "wrong"\n');
         expect((await project.check()).passed).toBe(false);

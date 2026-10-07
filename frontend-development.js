@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { FrontendProject } from './frontend-project.js';
 import { startDevTypecheckServer } from './typecheck.js';
 
 // Saves coalesce into one background job. Native TypeScript maintains the
@@ -9,6 +10,8 @@ import { startDevTypecheckServer } from './typecheck.js';
 export async function startFrontendDevelopment(entrypoint, { cwd = process.cwd() } = {}) {
     await startDevTypecheckServer(entrypoint, { cwd });
     let child = null, timer = null, queued = false, stopped = false;
+    const project = new FrontendProject({ cwd });
+    project.affected(entrypoint);
     const cli = fileURLToPath(new URL('./index.js', import.meta.url));
     function run() {
         if (stopped) return;
@@ -25,6 +28,7 @@ export async function startFrontendDevelopment(entrypoint, { cwd = process.cwd()
         const relative = String(file).replaceAll('\\', '/');
         if (relative.split('/').some(part => ['.git', '.cache', '.bimba', '.check-build', 'node_modules', 'public', 'dist', 'build', 'coverage'].includes(part))) return;
         if (!/\.(?:imba|[cm]?[jt]sx?|json|toml)$/.test(relative) && !['bun.lock', '.env', '.env.local', '.env.test'].includes(relative)) return;
+        if (!project.affected(relative)) return;
         clearTimeout(timer); timer = setTimeout(run, 350);
     }
     const watcher = fs.watch(cwd, { recursive: true }, (_event, file) => changed(file));

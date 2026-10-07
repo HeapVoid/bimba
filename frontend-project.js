@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { createRequire } from 'node:module';
 import { CompilerCache, atomicJSON, compilerEnvironment, hash, projectCache } from './compile-cache.js';
 import { TypeView } from './type-view.js';
 import { checkImbaTypes } from './typecheck.js';
@@ -57,35 +58,83 @@ export class DependencyInventory {
 export class FrontendProject {
     constructor({ cwd = process.cwd(), directory = projectCache(cwd), force = false } = {}) {
         this.cwd = path.resolve(cwd); this.directory = directory; this.force = force;
-        this.compiler = new CompilerCache({ cwd: this.cwd, directory, force });
-        this.dependencies = new DependencyInventory(directory);
+        this.compiler = null;
+        this.dependencies = null;
         this.proofFile = path.join(directory, 'frontend-types.json');
     }
-    snapshot(externalFiles = []) {
-        const sources = {}, other = {};
-        walk(this.cwd, (file, stat) => {
+    inputFiles(externalFiles = [], selected = []) {
+        const inputs = new Set(selected.map(file => path.resolve(this.cwd, file)));
+        const require = createRequire(path.join(this.cwd, 'package.json'));
+        let ts;
+        try { ts = require('typescript'); } catch { ts = createRequire(import.meta.url)('typescript'); }
+        const configurations = fs.readdirSync(this.cwd).filter(name => /^(?:tsconfig.*|jsconfig)\.json$/.test(name));
+        const host = { ...ts.sys, readFile: file => {
+            inputs.add(file);
+            return ts.sys.readFile(file);
+        }};
+        for (const name of configurations) {
+            const file = path.join(this.cwd, name); inputs.add(file);
+            const config = ts.readConfigFile(file, host.readFile);
+            if (config.config) {
+                const project = ts.parseJsonConfigFileContent(config.config, host, this.cwd, {}, file, undefined,
+                    [{ extension: '.imba', scriptKind: 7, isMixedContent: false }]);
+                for (const input of project.fileNames) inputs.add(input);
+            }
+        }
+        if (!configurations.length && fs.existsSync(path.join(this.cwd, 'src'))) {
+            walk(path.join(this.cwd, 'src'), file => inputs.add(file));
+        }
+        for (const file of externalFiles) inputs.add(path.resolve(this.cwd, file));
+        for (const name of ['package.json', 'bun.lock', 'bun.lockb', 'bunfig.toml', '.env', '.env.local', '.env.test']) inputs.add(path.join(this.cwd, name));
+        return inputs;
+    }
+    affected(file) {
+        const absolute = path.resolve(this.cwd, file);
+        let graph = [];
+        try {
+            const stat = fs.statSync(this.proofFile);
+            const stamp = stat.mtimeMs + ':' + stat.size;
+            if (stamp !== this.graphStamp) {
+                this.graphStamp = stamp;
+                this.graph = Object.keys(JSON.parse(fs.readFileSync(this.proofFile, 'utf8')).proof.external || {});
+            }
+            graph = this.graph || [];
+        } catch {}
+        const current = this.inputFiles(graph);
+        const affected = current.has(absolute) || this.previousInputs?.has(absolute);
+        this.previousInputs = current;
+        return !!affected;
+    }
+    snapshot(externalFiles = [], selected = []) {
+        const sources = {}, other = {}, inputs = {}, files = this.inputFiles(externalFiles, selected);
+        this.dependencies ||= new DependencyInventory(this.directory);
+        for (const file of [...files].sort()) {
             const name = path.relative(this.cwd, file).replaceAll('\\', '/');
-            if (!/\.(?:imba|[cm]?[jt]sx?|json|toml)$/.test(name) && !['bun.lock', 'bun.lockb', '.env', '.env.local', '.env.test'].includes(name)) return;
-            if (!stat) { other[name] = 'broken-link:' + fs.readlinkSync(file); return; }
+            if (!fs.existsSync(file)) { inputs[name] = other[name] = 'missing'; continue; }
             const bytes = fs.readFileSync(file);
-            if (name.endsWith('.imba')) sources[name] = bytes.toString('utf8');
-            else other[name] = hash(bytes);
-        });
+            inputs[name] = hash(bytes);
+            if (name.endsWith('.imba') && !name.startsWith('../')) sources[name] = bytes.toString('utf8');
+            else other[name] = inputs[name];
+        }
         const external = this.externalInputs(externalFiles);
         const environment = compilerEnvironment(Object.values(sources));
         // Execution priority, daemon ownership and checkout path are not types.
         const runtime = Object.fromEntries(['NODE_OPTIONS', 'NODE_PATH', 'NODE', 'BIMBA_NODE', 'NODE_ENV', 'TZ'].map(name => [name, process.env[name] ?? null]));
-        const context = hash(JSON.stringify({ engine, other, environment, runtime, dependencies: this.dependencies.snapshot(this.cwd) }));
-        return { context, sources, external };
+        const dependencies = this.dependencies.snapshot(this.cwd);
+        const context = hash(JSON.stringify({ engine, other, environment, runtime, dependencies }));
+        return { context, sources, external, inputs, dependencies };
     }
-    externalInputs(files) {
+    externalInputs(files, raw = false) {
         const values = {};
         for (const file of [...new Set(files)].sort()) {
-            const relative = path.relative(this.cwd, file);
-            if (!relative.startsWith('../') && relative !== '..' && !path.isAbsolute(relative)) continue;
-            values[file] = fs.existsSync(file) ? hash(fs.readFileSync(file)) : 'missing';
+            const absolute = path.resolve(this.cwd, file);
+            const relative = path.relative(this.cwd, absolute);
+            if (relative === 'node_modules' || relative.startsWith('node_modules/')) continue;
+            const key = relative.startsWith('../') || relative === '..' || path.isAbsolute(relative) ? absolute : relative.replaceAll('\\', '/');
+            values[key] = fs.existsSync(absolute)
+                ? (!raw && !relative.startsWith('../') && key.endsWith('.imba') ? 'imba-source' : hash(fs.readFileSync(absolute))) : 'missing';
         }
-        return values;
+        return Object.fromEntries(Object.entries(values).sort(([a], [b]) => a.localeCompare(b)));
     }
     equivalent(previous, current) {
         if (!previous || previous.context !== current.context || JSON.stringify(previous.external || {}) !== JSON.stringify(current.external)) return false;
@@ -106,14 +155,15 @@ export class FrontendProject {
         });
     }
     async check({ files = null, diagnostics = checkImbaTypes } = {}) {
+        this.compiler ||= new CompilerCache({ cwd: this.cwd, directory: this.directory, force: this.force });
         let previous;
         try {
             const record = JSON.parse(fs.readFileSync(this.proofFile, 'utf8'));
             if (record.format === 1 && record.digest === hash(JSON.stringify(record.proof))) previous = record.proof;
         } catch {}
         const externalFiles = Object.keys(previous?.external || {});
-        const before = this.snapshot(externalFiles);
-        const selected = (files || Object.keys(before.sources).filter(file => file.startsWith('src/'))).sort();
+        const before = this.snapshot(externalFiles, files || []);
+        const selected = (files || Object.keys(before.sources).filter(file => !fs.existsSync(path.join(this.cwd, 'src')) || file.startsWith('src/'))).sort();
         let valid = true;
         for (const file of selected) {
             const source = before.sources[file];
@@ -127,16 +177,27 @@ export class FrontendProject {
         if (!valid || !reusable) fs.rmSync(this.proofFile, { force: true });
         const coverage = new Set(reusable ? previous.coverage : []);
         const missing = selected.filter(file => !coverage.has(file));
-        const observedExternal = {};
+        const observedExternal = {}, observedInputs = {};
         const passed = valid && (!missing.length || await diagnostics(missing, { cwd: this.cwd, syntaxValidated: true, refreshProject: !reusable,
-            projectFiles: paths => Object.assign(observedExternal, this.externalInputs(paths)),
+            projectFiles: paths => {
+                Object.assign(observedExternal, this.externalInputs(paths));
+                Object.assign(observedInputs, this.externalInputs(paths, true));
+            },
         }));
-        const after = this.snapshot(externalFiles);
-        const stable = JSON.stringify(before) === JSON.stringify(after) && JSON.stringify(observedExternal) === JSON.stringify(this.externalInputs(Object.keys(observedExternal)));
+        const after = this.snapshot(externalFiles, files || []);
+        const external = Object.fromEntries(Object.entries({ ...after.external, ...observedExternal }).sort(([a], [b]) => a.localeCompare(b)));
+        const complete = Object.keys(observedExternal).some(file => !(file in after.external))
+            ? this.snapshot(Object.keys(external), files || []) : after;
+        // Discovering imports may extend the snapshot, but cannot replace any
+        // bytes checked earlier. Raw graph hashes also bind newly found Imba.
+        const stable = JSON.stringify(before) === JSON.stringify(after)
+            && after.dependencies === complete.dependencies
+            && Object.entries(after.inputs).every(([file, digest]) => complete.inputs[file] === digest)
+            && JSON.stringify(Object.entries(observedInputs).sort(([a], [b]) => a.localeCompare(b)))
+                === JSON.stringify(Object.entries(this.externalInputs(Object.keys(observedInputs), true)));
         if (passed && stable) {
             for (const file of missing) coverage.add(file);
-            const external = Object.fromEntries(Object.entries({ ...after.external, ...observedExternal }).sort(([a], [b]) => a.localeCompare(b)));
-            const proof = { ...after, external, coverage: [...coverage].sort() };
+            const proof = { ...complete, external, coverage: [...coverage].sort() };
             atomicJSON(this.proofFile, { format: 1, proof, digest: hash(JSON.stringify(proof)) });
         } else fs.rmSync(this.proofFile, { force: true });
         return { passed: passed && stable, mode: missing.length ? 'diagnostics' : 'snapshot-reused', checked: missing.length, covered: selected.length, compiler: { ...this.compiler.stats }, stable };
