@@ -7,7 +7,9 @@ import fs from 'fs'
 import path from 'path';
 import { rmSync } from "node:fs";
 import { serve } from './serve.js';
-import { checkImbaTypes, startDevTypecheckServer } from './typecheck.js';
+import { checkImbaTypes, collectImbaFiles, startDevTypecheckServer } from './typecheck.js';
+import { FrontendProject } from './frontend-project.js';
+import { startFrontendDevelopment } from './frontend-development.js';
 
 
 let flags = {}
@@ -32,6 +34,9 @@ try {
             html: { type: 'string' },
             typecheck: { type: 'boolean' },
             tscheck: { type: 'boolean' },
+            'frontend-check': { type: 'boolean' },
+            frontend: { type: 'boolean' },
+            force: { type: 'boolean' },
         },
         allowNegative: true,
         strict: true,
@@ -83,6 +88,10 @@ if(flags.help) {
     console.log("   "+theme.flags('--typecheck')+"                           Check TypeScript diagnostics in .imba files");
     console.log("   "+theme.flags('--tscheck')+"                             Alias for --typecheck");
     console.log("");
+    console.log("Frontend verification:");
+    console.log("   --frontend-check                         Reuse the exact frontend snapshot or check missing types");
+    console.log("   --force                                  Ignore cached compilation and diagnostic coverage");
+    console.log("   --frontend                               Check types in the background after saves in serve mode");
     console.log("Dev server (HMR):");
     console.log("   "+theme.flags('--serve')+"                               Start dev server with Hot Module Replacement");
     console.log("   "+theme.flags('--port <number>')+"                       Port for the dev server (default: 5200)");
@@ -92,14 +101,23 @@ if(flags.help) {
 }
 
 
+let frontendProject = flags.frontend;
+try { frontendProject ||= JSON.parse(fs.readFileSync('package.json', 'utf8')).bimba?.frontend === true; } catch {}
+if (flags.force) process.env.BIMBA_FORCE = '1';
+
 let bundling = false;
 let rebuildQueued = false;
 let watchTimer = null;
 
 // typecheck mode
-if (flags.typecheck || flags.tscheck) {
+if (flags.typecheck || flags.tscheck || flags['frontend-check']) {
     try {
-        const success = await checkImbaTypes(entrypoints);
+        let success;
+        if (flags['frontend-check'] || frontendProject) {
+            const files = collectImbaFiles(entrypoints, process.cwd()).files.map(file => path.relative(process.cwd(), file));
+            const result = await new FrontendProject({ force: flags.force }).check({ files });
+            console.log(JSON.stringify(result)); success = result.passed;
+        } else success = await checkImbaTypes(entrypoints);
         process.exit(success ? 0 : 1);
     }
     catch (error) {
@@ -117,7 +135,7 @@ else if (flags.serve) {
     }
     ensureBunfigPreload();
     serve(entrypoint, { port: parseInt(flags.port) || 5200, html: flags.html });
-    startDevTypecheckServer(entrypoint).catch(error => {
+    (frontendProject ? startFrontendDevelopment(entrypoint) : startDevTypecheckServer(entrypoint)).catch(error => {
         console.error(`TypeScript server unavailable: ${error.message}`);
     });
 }

@@ -6,6 +6,7 @@ import path from 'path';
 import { performance } from 'node:perf_hooks';
 import { connectTypecheckServer, launchDevTypecheckServer } from './typecheck-transport.js';
 import { theme } from './utils.js';
+import { CompilerCache } from './compile-cache.js';
 
 const require = createRequire(import.meta.url);
 
@@ -62,7 +63,7 @@ function findPluginProbe(cwd) {
     throw new Error('Could not find typescript-imba-plugin. Install the Imba VSCode extension or add the plugin to node_modules.');
 }
 
-function collectImbaFiles(entrypoints, cwd) {
+export function collectImbaFiles(entrypoints, cwd) {
     const targets = entrypoints.length ? entrypoints : [fs.existsSync(path.join(cwd, 'src')) ? 'src' : '.'];
     const files = new Set();
 
@@ -188,10 +189,10 @@ export async function checkImbaTypes(entrypoint, options = {}) {
     // first so a broken source file cannot be reported as a successful typecheck.
     const compilerPath = canResolve('imba/compiler', cwd);
     if (!compilerPath) throw new Error('Could not find the Imba compiler. Install it in this project: bun add -d imba');
-    const compiler = require(compilerPath);
+    const compiler = new CompilerCache({ cwd });
     mark('load Imba compiler');
     let syntaxErrors = 0;
-    for (const file of files) {
+    for (const file of options.syntaxValidated ? [] : files) {
         let errors;
         try {
             errors = compiler.compile(fs.readFileSync(file, 'utf8'), { sourcePath: file, platform: 'browser', comments: false }).errors || [];
@@ -354,6 +355,7 @@ export async function checkImbaTypes(entrypoint, options = {}) {
             if (shared) {
                 const sync = await request('bimbaSync', {
                     files: files.map(file => ({ file, content: fs.readFileSync(file, 'utf8') })),
+                    refresh: !!options.refreshProject,
                 });
                 if (sync.changed) await new Promise(resolve => setTimeout(resolve, 100));
             }
@@ -361,11 +363,17 @@ export async function checkImbaTypes(entrypoint, options = {}) {
                 await request('open', { file, projectRootPath: cwd });
             }
             mark('open selected files');
+            const inspectedProjects = new Set();
             for (const file of files) {
                 const project = await request('projectInfo', { file, needFileNameList: false });
                 if (project.languageServiceDisabled) throw new Error(`TypeScript language service is disabled for ${file}`);
                 if (!project.configFileName || !fs.existsSync(project.configFileName)) {
                     throw new Error(`${file} is not included in a project configuration. Add it to the include/files of tsconfig.json or jsconfig.json.`);
+                }
+                if (options.projectFiles && !inspectedProjects.has(project.configFileName)) {
+                    inspectedProjects.add(project.configFileName);
+                    const complete = await request('projectInfo', { file, needFileNameList: true });
+                    options.projectFiles([...(complete.fileNames || []), project.configFileName]);
                 }
             }
             mark('project info');

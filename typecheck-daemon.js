@@ -10,7 +10,7 @@ const clients = [];
 const sourceByFile = new Map();
 const deletedSourceByFile = new Map();
 const openedFiles = new Set();
-const skipDirs = new Set(['.bimba', '.cache', '.git', '.worktrees', 'build', 'dist', 'node_modules', 'public']);
+const skipDirs = new Set(['.bimba', '.cache', '.git', '.check-build', '.local-run', '.worktrees', 'build', 'dist', 'node_modules', 'public']);
 let active = null;
 let closing = false;
 let ownsSocket = false;
@@ -116,7 +116,10 @@ function handleLine(client, line) {
 
     if (message.command === 'bimbaSync') {
         const selected = new Map(message.arguments.files.map(({ file, content }) => [file, content]));
-        const changed = syncSources(selected);
+        const changed = syncSources(selected) || !!message.arguments.refresh;
+        if (message.arguments.refresh) tsserver.stdin.write(JSON.stringify({
+            seq: 0, type: 'request', command: 'reloadProjects', arguments: {},
+        }) + '\n');
 
         const response = JSON.stringify({
             seq: 0, type: 'response', command: 'bimbaSync',

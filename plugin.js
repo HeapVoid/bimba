@@ -1,13 +1,11 @@
 import { plugin } from "bun";
 import {theme} from './utils.js';
-import * as compiler from 'imba/compiler'
+import { compileImba, projectCache, counters } from './compile-cache.js'
 import dir from 'path'
 import fs from 'fs'
-import { Glob } from "bun";
-import { unlink } from "node:fs/promises";
 
-export const cache = dir.join(process.cwd(), '.cache')
-if (!fs.existsSync(cache)){ fs.mkdirSync(cache);}
+export const cache = projectCache()
+if (!fs.existsSync(cache)){ fs.mkdirSync(cache, { recursive: true });}
 
 // this should be reset from outside to get results of entrypoint building
 export let stats = {
@@ -122,24 +120,6 @@ export const imbaPlugin = {
 
         let contents = '';
 
-        // return the cached version if exists (include target in hash to avoid cross-platform cache hits)
-        const cached = dir.join(cache, Bun.hash(path + ':' + target) + '_' + stamp + '.js');
-        if (fs.existsSync(cached)) {
-          const cachedContents = await Bun.file(cached).text();
-          if (compileFileStamp(path) !== stamp) continue;
-          clearCompileError(path);
-          stats.bundled++;
-          stats.cached++;
-          return {
-            contents: cachedContents,
-            loader: "js",
-          };
-        }
-
-        // clear previous cached version
-        const glob = new Glob(Bun.hash(path + ':' + target) + '_' + "*.js");
-        for await (const file of glob.scan(cache)) if (fs.existsSync(dir.join(cache, file))) unlink(dir.join(cache, file));
-
         // if no cached version read and compile it with the imba compiler
         const file = await Bun.file(path).text();
         if (compileFileStamp(path) !== stamp) continue;
@@ -147,11 +127,14 @@ export const imbaPlugin = {
         const platform = target === 'node' || target === 'bun' ? 'node' : 'browser';
         let out
         try {
-          out = compiler.compile(file, {
+          const hits = counters.hits;
+          out = compileImba(file, {
             sourcePath: path,
             platform: platform,
             comments: false
           })
+          if (counters.hits > hits) stats.cached++;
+          else stats.compiled++;
         } catch (error) {
           out = { js: '', errors: [error] }
         }
@@ -164,9 +147,7 @@ export const imbaPlugin = {
           clearCompileError(path);
           console.log(theme.action("compiling: ") + theme.folder(dir.join(f.dir,'/')) + theme.filename(f.base) + " - " + theme.success("compiled"));
           stats.bundled++;
-          stats.compiled++;
           contents = out.js;
-          await Bun.write(cached, contents);
         }
         // there were errors during compilation
         else {

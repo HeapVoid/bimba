@@ -40,7 +40,11 @@ function socketFor({ cwd, tsserver, pluginProbe, runner }) {
     fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
     const version = JSON.parse(fs.readFileSync(packagePath, 'utf8')).version;
     const revision = fs.statSync(daemonPath).mtimeMs;
-    const identity = [fs.realpathSync(cwd), tsserver, pluginProbe, runner, version, revision].join('\0');
+    const toolchain = createHash('sha256');
+    for (const file of [tsserver, path.join(path.dirname(tsserver), '_tsserver.js'), path.join(pluginProbe, 'typescript-imba-plugin/dist/index.js')]) {
+        if (fs.existsSync(file)) toolchain.update(fs.readFileSync(file));
+    }
+    const identity = [fs.realpathSync(cwd), tsserver, pluginProbe, runner, version, revision, toolchain.digest('hex'), process.env.NODE_OPTIONS || '', process.env.NODE_PATH || ''].join('\0');
     const key = createHash('sha256').update(identity).digest('hex').slice(0, 20);
     return path.join(directory, `${key}.sock`);
 }

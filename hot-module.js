@@ -1,5 +1,5 @@
 import { parse } from 'acorn'
-import { compile } from 'imba/compiler'
+import { compileImba as compile } from './compile-cache.js'
 import path from 'node:path'
 
 const normalizer = new Bun.Transpiler({

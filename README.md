@@ -125,6 +125,46 @@ The TypeScript session timeout defaults to 120 seconds to accommodate larger pro
 
 When `bimba --serve` is running, Bimba starts and warms a project TypeScript server alongside the dev server. File, directory, and full-project checks reuse its type graph. Bimba synchronizes changed Imba sources before requesting diagnostics and stops the TypeScript server when the dev server exits. Without a dev server, checks use a fresh TypeScript session. Checks in CI always use a fresh session. Set `BIMBA_NO_TYPECHECK_DAEMON=1` to force a fresh session while the dev server is running. Set `BIMBA_PROFILE_TYPECHECK=1` to print timings for each phase. The resident TypeScript server holds the project type graph in memory while the dev server is running.
 
+### Reusing frontend work
+
+Bimba owns one content cache for HMR, browser builds, model builds and syntax
+checks. Keys include source bytes, the actual compiler bytes, compiler options
+and source environment flags. Project-relative paths make CSS identifiers and
+outputs reproducible across checkouts. Each file/variant keeps its latest
+successful result; failed diagnostics or unrelated tests do not discard it.
+Set `BIMBA_CACHE_DIR` to choose a cache location. The default is a project-name
+namespace under `~/.cache/bimba/projects/` (unnamed projects use their real path).
+
+Opt into development checks for any Imba frontend:
+
+```bash
+bimba src/index.imba --serve --frontend
+bimba src --frontend-check
+bimba src/panel.imba --frontend-check
+bimba src --frontend-check --force
+```
+
+`--frontend` keeps HMR responsive while a background process checks saves using
+the warm TypeScript server and primes the production compiler variant. Save
+bursts coalesce. Native TypeScript updates its affected type graph; complete
+Imba diagnostic coverage also catches implicit tag/global consumers. The first
+check establishes coverage. Subsequent exact snapshots reuse it. CSS-only
+changes compare virtual TypeScript for the changed files only; an unsupported
+plugin/configuration, changed types/imports/JS/dependencies, added/deleted files
+or incomplete coverage request diagnostics. Failures and concurrent edits do
+not publish success. Installed dependency bytes, external project files and
+configuration are part of the snapshot. A file check cannot prove other files.
+
+`--frontend-check` uses the same snapshot in development, CI and another
+checkout. It does not run tests or bundle the app. Production bundling still
+links/minifies current modules. `--force` bypasses compilation and diagnostic
+reuse. Alternatively, `package.json` can opt in with `"bimba":{"frontend":true}`.
+The background mode is opt-in and contains no application-specific behavior.
+
+The public APIs are `CompilerCache`, `compileImba` and `ImbaPlugin` from
+`bimba-cli/compile-cache.js`, and `FrontendProject` from
+`bimba-cli/frontend-project.js`. They share the CLI's implementation.
+
 ### Releasing
 
 The `publish.yml` workflow publishes a `v<package version>` tag from GitHub
