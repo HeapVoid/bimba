@@ -129,6 +129,10 @@ function handleLine(client, line) {
     }
     else {
         if (message.command === 'open') openedFiles.add(message.arguments.file);
+        if (message.command === 'updateOpen') {
+            for (const file of message.arguments.openFiles || []) openedFiles.add(file.file);
+            for (const file of message.arguments.closedFiles || []) openedFiles.delete(file);
+        }
         if (!tsserver.stdin.write(line + '\n')) client.pause();
     }
 }

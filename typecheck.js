@@ -359,12 +359,14 @@ export async function checkImbaTypes(entrypoint, options = {}) {
                 });
                 if (sync.changed) await new Promise(resolve => setTimeout(resolve, 100));
             }
-            for (const file of files) {
-                await request('open', { file, projectRootPath: cwd });
-            }
+            // One project update lets tsserver build the selected graph once.
+            // Use its public batch protocol in both warm and one-shot sessions.
+            await request('updateOpen', { openFiles: files.map(file => ({ file, projectRootPath: cwd })) });
             mark('open selected files');
             const inspectedProjects = new Set();
-            for (const file of files) {
+            // Validate every file's actual default project. Pipelining removes
+            // per-file IPC waits without guessing membership from config globs.
+            await Promise.all(files.map(async file => {
                 const project = await request('projectInfo', { file, needFileNameList: false });
                 if (project.languageServiceDisabled) throw new Error(`TypeScript language service is disabled for ${file}`);
                 if (!project.configFileName || !fs.existsSync(project.configFileName)) {
@@ -375,7 +377,7 @@ export async function checkImbaTypes(entrypoint, options = {}) {
                     const complete = await request('projectInfo', { file, needFileNameList: true });
                     options.projectFiles([...(complete.fileNames || []), project.configFileName]);
                 }
-            }
+            }));
             mark('project info');
             requestDiagnostics(files);
         }

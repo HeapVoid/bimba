@@ -33,6 +33,26 @@ async function check(cwd, env = {}, paths = ['src']) {
 }
 
 describe('Imba TypeScript diagnostics', () => {
+	test('batch opening checks every selected file and preserves separate project configuration', async () => {
+		const cwd = await fixture()
+		for (let index = 0; index < 64; index++) await Bun.write(join(cwd, `src/file-${index}.imba`), `export const value${index} = 42\n`)
+		await mkdir(join(cwd, 'nested'))
+		await Bun.write(join(cwd, 'nested/tsconfig.json'), JSON.stringify({ compilerOptions: { allowJs: true, checkJs: true, noEmit: true, skipLibCheck: true }, include: ['*.imba'] }))
+		const nested = join(cwd, 'nested/probe.imba')
+		await Bun.write(nested, "const value = 'wrong type'\nvalue.toFixed!\n")
+		const invalid = await check(cwd, {}, ['src', 'nested'])
+		expect(invalid.code).toBe(1)
+		expect(invalid.output).toContain('nested/probe.imba')
+		expect(invalid.output).toContain('TS2551')
+		await Bun.write(nested, 'const value = 42\nvalue.toFixed!\n')
+		const valid = await check(cwd, {}, ['src', 'nested'])
+		expect(valid.code).toBe(0)
+		await Bun.write(join(cwd, 'src/file-63.imba'), "const value = 'last file'\nvalue.toFixed!\n")
+		const last = await check(cwd, {}, ['src', 'nested'])
+		expect(last.code).toBe(1)
+		expect(last.output).toContain('src/file-63.imba')
+	}, 30000)
+
 	test('reuses a warm project and reads changed source from disk', async () => {
 		const cwd = await fixture()
 		const source = join(cwd, 'src/probe.imba')
