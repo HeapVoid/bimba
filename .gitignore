@@ -2,7 +2,6 @@
 
 public/*.js
 bun.lockb
-bun.lock
 .vscode
 .claude
 

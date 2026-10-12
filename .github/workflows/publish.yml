@@ -24,6 +24,8 @@ jobs:
           registry-url: https://registry.npmjs.org
           package-manager-cache: false
       - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.4.3'
       - run: bun install --frozen-lockfile
       - name: Verify release version
         run: test "v$(node -p "require('./package.json').version")" = "$GITHUB_REF_NAME"

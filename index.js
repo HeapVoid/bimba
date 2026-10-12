@@ -34,6 +34,7 @@ try {
             html: { type: 'string' },
             typecheck: { type: 'boolean' },
             tscheck: { type: 'boolean' },
+            check: { type: 'boolean' },
             'frontend-check': { type: 'boolean' },
             frontend: { type: 'boolean' },
             force: { type: 'boolean' },
@@ -87,6 +88,7 @@ if(flags.help) {
     console.log("   "+theme.flags('--clearcache')+"                          Clear cache on exit, works only when in watch mode");
     console.log("   "+theme.flags('--typecheck')+"                           Check TypeScript diagnostics in .imba files");
     console.log("   "+theme.flags('--tscheck')+"                             Alias for --typecheck");
+    console.log("   "+theme.flags('--check')+"                               Use Bun's native type checker during bundling (Bun 1.4.3+)");
     console.log("");
     console.log("Frontend verification:");
     console.log("   --frontend-check                         Reuse the exact frontend snapshot or check missing types");
@@ -104,6 +106,17 @@ if(flags.help) {
 let frontendProject = flags.frontend;
 try { frontendProject ||= JSON.parse(fs.readFileSync('package.json', 'utf8')).bimba?.frontend === true; } catch {}
 if (flags.force) process.env.BIMBA_FORCE = '1';
+
+if (flags.check) {
+    if (flags.serve || flags.typecheck || flags.tscheck || flags['frontend-check']) {
+        console.error('--check applies to bundle mode. Use --typecheck for Imba source diagnostics.');
+        process.exit(1);
+    }
+    if (!process.versions.typescript) {
+        console.error('--check requires Bun 1.4.3 or newer. Upgrade Bun to use its native type checker.');
+        process.exit(1);
+    }
+}
 
 let bundling = false;
 let rebuildQueued = false;
@@ -214,8 +227,10 @@ async function bundle() {
             minify: flags.minify ?? true,
             splitting: flags.splitting || false,
             define: IMBA_RUNTIME_DEFINES,
+            throw: false,
             plugins: [imbaPlugin]
         };
+        if (flags.check) buildOpts.check = true;
         if (flags.external?.length) {
             buildOpts.external = flags.external;
         }
@@ -238,10 +253,11 @@ async function bundle() {
             if (stats.reported)
                 console.log(theme.start(theme.failure(" Failure ") + theme.filename(` Imba compiler failed to proceed ${stats.failed} file${stats.failed > 1 ? 's' : ''}`)));
         }
-        else
+        else if (result.success && !stats.errors)
             console.log(theme.start(theme.success("Success") +` It took ${theme.time(Date.now() - start)} ms to bundle ${theme.count(stats.bundled)} file${stats.bundled > 1 ? 's' : ''} to the folder: ${theme.filedir(flags.outdir)}`));
 
         if (!result.success && !stats.errors) {
+            console.log(theme.failure(' Failure ') + ' Bun could not build the bundle');
             for (const log of result.logs) {
                 console.log(log);
             }

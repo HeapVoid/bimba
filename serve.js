@@ -1,5 +1,5 @@
 import { serve as bunServe } from 'bun'
-import { mkdirSync, watch, existsSync, statSync, writeFileSync, realpathSync } from 'fs'
+import { watch, existsSync, statSync, realpathSync } from 'fs'
 import path from 'path'
 import { imbaPlugin } from './plugin.js'
 import { IMBA_RUNTIME_DEFINES, theme } from './utils.js'
@@ -689,25 +689,6 @@ function vendorSpecifierFromPath(pathname) {
 	return specifier || null
 }
 
-function vendorEntrypoint(entrypoint) {
-	if (path.isAbsolute(entrypoint)) return entrypoint
-
-	const dir = path.join(process.cwd(), 'node_modules', '.cache', 'bimba', 'vendor-entry')
-	mkdirSync(dir, { recursive: true })
-
-	const name = encodeURIComponent(entrypoint).replace(/%/g, '_')
-	const file = path.join(dir, name + '.js')
-	const specifier = JSON.stringify(entrypoint)
-	const code = [
-		`export * from ${specifier};`,
-		`import * as mod from ${specifier};`,
-		`export default (mod.default ?? mod);`,
-		'',
-	].join('\n')
-	writeFileSync(file, code)
-	return file
-}
-
 async function bundleVendor(entrypoint) {
 	try {
 		const stat = path.isAbsolute(entrypoint) && existsSync(entrypoint) ? statSync(entrypoint) : null
@@ -715,10 +696,18 @@ async function bundleVendor(entrypoint) {
 		const cached = _vendorCache.get(entrypoint)
 		if (cached && cached.mtime === mtime) return cached
 
-		const buildEntrypoint = vendorEntrypoint(entrypoint)
+		// Bun resolves the virtual wrapper from the project and owns package
+		// exports/browser/CommonJS handling without a generated file on disk.
+		const buildEntrypoint = path.isAbsolute(entrypoint) ? entrypoint
+			: path.join(process.cwd(), 'node_modules', '.cache', 'bimba', 'vendor-entry', encodeURIComponent(entrypoint) + '.js')
+		const specifier = JSON.stringify(entrypoint)
+		const files = path.isAbsolute(entrypoint) ? {} : {
+			[buildEntrypoint]: `export * from ${specifier};\nimport * as mod from ${specifier};\nexport default (mod.default ?? mod);\n`,
+		}
 		const externalizeImba = shouldExternalizeImbaForVendor(entrypoint)
 		const result = await Bun.build({
 			entrypoints: [buildEntrypoint],
+			files,
 			target: 'browser',
 			format: 'esm',
 			write: false,

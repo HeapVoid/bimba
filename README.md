@@ -7,6 +7,41 @@ First of all install this tool like any other npm package:
 bun add bimba-cli -d
 ```
 
+## Runtime compatibility and integration
+
+Bimba 0.7.51 requires Bun 1.3.6 or newer. Bun 1.4.3 is recommended and is
+pinned in the release workflow, but upgrading to it is required only for the
+new native `--check` option. Bimba uses the Bun installed in the consuming
+project's environment; installing or updating `bimba-cli` does not install,
+bundle, or upgrade Bun.
+
+| Operation | Bun version | Type-checking engine |
+| --- | --- | --- |
+| Normal bundle or `--serve` HMR | 1.3.6+ | No native Bun type-check gate |
+| Bundle with `--check` | 1.4.3+ | Bun's built-in TypeScript checker |
+| `--typecheck` / `--tscheck` | 1.3.6+ | Project TypeScript + `typescript-imba-plugin` for original Imba sources |
+| `--frontend-check` or background `--frontend` | 1.3.6+ | The same Imba checker with shared compilation and diagnostic coverage |
+
+Bun owns the runtime, package resolution, bundler, TypeScript transpilation,
+HTTP server and WebSockets. Bimba owns Imba compilation, source diagnostics,
+compilation caches and component-preserving HMR. Vendor wrappers now use
+Bun's in-memory `Bun.build({ files })` API by default; this API was introduced
+in Bun 1.3.6 and works without the new native type checker.
+
+### Guidance for coding agents
+
+- Read the project's scripts and check `bun --version` before choosing a
+  command. Existing builds on older supported Bun versions continue to work.
+- Use `--check` explicitly for native checking during bundling. It cannot be
+  combined with `--serve`, `--typecheck`, or `--frontend-check`; on Bun older
+  than 1.4.3 it fails with an upgrade message instead of silently skipping.
+- For original `.imba` diagnostics, use `--typecheck` with selected files or
+  directories, or the project's `--frontend-check` workflow. Bun's checker
+  sees compiled JavaScript and does not load `typescript-imba-plugin`.
+- Keep the project's TypeScript and Imba language-service plugin for Imba
+  diagnostics. Bun's native checker is independent of that TypeScript
+  version; installing newer Bun is not a reason to remove or upgrade them.
+
 ---
 
 ## Backend development
@@ -84,7 +119,7 @@ For a deep dive into how Imba compiles tags, how the render cache works, and how
 
 Static files are resolved relative to the HTML file's directory first, then from the project root (for `node_modules`, `src`, etc.). Extensionless imports are resolved by trying `.imba`, `.ts`, `.tsx`, `.js`, and `.mjs` extensions automatically.
 
-**npm package resolution:** The dev server scans each served JS module and rewrites bare imports such as `imba/runtime`, `@scope/pkg`, and `pkg/subpath` to `__bimba_vendor__/*` URLs. Those vendor URLs are bundled on demand with Bun (`target: "browser"`). Imba source files still compile separately for HMR, while Bun owns dependency resolution, `exports`, `browser` fields, nested `node_modules`, and CommonJS interop.
+**npm package resolution:** The dev server scans each served JS module and rewrites bare imports such as `imba/runtime`, `@scope/pkg`, and `pkg/subpath` to `__bimba_vendor__/*` URLs. Those vendor URLs are bundled on demand with Bun (`target: "browser"`). Package wrappers use Bun's native in-memory `files` option, so serving packages does not create generated JS files in `node_modules`. Imba source files still compile separately for HMR, while Bun owns dependency resolution, `exports`, `browser` fields, nested `node_modules`, and CommonJS interop.
 
 ---
 
@@ -99,6 +134,29 @@ With watch:
 ```bash
 bunx bimba src/index.imba --outdir public/js --watch --clearcache
 ```
+
+### Native Bun type checking during bundling
+
+With Bun 1.4.3 or newer, add `--check` to use Bun's built-in type checker:
+
+```bash
+bunx bimba src/index.imba --outdir public/js --check
+```
+
+Bimba passes `check: true` to `Bun.build`. Bun checks the modules read by the
+bundler, including `.ts`/`.tsx` imported from Imba, and fails before writing
+output when it finds a type error. `--watch --check` repeats the check on each
+rebuild. Normal builds and HMR retain their existing fast iteration behavior;
+`--check` applies to bundle mode only.
+
+This does not replace Imba source diagnostics below. Bun sees the JavaScript
+produced by the Imba build plugin and does not load TypeScript language-service
+plugins. Use `--typecheck` or `--frontend-check` to check the original `.imba`
+sources. Bun's checker follows TypeScript 7 semantics independently of the
+project's installed TypeScript version: old options such as `baseUrl` may need
+migration, and ambient packages must be listed explicitly in
+`compilerOptions.types` (for example, `["bun"]` with `@types/bun` installed).
+See [Bun type checking](https://bun.com/docs/runtime/check).
 
 ### TypeScript diagnostics for Imba files
 
@@ -151,7 +209,7 @@ bimba src --frontend-check --force
 
 `--frontend` keeps HMR responsive while a background process checks saves using
 the warm TypeScript server and primes the production compiler variant. Save
-bursts coalesce. Native TypeScript updates its affected type graph; complete
+bursts coalesce. The resident TypeScript language service updates its affected type graph; complete
 Imba diagnostic coverage also catches implicit tag/global consumers. The first
 check establishes coverage. Subsequent exact snapshots reuse it. CSS-only
 changes compare virtual TypeScript for the changed files only; an unsupported
@@ -198,6 +256,8 @@ npm Trusted Publishing (OIDC), with no stored npm token. Configure the
 `--typecheck` — check TypeScript diagnostics in `.imba` files using `tsserver` and `typescript-imba-plugin`.
 
 `--tscheck` — alias for `--typecheck`.
+
+`--check` — use Bun's native type checker during bundling (requires Bun 1.4.3+); type errors prevent writing output. Use `--typecheck` for original Imba source diagnostics.
 
 `--serve` — start dev server with HMR instead of bundling.
 
