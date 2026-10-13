@@ -135,6 +135,122 @@ With watch:
 bunx bimba src/index.imba --outdir public/js --watch --clearcache
 ```
 
+### Automatic tag dependencies (opt-in prototype)
+
+The browser build plugin can discover dependencies of selected lazy Imba
+modules without a handwritten tag-to-file mapping:
+
+Projects can enable it through the CLI:
+
+```sh
+bunx bimba src/index.imba --outdir public/js --splitting --auto-tags
+```
+
+`--splitting` controls Bun's code splitting; `--auto-tags` supplies the missing
+tag dependencies. The flag is opt-in. Without configuration it indexes `src/`
+(or the entrypoint directory if there is no `src/`) and discovers lazy boundaries
+from literal relative `import('./page.imba')` expressions in Imba modules.
+The shell retains its lazy imports. The CLI prints the discovered dependency
+manifest and writes outputs only after the inventory has passed validation.
+
+To include tags outside that directory, configure the existing project manifest:
+
+```json
+{
+  "bimba": {
+    "tags": {
+      "roots": ["src", "components"]
+    }
+  }
+}
+```
+
+The configuration does not activate the mode by itself. Use `--auto-tags` in the
+project's build script, or `--no-auto-tags` to disable it. `entries` can optionally
+select explicit module paths when lazy imports are computed or originate in JS;
+this selection is the project's loading contract. `external` lists tags supplied
+by an existing loader or outside the indexed source tree and keeps that contract.
+
+The CLI currently rejects `--watch`, `--serve`, type-checking modes, non-browser
+targets and source maps with `--auto-tags`. Ordinary builds and HMR are unchanged.
+This mode is tested with Bun 1.4.3 and Imba 2.0.0-alpha.253.
+
+For the public Bun build plugin:
+
+```js
+import { ImbaPlugin } from 'bimba-cli/compile-cache.js';
+import { IMBA_RUNTIME_DEFINES } from 'bimba-cli/utils.js';
+
+const plugin = new ImbaPlugin(undefined, {
+  tags: {
+    roots: ['src'],
+  },
+});
+const result = await Bun.build({
+  entrypoints: ['src/index.imba'],
+  target: 'browser', splitting: true, define: IMBA_RUNTIME_DEFINES,
+  plugins: [plugin],
+});
+console.log(plugin.tags.dependencies);
+```
+
+`roots` is the source inventory. Without `entries`, literal relative lazy imports
+in Imba select the modules to link. An explicit `entries` array selects the modules
+whose static dependency closure may be linked automatically. Keep `import()` in the shell
+to declare the lazy boundary. A tag reference in that shell does not create an
+eager import. Every dependency is discovered from compiler tokens and the AST
+of generated JavaScript, including results restored from the compilation cache.
+Only reached modules are compiled; unrelated declarations in `roots` are indexed
+without adding their code to the build.
+
+Selected modules receive ordinary named ESM imports and internal constructor
+exports. Custom tag inheritance uses an imported class instead of looking up
+its superclass in the runtime registry. Nested component references create the
+same value dependencies, recursively. Existing explicit static imports remain
+part of the closure when they are relative `.imba` imports; dynamic imports retain
+their own boundaries. Bundling and
+browser ESM evaluation own loading, deduplication and execution order.
+
+Missing or ambiguous owners and module cycles involving a superclass reject the
+build with source paths, including cycles closed by rendering or static imports.
+Render-only cycles retain live ESM bindings. Every
+build refreshes the index, including sequential reuse of a plugin instance;
+a changed source, added or removed source file during
+linking rejects that snapshot, including declarations not emitted into the bundle.
+An optional `external: ['package-owned-tag']` declares tags supplied outside the
+indexed sources, whose existing loading contract remains the caller's concern.
+
+An inferred static dependency on a module also selected by a literal `import()`
+rejects the build: it could silently move an action dialog into its catalogue's
+initial code. An explicit static import declares that this eager dependency is
+intentional. If an existing loader already awaits the dialog, put its supplied
+tag in `external`; the dialog remains independently linked and loaded. The
+linker does not infer the meaning of arbitrary async application operations.
+
+This prototype covers top-level global tags containing a hyphen and literal
+tag references emitted by the current Imba compiler. Runtime-computed tag names
+are rejected in linked modules: use literal tags or directly imported constructors
+(including PascalCase tags) so their module ownership is explicit.
+HMR, route declaration generation and source-map rewriting
+are not integrated yet. Use the default compiler options and no bundle source maps.
+When using the public plugin, discard outputs if Bun reports a failure; the CLI
+does this before writing them.
+
+The focused regression matrix is `tests/tag-dependencies.test.js` and
+`tests/auto-tags-cli.test.js`: recursive components and bases, two lazy pages
+sharing one provider, static imports, render cycles, unsafe superclass cycles,
+colocated order, native HTML/SVG, duplicate/missing/ambiguous declarations,
+literal dynamic templates, imported constructors, conditional registration,
+source and inventory changes, preserved action boundaries, reused plugins, name
+collisions, external loading, CLI configuration and unsupported modes.
+
+These checks validate supported Imba tag ownership and generated imports. They
+do not ensure that a server still retains a chunk referenced by an old browser
+tab, that the network delivers it, or that a component's own initialization succeeds.
+A failed `import()` must reach the application's existing load-error and
+document-reload flow; failed module evaluation is not a reliable same-document retry.
+An open tab referencing a removed chunk can recover through a hard document reload.
+
 ### Native Bun type checking during bundling
 
 With Bun 1.4.3 or newer, add `--check` to use Bun's built-in type checker:
@@ -248,6 +364,11 @@ npm Trusted Publishing (OIDC), with no stored npm token. Configure the
 `--clearcache` — delete the cache directory on exit (Ctrl+C). Works only in watch mode.
 
 `--no-minify` — disable minification. Bundle mode minifies by default.
+
+`--splitting` — split dynamic imports and shared modules into chunks.
+
+`--auto-tags` — automatically link lazy Imba tag dependencies; source roots can be
+configured with `package.json` → `bimba.tags`. See the supported modes above.
 
 `--sourcemap <inline|external|none>` — how to include source maps in the output (default: `none`).
 

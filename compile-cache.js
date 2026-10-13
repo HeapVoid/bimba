@@ -3,6 +3,7 @@ import { createRequire } from 'node:module';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { TagDependencies } from './tag-dependencies.js';
 
 export const hash = value => createHash('sha256').update(value).digest('hex');
 export const counters = { hits: 0, compiled: 0 };
@@ -81,20 +82,41 @@ export function compileImba(source, options) {
     return current.compile(source, options);
 }
 
+// Both the public build plugin and the CLI use one linker and compiler contract.
+export function createTagDependencies(tags, options, build) {
+    if (options.platform !== 'browser' || build.config?.target && build.config.target !== 'browser') throw Error('Automatic tag dependencies require a browser build');
+    if (options.hmr || options.sourcemap && options.sourcemap !== 'none' || build.config?.sourcemap && build.config.sourcemap !== 'none') throw Error('Automatic tag dependencies do not yet support HMR or source maps');
+    const cache = new CompilerCache();
+    const linker = new TagDependencies({ ...tags, cwd: cache.cwd, compiler: cache.compiler,
+        compile: file => cache.compile(fs.readFileSync(file, 'utf8'), { ...options, sourcePath: file }),
+    });
+    linker.prepare();
+    build.onEnd(result => { if (result.success) linker.verify(); });
+    return linker;
+}
+
 export class ImbaPlugin {
     name = 'bimba-imba';
     #options;
     #errors = 0;
-    constructor(options = { platform: 'browser', comments: false }) { this.#options = { ...options }; }
+    #tags;
+    tags = null;
+    constructor(options = { platform: 'browser', comments: false }, { tags = null } = {}) {
+        this.#options = { ...options };
+        this.#tags = tags;
+    }
     get errors() { return this.#errors; }
     setup = build => {
+        if (this.#tags) {
+            this.tags = createTagDependencies(this.#tags, this.#options, build);
+        }
         build.onLoad({ filter: /\.imba$/ }, ({ path: file }) => {
             const result = compileImba(fs.readFileSync(file, 'utf8'), { ...this.#options, sourcePath: file });
             if (result.errors?.length) {
                 this.#errors++;
                 throw Error(file + ': ' + result.errors.map(error => error.message || String(error)).join('\n'));
             }
-            return { contents: result.js, loader: 'js' };
+            return { contents: this.tags ? this.tags.link(file, result.js) : result.js, loader: 'js' };
         });
     };
 }

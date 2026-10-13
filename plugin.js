@@ -1,6 +1,6 @@
 import { plugin } from "bun";
 import {theme} from './utils.js';
-import { compileImba, projectCache, counters } from './compile-cache.js'
+import { compileImba, projectCache, counters, createTagDependencies } from './compile-cache.js'
 import dir from 'path'
 import fs from 'fs'
 
@@ -102,76 +102,85 @@ function printCompileError(error) {
 export let target = 'browser';
 export function setTarget(t) { target = t; }
 
-export const imbaPlugin = {
-  name: "imba",
-  async setup(build) {
+export function createImbaPlugin({tags = null} = {}) {
+  let linker = null;
+  return {
+    name: "imba",
+    get tags() { return linker; },
+    async setup(build) {
 
-    // when an .imba file is imported...
-    build.onLoad({ filter: /\.imba$/ }, async ({ path }) => {
+      const platform = target === 'node' || target === 'bun' ? 'node' : 'browser';
+      linker = tags ? createTagDependencies(tags, {platform, comments:false}, build) : null;
 
-      const f = dir.parse(path)
+      // when an .imba file is imported...
+      build.onLoad({ filter: /\.imba$/ }, async ({ path }) => {
 
-      while (true) {
-        const stamp = compileFileStamp(path);
-        if (!stamp) {
-          clearCompileError(path);
-          return { contents: '', loader: "js" };
-        }
+        const f = dir.parse(path)
 
-        let contents = '';
-
-        // if no cached version read and compile it with the imba compiler
-        const file = await Bun.file(path).text();
-        if (compileFileStamp(path) !== stamp) continue;
-
-        const platform = target === 'node' || target === 'bun' ? 'node' : 'browser';
-        let out
-        try {
-          const hits = counters.hits;
-          out = compileImba(file, {
-            sourcePath: path,
-            platform: platform,
-            comments: false
-          })
-          if (counters.hits > hits) stats.cached++;
-          else stats.compiled++;
-        } catch (error) {
-          out = { js: '', errors: [error] }
-        }
-
-        // Never report or cache a result from an older source snapshot.
-        if (compileFileStamp(path) !== stamp) continue;
-
-        // the file has been successfully compiled
-        if (!out.errors?.length) {
-          clearCompileError(path);
-          console.log(theme.action("compiling: ") + theme.folder(dir.join(f.dir,'/')) + theme.filename(f.base) + " - " + theme.success("compiled"));
-          stats.bundled++;
-          contents = out.js;
-        }
-        // there were errors during compilation
-        else {
-          const shouldPrint = shouldPrintCompileError(path, out.errors);
-          if (shouldPrint) console.log(theme.action("compiling: ") + theme.folder(dir.join(f.dir,'/')) + theme.filename(f.base) + " - " + theme.failure(" fail "));
-          stats.failed++;
-          if (shouldPrint) {
-            stats.reported++;
-            for (let i = 0; i < out.errors.length; i++) {
-              if(out.errors[i]) printCompileError(out.errors[i]);
-            }
+        while (true) {
+          const stamp = compileFileStamp(path);
+          if (!stamp) {
+            clearCompileError(path);
+            return { contents: '', loader: "js" };
           }
-          stats.errors++;
-        }
 
-        // and return the compiled source code as "js"
-        return {
-          contents,
-          loader: "js",
-        };
-      }
-    });
-  }
-};
+          let contents = '';
+
+          // if no cached version read and compile it with the imba compiler
+          const file = await Bun.file(path).text();
+          if (compileFileStamp(path) !== stamp) continue;
+
+          const platform = target === 'node' || target === 'bun' ? 'node' : 'browser';
+          let out
+          try {
+            const hits = counters.hits;
+            out = compileImba(file, {
+              sourcePath: path,
+              platform: platform,
+              comments: false
+            })
+            if (counters.hits > hits) stats.cached++;
+            else stats.compiled++;
+          } catch (error) {
+            out = { js: '', errors: [error] }
+          }
+
+          // Never report or cache a result from an older source snapshot.
+          if (compileFileStamp(path) !== stamp) continue;
+
+          // the file has been successfully compiled
+          if (!out.errors?.length) {
+            clearCompileError(path);
+            console.log(theme.action("compiling: ") + theme.folder(dir.join(f.dir,'/')) + theme.filename(f.base) + " - " + theme.success("compiled"));
+            stats.bundled++;
+            contents = linker ? linker.link(path, out.js) : out.js;
+          }
+          // there were errors during compilation
+          else {
+            const shouldPrint = shouldPrintCompileError(path, out.errors);
+            if (shouldPrint) console.log(theme.action("compiling: ") + theme.folder(dir.join(f.dir,'/')) + theme.filename(f.base) + " - " + theme.failure(" fail "));
+            stats.failed++;
+            if (shouldPrint) {
+              stats.reported++;
+              for (let i = 0; i < out.errors.length; i++) {
+                if(out.errors[i]) printCompileError(out.errors[i]);
+              }
+            }
+            stats.errors++;
+          }
+
+          // and return the compiled source code as "js"
+          return {
+            contents,
+            loader: "js",
+          };
+        }
+      });
+    }
+  };
+}
+
+export const imbaPlugin = createImbaPlugin();
 
 plugin(imbaPlugin);
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 
 import { parseArgs } from "util";
-import { imbaPlugin, stats, cache, setTarget } from './plugin.js'
+import { imbaPlugin, createImbaPlugin, stats, cache, setTarget } from './plugin.js'
 import { IMBA_RUNTIME_DEFINES, theme } from './utils.js';
 import fs from 'fs'
 import path from 'path';
@@ -26,6 +26,7 @@ try {
             clearcache: { type: 'boolean' },
             minify: { type: 'boolean' },
             splitting: { type: 'boolean' },
+            'auto-tags': { type: 'boolean' },
             target: { type: 'string' },
             external: { type: 'string', multiple: true },
             sourcemap: { type: 'string' },
@@ -52,7 +53,7 @@ catch (error) {
         console.log(error.message);
     else
         console.log("Could not resolve CLI arguments. Read help to know them: " + theme.flags('--entry file.imba'));
-    process.exit(0);
+    process.exit(1);
 }
 
 function ensureBunfigPreload() {
@@ -81,6 +82,8 @@ if(flags.help) {
     console.log("");
     console.log("   "+theme.flags('--outdir <folder>')+"                     Compile imba files to the specified folder");
     console.log("   "+theme.flags('--no-minify')+"                           Disable minification for compiled .js files");
+    console.log("   --splitting                              Split dynamic imports into lazy chunks");
+    console.log("   --auto-tags                              Link lazy tag dependencies (package.json bimba.tags)");
     console.log("   "+theme.flags('--sourcemap <inline|external|none>')+"    How should sourcemap files be included in the .js");
     console.log("   "+theme.flags('--target <browser|node>')+"               Target platform for both Imba compiler and Bun bundler");
     console.log("   "+theme.flags('--external <package>')+"                Exclude package from bundle (repeatable, e.g. --external ws --external node-pty)");
@@ -104,7 +107,23 @@ if(flags.help) {
 
 
 let frontendProject = flags.frontend;
-try { frontendProject ||= JSON.parse(fs.readFileSync('package.json', 'utf8')).bimba?.frontend === true; } catch {}
+let projectOptions = {};
+try { projectOptions = JSON.parse(fs.readFileSync('package.json', 'utf8')).bimba || {}; } catch (error) {
+    if (flags['auto-tags'] && error.code !== 'ENOENT') { console.error('Cannot read package.json: ' + error.message); process.exit(1); }
+}
+frontendProject ||= projectOptions.frontend === true;
+let tagOptions = null;
+if (flags['auto-tags']) {
+    if (flags.serve || flags.watch || flags.typecheck || flags.tscheck || flags.check || flags['frontend-check'] || flags.target && flags.target !== 'browser' || flags.sourcemap && flags.sourcemap !== 'none') {
+        console.error('--auto-tags supports browser bundle mode without --watch, --serve, type checking modes or source maps.');
+        process.exit(1);
+    }
+    tagOptions = projectOptions.tags ?? {roots:[fs.existsSync('src') ? 'src' : path.dirname(entrypoint)]};
+    if (!tagOptions || typeof tagOptions !== 'object' || Array.isArray(tagOptions)) {
+        console.error('package.json bimba.tags must be an object with source roots.');
+        process.exit(1);
+    }
+}
 if (flags.force) process.env.BIMBA_FORCE = '1';
 
 if (flags.check) {
@@ -219,22 +238,34 @@ async function bundle() {
 
     let result = undefined
     try {
+        const buildPlugin = tagOptions ? createImbaPlugin({tags:tagOptions}) : imbaPlugin;
         const buildOpts = {
             entrypoints: [entrypoint],
-            outdir: flags.outdir,
+            // Validate the complete tag inventory before exposing new artifacts.
+            outdir: tagOptions ? undefined : flags.outdir,
             target: buildTarget,
             sourcemap: flags.sourcemap || 'none',
             minify: flags.minify ?? true,
             splitting: flags.splitting || false,
             define: IMBA_RUNTIME_DEFINES,
             throw: false,
-            plugins: [imbaPlugin]
+            plugins: [buildPlugin]
         };
         if (flags.check) buildOpts.check = true;
         if (flags.external?.length) {
             buildOpts.external = flags.external;
         }
         result = await Bun.build(buildOpts);
+
+        if (tagOptions && result.success && !stats.errors) {
+            const directory = path.resolve(flags.outdir);
+            for (const output of result.outputs) {
+                const destination = path.resolve(directory, output.path);
+                if (destination !== directory && !destination.startsWith(directory + path.sep)) throw Error('Bundle output is outside --outdir: ' + output.path);
+                await Bun.write(destination, output);
+            }
+            console.log(JSON.stringify({auto_tags:buildPlugin.tags.dependencies}));
+        }
 
         // For node target, add shebang to the output file
         if (result.success && (buildTarget === 'node' || buildTarget === 'bun')) {

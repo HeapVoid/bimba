@@ -1,4 +1,4 @@
-import { parse } from 'acorn'
+import { syntax, visit, replace, keyName } from './javascript.js'
 import { compileImba as compile } from './compile-cache.js'
 import path from 'node:path'
 
@@ -6,34 +6,6 @@ const normalizer = new Bun.Transpiler({
 	loader: 'js', target: 'browser', trimUnusedImports: false, inline: false,
 })
 const generatedSymbol = /^(?:ε[\p{ID_Continue}$]*|[\p{ID_Start}_$][\p{ID_Continue}$]*φ\d*|c\$\d+|\$\d+)$/u
-
-function syntax(js) {
-	const comments = []
-	const ast = parse(js, { ecmaVersion: 'latest', sourceType: 'module', onComment: comments })
-	return { ast, comments }
-}
-
-function visit(node, callback, ancestors = []) {
-	if (!node || typeof node.type !== 'string') return
-	if (callback(node, ancestors) === false) return
-	const parents = [...ancestors, node]
-	for (const value of Object.values(node)) {
-		if (Array.isArray(value)) {
-			for (const child of value) visit(child, callback, parents)
-		} else if (value && typeof value === 'object') visit(value, callback, parents)
-	}
-}
-
-function replace(js, edits) {
-	for (const { start, end, text } of edits.sort((a, b) => b.start - a.start)) {
-		js = js.slice(0, start) + text + js.slice(end)
-	}
-	return js
-}
-
-function keyName(node) {
-	return node?.type === 'Identifier' ? node.name : node?.type === 'Literal' ? node.value : null
-}
 
 // Imba's generated getter caches its element as a non-configurable own field.
 // Only that getter's exact cache operation is made removable during HMR.
