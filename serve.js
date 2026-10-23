@@ -871,7 +871,7 @@ export function serve(entrypoint, flags = {}) {
 	const bundledFiles = new Set()
 	const publishedCss = new Map()
 	const sources = new Resources()
-	const sourceWatchers = new Map()
+	const watchers = new Map()
 
 	function rememberModuleUrl(filepath, pathname) {
 		const absolute = path.resolve(filepath)
@@ -1449,9 +1449,23 @@ export function serve(entrypoint, flags = {}) {
 		}
 	}
 
-	const watcher = watch(srcDir, { recursive: true }, (_event, filename) => {
-		scheduleCompile(filename)
-	})
+	function observes(filepath) {
+		return [...watchers.keys()].some(directory => within(directory, filepath))
+	}
+
+	function observe(directory) {
+		directory = realpathSync(directory)
+		if (observes(directory)) return
+		const watcher = watch(directory, {recursive:true}, (_event, filename) => {
+			if (filename) scheduleCompile(path.resolve(directory, String(filename)))
+		})
+		for (const [root, previous] of watchers) if (within(directory, root)) {
+			previous.close()
+			watchers.delete(root)
+		}
+		watchers.set(directory, watcher)
+	}
+	observe(srcRoot)
 
 	// ── HTTP + WebSocket server ────────────────────────────────────────────────
 
@@ -1730,20 +1744,14 @@ export function serve(entrypoint, flags = {}) {
 
 	server.moduleUrl = (filepath, root = process.cwd()) => {
 		const address = sources.mount(filepath, root)
-		const directory = realpathSync(root)
-		if (!within(srcRoot, directory) && !sourceWatchers.has(directory)) {
-			sourceWatchers.set(directory, watch(directory, {recursive:true}, (_event, filename) => {
-				if (filename) scheduleCompile(path.resolve(directory, String(filename)))
-			}))
-		}
+		if (!observes(realpathSync(filepath))) observe(root)
 		return address
 	}
 
 	const stop = server.stop.bind(server)
 	server.stop = closeActiveConnections => {
-		watcher.close()
-		for (const watcher of sourceWatchers.values()) watcher.close()
-		sourceWatchers.clear()
+		for (const watcher of watchers.values()) watcher.close()
+		watchers.clear()
 		sources.roots.clear()
 		for (const timer of _debounce.values()) clearTimeout(timer)
 		_debounce.clear()

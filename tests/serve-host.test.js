@@ -217,3 +217,75 @@ console.log('TEST_SERVER ' + server.url);
 	expect((await load(await source(await address('project','common.cjs')))).default).toBe('CHANGED')
 	expect((await change('theme.css', '.fixture {color:blue}', cssUrl)).type).toBe('css')
 }, 15000)
+
+test('module URLs reuse observed files and overlapping roots share one watcher', async () => {
+	const root = await mkdtemp(join(tmpdir(), 'bimba-watch-host-'))
+	const external = await mkdtemp(join(tmpdir(), 'bimba-watch-external-'))
+	fixtures.push(root, external)
+	await mkdir(join(root, 'src'))
+	await mkdir(join(external, 'nested'))
+	await Bun.write(join(root, 'index.html'), '<html><head></head><body></body></html>')
+	await Bun.write(join(root, 'src/app.imba'), 'export const value = 1\n')
+	await Bun.write(join(root, 'src/plugin.js'), 'export default 1;')
+	await Bun.write(join(external, 'nested/plugin.js'), 'export default 2;')
+	await Bun.write(join(external, 'other.js'), 'export default 3;')
+	await Bun.write(join(root, 'observe.mjs'), `
+import {mock} from 'bun:test';
+import path from 'node:path';
+const fs = await import('fs'), originalWatch = fs.watch;
+const registrations = [];
+mock.module('fs', () => ({...fs, watch(directory, ...args) {
+  const watcher = originalWatch(directory, ...args), close = watcher.close.bind(watcher);
+  const registration = {root:fs.realpathSync(directory), closed:0};
+  registrations.push(registration);
+  watcher.close = () => { registration.closed++; return close(); };
+  return watcher;
+}}));
+const {serve} = await import(${JSON.stringify(join(import.meta.dir, '../serve.js'))});
+const external = fs.realpathSync(${JSON.stringify(external)}), host = process.cwd();
+const server = serve('src/app.imba', {port:0,hostname:'127.0.0.1',watchRoot:'src'});
+const active = () => registrations.filter(item => !item.closed).map(item => item.root).sort();
+const snapshots = {};
+try {
+  snapshots.initial = active();
+  snapshots.nativeUrl = server.moduleUrl(host+'/src/plugin.js', host);
+  server.moduleUrl(host+'/src/plugin.js', host);
+  snapshots.native = active();
+  snapshots.nestedUrl = server.moduleUrl(external+'/nested/plugin.js', external+'/nested');
+  server.moduleUrl(external+'/nested/plugin.js', external+'/nested');
+  snapshots.nested = active();
+  server.moduleUrl(external+'/other.js', external);
+  snapshots.parent = active();
+  snapshots.repeatedUrl = server.moduleUrl(external+'/nested/plugin.js', external+'/nested');
+  snapshots.repeated = active();
+  await (await fetch(new URL(snapshots.nestedUrl, server.url))).text();
+  const socket = new WebSocket(new URL('/__hmr__', server.url).toString().replace('http:', 'ws:'));
+  await new Promise((resolve,reject)=>{socket.onopen=resolve;socket.onerror=reject;});
+  const changed = new Promise((resolve,reject)=>{
+    const timer=setTimeout(()=>reject(Error('Merged-root HMR did not arrive')),2000);
+    socket.onmessage=event=>{const message=JSON.parse(event.data);if(!message.paths?.includes(snapshots.nestedUrl))return;clearTimeout(timer);resolve(message.type);};
+  });
+  fs.writeFileSync(external+'/nested/plugin.js','export default 4;');
+  snapshots.hmr = await changed;
+  socket.close();
+} finally {await server.stop(true);}
+console.log('WATCH_RESULT '+JSON.stringify({snapshots,registrations,active:active(),host,external}));
+`)
+	const child = Bun.spawn([process.execPath, 'observe.mjs'], {cwd:root,env:{...process.env,BIMBA_CACHE_DIR:join(root,'.cache')},stdout:'pipe',stderr:'pipe'})
+	children.push(child)
+	const output = await new Response(child.stdout).text(), errors = await new Response(child.stderr).text()
+	expect(await child.exited).toBe(0)
+	if (child.exitCode) throw Error(errors)
+	const result = JSON.parse(output.split('\n').find(line => line.startsWith('WATCH_RESULT ')).slice(13))
+	const {snapshots, host, external:project} = result
+	expect(snapshots.nativeUrl).toBe('/src/plugin.js')
+	expect(snapshots.native).toEqual([join(host,'src')])
+	expect(snapshots.nested).toEqual([join(host,'src'),join(project,'nested')].sort())
+	expect(snapshots.parent).toEqual([join(host,'src'),project].sort())
+	expect(snapshots.repeated).toEqual(snapshots.parent)
+	expect(snapshots.repeatedUrl).toBe(snapshots.nestedUrl)
+	expect(snapshots.hmr).toBe('reload')
+	expect(result.registrations).toHaveLength(3)
+	expect(result.registrations.every(item => item.closed === 1)).toBe(true)
+	expect(result.active).toEqual([])
+}, 10000)

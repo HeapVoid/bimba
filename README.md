@@ -183,10 +183,13 @@ const source = `export {default} from ${JSON.stringify(url)};`;
 Mounted files use the normal Imba, JS/CommonJS, TypeScript and resource loaders.
 Relative imports and CSS URLs stay within their registered root; npm imports use
 the source project's browser exports, while Imba uses the host's shared runtime.
-Registered roots are watched recursively, with the same HMR messages and module
-URLs as local sources. Registration is idempotent; `server.stop()` closes all
-additional watchers and clears source registrations. Hosts own which roots to
-expose and which modules to list. This API carries no project configuration or
+Files already covered by `watchRoot` or another registered watcher reuse that
+observation without expanding its scope. Otherwise their source root is watched
+recursively, with the same HMR messages and module URLs as local sources.
+Overlapping roots share one watcher: a newly observed parent replaces covered
+child watchers. Registration is idempotent; `server.stop()` closes all watchers
+and clears source registrations. Hosts own which roots to expose and which
+modules to list. This API carries no project configuration or
 application-specific preview behavior.
 
 ### Resource imports
