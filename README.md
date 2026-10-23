@@ -163,6 +163,23 @@ The host owns its API and project configuration. Bimba owns module compilation,
 vendor conversion, WebSocket updates and frontend watching. `server.stop()` also
 closes Bimba's watcher and cancels pending frontend updates.
 
+### Resource imports
+
+Local JavaScript, TypeScript and Imba can import JSON, stylesheets and files
+without application-specific HTTP adapters. Relative resource imports receive
+an `?import` module URL automatically; direct script requests use the same
+contract. A normal request without that query returns the original file and MIME
+type. JSON modules expose Bun's default and named exports. Other non-source files
+(images, fonts, documents and custom extensions) export their encoded public URL.
+
+CSS imports load one shared `<link rel="stylesheet">` per file and await its load.
+This keeps `@import`, images and font URLs relative to the original stylesheet.
+The same loader handles CSS package exports and CSS imported by JavaScript
+packages; Bun still owns browser-condition and package resolution. Symlinked
+dependencies outside the checkout receive a package-scoped resource address.
+Stylesheet failures reject module loading. Native CSS HMR refreshes linked styles,
+including nested CSS imports; watched JSON and file changes reload using tabs.
+
 ### Production bundle
 
 To compile and bundle your source code from .imba to .js:

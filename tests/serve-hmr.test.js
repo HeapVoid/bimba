@@ -54,7 +54,7 @@ async function client() {
 	const document = {
 		body: { children: elements },
 		getElementById: () => null,
-		querySelectorAll: selector => selector === 'script[src],link[rel="stylesheet"][href]' ? linked : elements.flatMap(el => [el, ...el.querySelectorAll()])
+		querySelectorAll: selector => selector === 'script[src],link[rel="stylesheet"][href]' ? linked : selector === 'link[rel="stylesheet"]' ? linked.filter(el => el.rel === 'stylesheet') : elements.flatMap(el => [el, ...el.querySelectorAll()])
 			.filter(el => el.isConnected && (selector === '*' || el.tagName.toLowerCase() === selector)),
 	}
 	const registry = {
@@ -95,6 +95,16 @@ async function client() {
 }
 
 describe('HMR client', () => {
+	test('refreshes a linked stylesheet when one of its nested CSS imports changes', async () => {
+		const env = await client()
+		const link = {rel:'stylesheet',href:'http://localhost/src/theme.css',sheet:{href:'http://localhost/src/theme.css',cssRules:[{styleSheet:{href:'http://localhost/src/nested.css',cssRules:[]}}]}}
+		env.linked.push(link)
+		env.requested('http://localhost/src/nested.css','css')
+		await env.message({type:'css',file:'src/nested.css',paths:['/src/nested.css'],css:'body {color:blue}'})
+		expect(new URL(link.href).searchParams.has('t')).toBe(true)
+		expect(env.reloads).toBe(0)
+	})
+
 	test('encodes physical filenames for hot imports and keeps similar filenames distinct', async () => {
 		const env = await client()
 		const file = 'src/sidebar# ?% ю.imba'

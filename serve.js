@@ -12,6 +12,66 @@ function fileUrl(filepath) {
 	return '/' + filepath.replaceAll('\\', '/').replace(/^(?:\.\/|\/)+/, '').split('/').map(encodeURIComponent).join('/')
 }
 
+const sourceExtensions = new Set(['.imba', '.js', '.jsx', '.mjs', '.cjs', '.ts', '.tsx'])
+function resourceType(filepath) {
+	const extension = path.extname(filepath).toLowerCase()
+	return !extension || sourceExtensions.has(extension) ? null
+		: extension === '.json' ? 'json' : extension === '.css' ? 'css' : 'file'
+}
+
+// Stylesheets keep their native URL so the browser resolves @import and url()
+// relative to the actual CSS file. Both vendor and local imports use this owner.
+class Resources {
+	roots = new Map()
+	url(filepath) {
+		const absolute = path.resolve(filepath)
+		const local = path.relative(process.cwd(), absolute)
+		if (local !== '..' && !local.startsWith('..' + path.sep) && !path.isAbsolute(local)) return fileUrl(local)
+		// Bun can resolve a symlinked dependency outside the checkout. Mount its
+		// package root so native CSS keeps working relative URLs within that package.
+		const folder = path.dirname(absolute)
+		let directory = folder
+		while (!existsSync(path.join(directory, 'package.json')) && path.dirname(directory) !== directory) directory = path.dirname(directory)
+		if (!existsSync(path.join(directory, 'package.json'))) directory = folder
+		const key = Buffer.from(directory).toString('base64url')
+		this.roots.set(key, directory)
+		return '/__bimba_files__/' + key + fileUrl(path.relative(directory, absolute))
+	}
+	resolve(pathname) {
+		const [, , key, ...parts] = pathname.split('/')
+		const directory = pathname.startsWith('/__bimba_files__/') && this.roots.get(key)
+		if (!directory) return null
+		const target = path.resolve(directory, ...parts)
+		const local = path.relative(directory, target)
+		return local !== '..' && !local.startsWith('..' + path.sep) && !path.isAbsolute(local) ? resolveFileCandidate(target) : null
+	}
+	module(filepath) {
+		const url = JSON.stringify(this.url(filepath))
+		if (resourceType(filepath) !== 'css') return `export default ${url};`
+		return [
+			`const href = ${url};`,
+			`let link = document.querySelector('link[data-bimba-css=' + JSON.stringify(href) + ']');`,
+			`if (!link) {`,
+			`  link = document.createElement('link'); link.rel = 'stylesheet'; link.href = href;`,
+			`  link.setAttribute('data-bimba-css', href);`,
+			`  link.bimbaReady = new Promise((resolve, reject) => { link.onload = resolve; link.onerror = () => reject(new Error('Could not load stylesheet: ' + href)); });`,
+			`  document.head.append(link);`,
+			`}`,
+			`await link.bimbaReady;`,
+			`export default {};`,
+		].join('\n')
+	}
+	plugin = {
+		name: 'bimba-resources',
+		setup: build => {
+			build.onLoad({filter: /./}, ({path: filepath}) => {
+				if (['css', 'file'].includes(resourceType(filepath))) return {contents: this.module(filepath), loader: 'js'}
+			})
+		},
+	}
+}
+const resources = new Resources()
+
 const hmrClient = `
 <script>
 (function() {
@@ -381,6 +441,16 @@ ${fileUrl.toString()}
 
 	}
 
+	function _usesStylesheet(sheet, paths) {
+		if (!sheet) return false;
+		if (sheet.href) {
+			const url = new URL(sheet.href);
+			if (url.origin !== location.origin) return false;
+			if (paths.includes(url.pathname)) return true;
+		}
+		return Array.from(sheet.cssRules || []).some(rule => rule.styleSheet && _usesStylesheet(rule.styleSheet, paths));
+	}
+
 	async function _doStyleUpdate({ file, styleId, css, paths }) {
 		clearError(file);
 		if (styleId) {
@@ -394,7 +464,7 @@ ${fileUrl.toString()}
 			}
 			for (const el of document.querySelectorAll('link[rel="stylesheet"]')) {
 				const url = new URL(el.href);
-				if (url.origin === location.origin && paths.includes(url.pathname)) {
+				if (url.origin === location.origin && (paths.includes(url.pathname) || _usesStylesheet(el.sheet, paths))) {
 					url.searchParams.set('t', Date.now());
 					el.href = url.href;
 				}
@@ -567,7 +637,7 @@ function rewriteImports(js, filepath) {
 		let target
 		if (isBareSpecifier(specifier)) target = vendorUrl(specifier)
 		else if (filepath && specifier.startsWith('.') && existsSync(path.resolve(path.dirname(filepath), specifier))) {
-			target = specifier.split('/').map(encodeURIComponent).join('/')
+			target = specifier.split('/').map(encodeURIComponent).join('/') + (resourceType(specifier) ? '?import' : '')
 		} else continue
 		const escaped = escapeRegExp(specifier)
 
@@ -726,7 +796,7 @@ async function bundleVendor(entrypoint) {
 			packages: 'bundle',
 			external: externalizeImba ? IMBA_VENDOR_EXTERNALS : [],
 			define: IMBA_RUNTIME_DEFINES,
-			plugins: [imbaPlugin],
+			plugins: [resources.plugin, imbaPlugin],
 		})
 
 		if (!result.success) {
@@ -738,21 +808,6 @@ async function bundleVendor(entrypoint) {
 
 		let code = await output.text()
 		if (externalizeImba) code = rewriteImports(code)
-		const css = (await Promise.all(
-			result.outputs
-				.filter(output => output.path.endsWith('.css'))
-				.map(output => output.text())
-		)).join('\n')
-		if (css) {
-			const id = JSON.stringify('vendor:' + entrypoint)
-			code = [
-				`const __bimba_vendor_css_id = ${id};`,
-				`let __bimba_vendor_css = document.querySelector('style[data-bimba-css=' + JSON.stringify(__bimba_vendor_css_id) + ']');`,
-				`if (!__bimba_vendor_css) { __bimba_vendor_css = document.createElement('style'); __bimba_vendor_css.setAttribute('data-bimba-css', __bimba_vendor_css_id); document.head.appendChild(__bimba_vendor_css); }`,
-				`__bimba_vendor_css.textContent = ${JSON.stringify(css)};`,
-				code,
-			].join('\n')
-		}
 		const bundled = { mtime, code, inputs: Object.keys(result.metafile.inputs).map(input => path.resolve(input)) }
 		_vendorCache.set(entrypoint, bundled)
 		return bundled
@@ -808,7 +863,7 @@ export function serve(entrypoint, flags = {}) {
 	async function serveJavaScriptFile(filepath, moduleUrl) {
 		rememberModuleUrl(filepath, moduleUrl)
 		let source
-		if (filepath.endsWith('.cjs')) {
+		if (filepath.endsWith('.cjs') || resourceType(filepath) === 'json') {
 			const bundled = await bundleVendor(path.resolve(filepath))
 			if (bundled.errors?.length) throw new Error(bundled.errors.join('\n'))
 			for (const input of bundled.inputs) {
@@ -1284,7 +1339,7 @@ export function serve(entrypoint, flags = {}) {
 
 	function scheduleCompile(filename) {
 		const file = watchedFile(filename)
-		if (!file || !/\.(?:imba|ts|tsx|js|mjs|cjs|css)$/.test(file.rel)) return
+		if (!file || (!/\.(?:imba|ts|tsx|js|mjs|cjs|css)$/.test(file.rel) && !moduleUrls.has(file.filepath))) return
 		_vendorCache.clear()
 
 		const version = (_watchVersion.get(file.rel) || 0) + 1
@@ -1410,6 +1465,29 @@ export function serve(entrypoint, flags = {}) {
 				return errorResponse(file, bundled?.errors || [`Could not bundle vendor module: ${specifier}`])
 			}
 
+			const resource = resourceType(pathname)
+			const moduleRequest = url.searchParams.has('import') || req.headers.get('sec-fetch-dest') === 'script'
+			if (resource && (moduleRequest || !pathname.endsWith('.html'))) {
+				const filepath = resources.resolve(pathname) || resolveFileCandidate(path.join(htmlDir, pathname)) || resolveFileCandidate('.' + pathname)
+				const file = (resource === 'css' ? 'css:' : 'static:') + normalizeFile(filepath || pathname)
+				if (!filepath) return new Response('Not Found', {status:404})
+				try {
+					rememberModuleUrl(filepath, url.pathname)
+					if (resource === 'css' && !publishedCss.has(path.resolve(filepath))) publishedCss.set(path.resolve(filepath), await Bun.file(filepath).text())
+					const response = !moduleRequest ? new Response(Bun.file(filepath), {headers:{'Cache-Control':'no-store'}})
+						: resource === 'json' ? await serveJavaScriptFile(filepath, url.pathname)
+						: new Response(resources.module(filepath), {headers:{'Content-Type':'application/javascript'}})
+					await markSuccess(file)
+					return response
+				} catch (error) {
+					if (isMissingFileError(error)) {
+						clearError(file)
+						return new Response('Not Found', {status:404})
+					}
+					return errorResponse(file, [error])
+				}
+			}
+
 			// HTML: index or any .html file
 			if (pathname === '/' || pathname.endsWith('.html')) {
 				const htmlFile = pathname === '/' ? htmlPath : '.' + pathname
@@ -1452,43 +1530,6 @@ export function serve(entrypoint, flags = {}) {
 						return new Response('Not Found', { status: 404 })
 					}
 					return errorResponse(file, [{ message: e.message, snippet: e.stack || e.message }])
-				}
-			}
-
-			// CSS files imported from JS: wrap as a JS module that injects a <style> tag.
-			// Without this, `import './styles.css'` inside an ESM package fails because
-			// the browser expects a JS module response, not raw CSS.
-			if (pathname.endsWith('.css')) {
-				const cssPath = resolveFileCandidate(path.join(htmlDir, pathname)) || resolveFileCandidate('.' + pathname)
-				const cssFile = cssPath ? Bun.file(cssPath) : null
-				const file = 'css:' + normalizeFile(cssPath || pathname)
-				try {
-					if (cssFile && await cssFile.exists()) {
-						const css = await cssFile.text()
-						const abs = path.resolve(cssPath)
-						rememberModuleUrl(abs, pathname)
-						if (!publishedCss.has(abs)) publishedCss.set(abs, css)
-						if (req.headers.get('sec-fetch-dest') === 'style') {
-							await markSuccess(file)
-							return new Response(css, { headers: { 'Content-Type': 'text/css' } })
-						}
-
-						const id = JSON.stringify(url.pathname)
-						const js = [
-							`const id = ${id};`,
-							`let el = document.querySelector('style[data-bimba-css=' + JSON.stringify(id) + ']');`,
-							`if (!el) { el = document.createElement('style'); el.setAttribute('data-bimba-css', id); document.head.appendChild(el); }`,
-							`el.textContent = ${JSON.stringify(css)};`,
-						].join('\n')
-						await markSuccess(file)
-						return new Response(js, { headers: { 'Content-Type': 'application/javascript' } })
-					}
-				} catch (error) {
-					if (isMissingFileError(error)) {
-						clearError(file)
-						return new Response('Not Found', { status: 404 })
-					}
-					return errorResponse(file, [error])
 				}
 			}
 
