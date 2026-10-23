@@ -144,7 +144,7 @@ test('mounted source roots keep modules, dependencies, assets and HMR separate f
 	await symlink(join(other, 'examples/plugin.js'), join(project, 'examples/link.js'))
 	await file(host, 'host.mjs', `
 import {serve} from ${JSON.stringify(join(import.meta.dir, '../serve.js'))};
-const roots = ${JSON.stringify({project, other})};
+const roots = ${JSON.stringify({project, other, host})};
 const server = serve('src/app.imba', {port:0,hostname:'127.0.0.1',watchRoot:'src',fetch(request) {
   const query = new URL(request.url);
   if (query.pathname === '/module') return new Response(server.moduleUrl(roots[query.searchParams.get('root')] + '/examples/' + (query.searchParams.get('file') || 'plugin.js'), roots[query.searchParams.get('root')]));
@@ -163,6 +163,8 @@ console.log('TEST_SERVER ' + server.url);
 	}
 	const request = (path, headers) => fetch(new URL(path, origin), {headers})
 	const address = async (root, file = 'plugin.js') => (await request('/module?root=' + root + '&file=' + encodeURIComponent(file))).text()
+	expect(await address('host')).toBe('/examples/plugin.js')
+	expect((await (await request(await address('host'))).text())).toContain('HOST')
 	const projectUrl = await address('project'), otherUrl = await address('other')
 	expect(projectUrl).not.toBe(otherUrl)
 	expect(await address('project')).toBe(projectUrl)

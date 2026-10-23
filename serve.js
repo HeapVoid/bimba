@@ -36,7 +36,8 @@ class Resources {
 		if (!within(directory, absolute)) throw new Error('Module must belong to its source root')
 		const key = Buffer.from(directory).toString('base64url')
 		this.roots.set(key, directory)
-		return '/__bimba_files__/' + key + fileUrl(local)
+		// Host sources already have canonical URLs used by the entrypoint graph.
+		return directory === realpathSync(process.cwd()) ? fileUrl(local) : '/__bimba_files__/' + key + fileUrl(local)
 	}
 	url(filepath) {
 		const absolute = path.resolve(filepath)

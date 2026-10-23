@@ -171,6 +171,8 @@ can use the returned URLs in generated modules or import maps, including when
 multiple projects contain the same relative filenames. Paths are resolved through
 realpath; a file outside the declared root, including a symlink escape, is rejected.
 Only roots registered on that server can be requested through these source URLs.
+For the host root, existing local URLs are reused so imports from the entrypoint
+and generated modules execute one shared module instance.
 
 ```js
 const url = server.moduleUrl('/work/project/examples/plugin.ts', '/work/project');
