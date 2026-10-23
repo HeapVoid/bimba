@@ -74,6 +74,8 @@ bunx bimba src/index.imba --serve --port 5200 --html public/index.html
 **How it works:**
 - Serves your HTML file and compiles `.imba` files on demand (no bundling step)
 - Transpiles local `.ts` and `.tsx` modules on demand through Bun
+- Loads local `.cjs` modules through the same browser bundler used for npm packages; edits to their watched dependencies reload using tabs
+- Preserves spaces, Unicode, `#`, `?` and `%` in local filenames through encoded module URLs
 - Watches `src/` for changes and pushes updates over WebSocket
 - Rewrites bare package imports in served JS modules to `__bimba_vendor__/*` URLs
 - CSS files imported from JS (e.g. `import 'some-lib/styles.css'`) are automatically wrapped as JS modules that inject `<style>` tags
@@ -122,6 +124,44 @@ Static files are resolved relative to the HTML file's directory first, then from
 **npm package resolution:** The dev server scans each served JS module and rewrites bare imports such as `imba/runtime`, `@scope/pkg`, and `pkg/subpath` to `__bimba_vendor__/*` URLs. Those vendor URLs are bundled on demand with Bun (`target: "browser"`). Package wrappers use Bun's native in-memory `files` option, so serving packages does not create generated JS files in `node_modules`. Imba source files still compile separately for HMR, while Bun owns dependency resolution, `exports`, `browser` fields, nested `node_modules`, and CommonJS interop.
 
 ---
+
+### Embedding the dev server
+
+Applications can share Bimba's listener with their own HTTP endpoints:
+
+```js
+import { serve } from 'bimba-cli/serve.js';
+
+const server = serve('src/page/app.imba', {
+  port: 0,
+  hostname: '127.0.0.1',
+  html: 'public/index.html',
+  watchRoot: 'src',
+  imports: { 'project:previews': '/previews.js' },
+  async fetch(request, server) {
+    if (new URL(request.url).pathname === '/api/ready') {
+      return Response.json({ ready: true });
+    }
+    // Return null or undefined to use Bimba's normal routes and WebSocket.
+  },
+});
+
+console.log(server.url);
+// On application shutdown: await server.stop(true);
+```
+
+`serve(entrypoint, options = {})` returns the `Bun.Server`. `port` defaults to
+5200; zero asks Bun for a free port. `hostname` is passed to Bun. `html` retains
+the CLI's automatic discovery when omitted. Filesystem paths and HTTP module
+paths are relative to the process working directory.
+
+`watchRoot` selects the recursively watched source directory; its default is the
+entrypoint directory. Include any local dependencies that should update in this
+tree. `imports` injects an import map before the entrypoint. `fetch(request,
+server)` may return a `Response` or a Promise; null/undefined delegates to Bimba.
+The host owns its API and project configuration. Bimba owns module compilation,
+vendor conversion, WebSocket updates and frontend watching. `server.stop()` also
+closes Bimba's watcher and cancels pending frontend updates.
 
 ### Production bundle
 

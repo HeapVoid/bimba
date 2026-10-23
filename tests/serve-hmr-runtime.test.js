@@ -3,6 +3,7 @@ import { Window } from 'happy-dom'
 import vm from 'node:vm'
 import { compileHotModule, classifyHotUpdate } from '../hot-module.js'
 import { IMBA_RUNTIME_DEFINES } from '../utils.js'
+import { clientTemplate } from './client-template.js'
 
 const windows = []
 let runtime, clientCode
@@ -19,8 +20,7 @@ beforeAll(async () => {
 	})
 	if (!result.success) throw new AggregateError(result.logs)
 	runtime = await result.outputs[0].text()
-	const source = await Bun.file(new URL('../serve.js', import.meta.url)).text()
-	clientCode = vm.runInNewContext(source.match(/const hmrClient = (`[\s\S]*?`)\n/)[1])
+	clientCode = (await clientTemplate())
 		.replace(/^\s*<script>|<\/script>\s*$/g, '')
 		.replaceAll('await import(', 'await testImport(')
 })

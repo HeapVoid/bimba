@@ -3,6 +3,7 @@ import { mkdtemp, mkdir, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import vm from 'node:vm'
+import { clientTemplate } from './client-template.js'
 
 const fixtures = []
 const servers = []
@@ -18,9 +19,7 @@ afterEach(async () => {
 // Run the actual injected client with native EventTarget and a small DOM model.
 // Only module loading is substituted; updates arrive through its WebSocket handler.
 async function client() {
-	const source = await Bun.file(join(import.meta.dir, '../serve.js')).text()
-	const template = source.match(/const hmrClient = (`[\s\S]*?`)\n/)[1]
-	const html = vm.runInNewContext(template)
+	const html = await clientTemplate()
 	const code = html.replace(/^\s*<script>|<\/script>\s*$/g, '').replaceAll('await import(', 'await loadModule(')
 	const elements = []
 	const definitions = new Map()
@@ -73,7 +72,7 @@ async function client() {
 		},
 		__bimba_modules: completed,
 		console: { error() {} }, setTimeout, clearTimeout,
-		imba: { commit() {} }, loadModule: () => { imports++; return load() },
+		imba: { commit() {} }, loadModule: url => { imports++; return load(url) },
 	})
 	return {
 		Element, registry, elements, completed, resources, linked,
@@ -96,6 +95,19 @@ async function client() {
 }
 
 describe('HMR client', () => {
+	test('encodes physical filenames for hot imports and keeps similar filenames distinct', async () => {
+		const env = await client()
+		const file = 'src/sidebar# ?% ю.imba'
+		env.completed.add('/project/' + file)
+		let imported
+		await env.message({type:'update', file}, url => { imported = new URL(url, 'http://localhost/') })
+		expect(imported.pathname).toBe('/src/' + encodeURIComponent('sidebar# ?% ю.imba'))
+		expect(imported.hash).toBe('')
+		expect(env.reloads).toBe(1)
+		await env.message({type:'update', file:'src/sidebar#other.imba'})
+		expect(env.imports).toBe(1)
+	})
+
 	test('ignores unused component, data, JS/TS and CSS changes before importing anything', async () => {
 		const env = await client()
 		for (const msg of [

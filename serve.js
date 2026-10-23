@@ -8,9 +8,14 @@ export { prepareHotModule } from './hot-module.js'
 
 // ─── HMR Client (injected into browser) ──────────────────────────────────────
 
+function fileUrl(filepath) {
+	return '/' + filepath.replaceAll('\\', '/').replace(/^(?:\.\/|\/)+/, '').split('/').map(encodeURIComponent).join('/')
+}
+
 const hmrClient = `
 <script>
 (function() {
+${fileUrl.toString()}
 	// ── Custom element registry with prototype patching ────────────────────────
 	//
 	// On initial page load: tags are not registered yet → call original define,
@@ -244,7 +249,7 @@ const hmrClient = `
 	function _usesModule(msg) {
 		if (!msg.file || _completedModule(msg.file)) return true;
 		_readRequests();
-		return (msg.paths || ['/' + normalizeFile(msg.file)]).some(url => _requestedPaths.has(url));
+		return (msg.paths || [fileUrl(normalizeFile(msg.file))]).some(url => _requestedPaths.has(url));
 	}
 
 	function _applyUpdate(msg) {
@@ -273,7 +278,7 @@ const hmrClient = `
 		_collector = collected;
 		_contextChanged = contextChanged;
 		try {
-			await import('/' + file + '?t=' + Date.now());
+			await import(fileUrl(file) + '?t=' + Date.now());
 		} finally {
 			_collector = prev;
 			_contextChanged = true;
@@ -425,7 +430,7 @@ const hmrClient = `
 	const _compileErrors = new Map();
 
 	function normalizeFile(file) {
-		let value = String(file || '').split(/[?#]/)[0].split(String.fromCharCode(92)).join('/');
+		let value = String(file || '').split(String.fromCharCode(92)).join('/');
 		while (value.startsWith('./')) value = value.slice(2);
 		while (value.startsWith('/')) value = value.slice(1);
 		return value;
@@ -550,7 +555,7 @@ function escapeRegExp(value) {
 	return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
-function rewriteBareImports(js) {
+function rewriteImports(js, filepath) {
 	let imports = []
 	try {
 		imports = _importScanner.scanImports(js)
@@ -558,8 +563,12 @@ function rewriteBareImports(js) {
 		return js
 	}
 
-	for (const specifier of new Set(imports.map(item => item.path).filter(isBareSpecifier))) {
-		const target = vendorUrl(specifier)
+	for (const specifier of new Set(imports.map(item => item.path))) {
+		let target
+		if (isBareSpecifier(specifier)) target = vendorUrl(specifier)
+		else if (filepath && specifier.startsWith('.') && existsSync(path.resolve(path.dirname(filepath), specifier))) {
+			target = specifier.split('/').map(encodeURIComponent).join('/')
+		} else continue
 		const escaped = escapeRegExp(specifier)
 
 		const staticPattern = new RegExp(`((?:import|export)\\s+(?:[^'"]*?\\s+from\\s*)?)(['"])${escaped}\\2`, 'g')
@@ -621,7 +630,7 @@ async function compileFile(filepath) {
 		const result = compileHotModule(code, abs)
 		if (fileStamp(abs) !== stamp) continue
 
-		const baked = { ...result, js: rewriteBareImports(result.js) }
+		const baked = { ...result, js: rewriteImports(result.js, abs) }
 		const out = classified(baked, abs)
 		// A successful first request establishes the baseline. Failed compiles
 		// cannot replace the last working module used by open browser tabs.
@@ -710,6 +719,7 @@ async function bundleVendor(entrypoint) {
 			files,
 			target: 'browser',
 			format: 'esm',
+			metafile: true,
 			write: false,
 			minify: false,
 			sourcemap: 'none',
@@ -727,7 +737,7 @@ async function bundleVendor(entrypoint) {
 		if (!output) return { mtime, errors: ['Bun.build did not return a JavaScript output'] }
 
 		let code = await output.text()
-		if (externalizeImba) code = rewriteBareImports(code)
+		if (externalizeImba) code = rewriteImports(code)
 		const css = (await Promise.all(
 			result.outputs
 				.filter(output => output.path.endsWith('.css'))
@@ -743,7 +753,7 @@ async function bundleVendor(entrypoint) {
 				code,
 			].join('\n')
 		}
-		const bundled = { mtime, code }
+		const bundled = { mtime, code, inputs: Object.keys(result.metafile.inputs).map(input => path.resolve(input)) }
 		_vendorCache.set(entrypoint, bundled)
 		return bundled
 	} catch (error) {
@@ -751,43 +761,41 @@ async function bundleVendor(entrypoint) {
 	}
 }
 
-async function serveJavaScriptFile(filepath) {
-	const js = registerHotModule(rewriteBareImports(await Bun.file(filepath).text()), filepath)
-	return new Response(js, { headers: { 'Content-Type': 'application/javascript' } })
-}
 
 async function serveTypeScriptFile(filepath) {
 	const loader = filepath.endsWith('.tsx') ? 'tsx' : 'ts'
 	const transpiler = new Bun.Transpiler({ loader, target: 'browser' })
 	const source = await Bun.file(filepath).text()
-	const js = registerHotModule(rewriteBareImports(await transpiler.transform(source)), filepath)
+	const js = registerHotModule(rewriteImports(await transpiler.transform(source), filepath), filepath)
 	return new Response(js, { headers: { 'Content-Type': 'application/javascript' } })
 }
 
 // Rewrite production HTML for the dev server:
 // strips existing importmap + data-entrypoint script, then injects the Imba
 // entrypoint module + HMR client before </head>.
-function transformHtml(html, entrypoint) {
+function transformHtml(html, entrypoint, imports = {}) {
 	html = html.replace(/<script\s+type=["']importmap["'][^>]*>[\s\S]*?<\/script>/gi, '')
 	html = html.replace(/<script([^>]*)\bdata-entrypoint\b([^>]*)><\/script>/gi, '')
 
-	const entryUrl = '/' + entrypoint.replace(/^\.\//, '').replaceAll('\\', '/')
+	const entryUrl = fileUrl(entrypoint)
+	const importMap = Object.keys(imports).length ? `<script type="importmap">${JSON.stringify({ imports }).replaceAll('<', '\\u003c')}</script>\n` : ''
 
 	html = html.replace('</head>', () =>
-		`\t\t<script type='module' src='${entryUrl}'></script>\n${hmrClient}\n\t</head>`
+		`${importMap}\t\t<script type="module" src="${entryUrl}"></script>\n${hmrClient}\n\t</head>`
 	)
 	return html
 }
 
 // ─── Dev server ───────────────────────────────────────────────────────────────
 
-export function serve(entrypoint, flags) {
-	const port    = flags.port || 5200
+export function serve(entrypoint, flags = {}) {
+	const port    = flags.port ?? 5200
 	const htmlPath = findHtml(flags.html)
 	const htmlDir  = path.dirname(htmlPath)
-	const srcDir   = path.dirname(entrypoint)
+	const srcDir   = flags.watchRoot ?? path.dirname(entrypoint)
 	const sockets  = new Set()
 	const moduleUrls = new Map()
+	const bundledFiles = new Set()
 	const publishedCss = new Map()
 
 	function rememberModuleUrl(filepath, pathname) {
@@ -796,8 +804,25 @@ export function serve(entrypoint, flags) {
 		moduleUrls.get(absolute).add(pathname)
 	}
 
+
+	async function serveJavaScriptFile(filepath, moduleUrl) {
+		rememberModuleUrl(filepath, moduleUrl)
+		let source
+		if (filepath.endsWith('.cjs')) {
+			const bundled = await bundleVendor(path.resolve(filepath))
+			if (bundled.errors?.length) throw new Error(bundled.errors.join('\n'))
+			for (const input of bundled.inputs) {
+				rememberModuleUrl(input, moduleUrl)
+				bundledFiles.add(input)
+			}
+			source = bundled.code
+		} else source = await Bun.file(filepath).text()
+		const js = registerHotModule(rewriteImports(source, filepath), filepath)
+		return new Response(js, { headers: { 'Content-Type': 'application/javascript' } })
+	}
+
 	function modulePaths(filepath) {
-		return [...new Set(['/' + normalizeFile(filepath), ...(moduleUrls.get(path.resolve(filepath)) || [])])]
+		return [...new Set([fileUrl(normalizeFile(filepath)), ...(moduleUrls.get(path.resolve(filepath)) || [])])]
 	}
 
 	// ── Live status block (shows only the current compile state) ───────────────
@@ -937,7 +962,6 @@ export function serve(entrypoint, flags) {
 
 	function normalizeFile(file) {
 		let value = String(file || '')
-		value = value.split(/[?#]/)[0]
 		if (path.isAbsolute(value)) {
 			const rel = path.relative(process.cwd(), value)
 			if (!rel.startsWith('..')) value = rel
@@ -1260,7 +1284,8 @@ export function serve(entrypoint, flags) {
 
 	function scheduleCompile(filename) {
 		const file = watchedFile(filename)
-		if (!file || !/\.(?:imba|ts|tsx|js|mjs|css)$/.test(file.rel)) return
+		if (!file || !/\.(?:imba|ts|tsx|js|mjs|cjs|css)$/.test(file.rel)) return
+		_vendorCache.clear()
 
 		const version = (_watchVersion.get(file.rel) || 0) + 1
 		_watchVersion.set(file.rel, version)
@@ -1270,7 +1295,8 @@ export function serve(entrypoint, flags) {
 
 		_debounce.set(file.rel, setTimeout(() => {
 			_debounce.delete(file.rel)
-			if (file.rel.endsWith('.imba')) compileChangedFile(file, version)
+			if (bundledFiles.has(file.filepath)) reloadChangedFile(file, version)
+			else if (file.rel.endsWith('.imba')) compileChangedFile(file, version)
 			else if (file.rel.endsWith('.css')) updateCssFile(file, version)
 			else reloadChangedFile(file, version)
 		}, 150))
@@ -1348,20 +1374,24 @@ export function serve(entrypoint, flags) {
 		}
 	}
 
-	watch(srcDir, { recursive: true }, (_event, filename) => {
+	const watcher = watch(srcDir, { recursive: true }, (_event, filename) => {
 		scheduleCompile(filename)
 	})
 
 	// ── HTTP + WebSocket server ────────────────────────────────────────────────
 
-	bunServe({
+	const server = bunServe({
 		port,
+		hostname: flags.hostname,
 		development: true,
 
 		fetch: async (req, server) => {
 			const url = new URL(req.url)
-			const pathname = url.pathname
+			let pathname = url.pathname
 			try {
+			const response = await flags.fetch?.(req, server)
+			if (response != null) return response
+			if (!pathname.startsWith('/__bimba_vendor__/')) pathname = decodeURIComponent(pathname)
 
 			// WebSocket upgrade for HMR
 			if (pathname === '/__hmr__') {
@@ -1387,8 +1417,8 @@ export function serve(entrypoint, flags) {
 				try {
 					let html = await Bun.file(htmlFile).text()
 					await markSuccess(file)
-					return new Response(transformHtml(html, entrypoint), {
-						headers: { 'Content-Type': 'text/html' },
+					return new Response(transformHtml(html, entrypoint, flags.imports), {
+						headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' },
 					})
 				} catch (error) {
 					if (isMissingFileError(error)) {
@@ -1402,7 +1432,7 @@ export function serve(entrypoint, flags) {
 			// Imba files: compile on demand and serve as JS
 			if (pathname.endsWith('.imba')) {
 				const filepath = '.' + pathname
-				rememberModuleUrl(filepath, pathname)
+				rememberModuleUrl(filepath, url.pathname)
 				const file = normalizeFile(pathname)
 				try {
 					const out = await compileFile(filepath)
@@ -1443,7 +1473,7 @@ export function serve(entrypoint, flags) {
 							return new Response(css, { headers: { 'Content-Type': 'text/css' } })
 						}
 
-						const id = JSON.stringify(pathname)
+						const id = JSON.stringify(url.pathname)
 						const js = [
 							`const id = ${id};`,
 							`let el = document.querySelector('style[data-bimba-css=' + JSON.stringify(id) + ']');`,
@@ -1462,13 +1492,12 @@ export function serve(entrypoint, flags) {
 				}
 			}
 
-			if (!pathname.startsWith('/node_modules/') && (pathname.endsWith('.js') || pathname.endsWith('.mjs'))) {
+			if (!pathname.startsWith('/node_modules/') && /\.(?:js|mjs|cjs)$/.test(pathname)) {
 				const jsFile = resolveFileCandidate(path.join(htmlDir, pathname)) || resolveFileCandidate('.' + pathname)
 				if (jsFile) {
-					rememberModuleUrl(jsFile, pathname)
 					const file = 'js:' + normalizeFile(jsFile)
 					try {
-						const response = await serveJavaScriptFile(jsFile)
+						const response = await serveJavaScriptFile(jsFile, url.pathname)
 						await markSuccess(file)
 						return response
 					} catch (error) {
@@ -1486,7 +1515,7 @@ export function serve(entrypoint, flags) {
 			if (!pathname.startsWith('/node_modules/') && (pathname.endsWith('.ts') || pathname.endsWith('.tsx'))) {
 				const tsFile = resolveFileCandidate(path.join(htmlDir, pathname)) || resolveFileCandidate('.' + pathname)
 				if (tsFile) {
-					rememberModuleUrl(tsFile, pathname)
+					rememberModuleUrl(tsFile, url.pathname)
 					const file = 'ts:' + normalizeFile(tsFile)
 					try {
 						const response = await serveTypeScriptFile(tsFile)
@@ -1508,7 +1537,7 @@ export function serve(entrypoint, flags) {
 			if (pathname.startsWith('/node_modules/')) {
 				const resolved = resolveFileCandidate('.' + pathname)
 				if (resolved?.endsWith('.imba')) {
-					rememberModuleUrl(resolved, pathname)
+					rememberModuleUrl(resolved, url.pathname)
 					const out = await compileFile(resolved)
 					const file = normalizeFile(resolved)
 					if (out.missing) {
@@ -1570,7 +1599,7 @@ export function serve(entrypoint, flags) {
 					await markSuccess(file)
 					return new Response(out.js, { headers: { 'Content-Type': 'application/javascript' } })
 				}
-				for (const ext of ['.ts', '.tsx', '.js', '.mjs']) {
+				for (const ext of ['.ts', '.tsx', '.js', '.mjs', '.cjs']) {
 					const withExt = '.' + pathname + ext
 					if (existsSync(withExt)) {
 						rememberModuleUrl(withExt, pathname)
@@ -1579,7 +1608,7 @@ export function serve(entrypoint, flags) {
 						try {
 							const response = typed
 								? await serveTypeScriptFile(withExt)
-								: await serveJavaScriptFile(withExt)
+								: await serveJavaScriptFile(withExt, url.pathname)
 							await markSuccess(file)
 							return response
 						} catch (error) {
@@ -1599,8 +1628,8 @@ export function serve(entrypoint, flags) {
 				try {
 					let html = await Bun.file(htmlPath).text()
 					await markSuccess(file)
-					return new Response(transformHtml(html, entrypoint), {
-						headers: { 'Content-Type': 'text/html' },
+					return new Response(transformHtml(html, entrypoint, flags.imports), {
+						headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' },
 					})
 				} catch (error) {
 					if (isMissingFileError(error)) {
@@ -1629,7 +1658,16 @@ export function serve(entrypoint, flags) {
 		},
 	})
 
+	const stop = server.stop.bind(server)
+	server.stop = closeActiveConnections => {
+		watcher.close()
+		for (const timer of _debounce.values()) clearTimeout(timer)
+		_debounce.clear()
+		clearTimeout(_statusTimer)
+		return stop(closeActiveConnections)
+	}
 	console.log(theme.folder('──────────────────────────────────────────────────────────────────────'))
-	console.log(theme.start('Dev server running at ') + theme.success(`http://localhost:${port}`))
+	console.log(theme.start('Dev server running at ') + theme.success(server.url.toString()))
 	console.log(theme.folder('──────────────────────────────────────────────────────────────────────'))
+	return server
 }
