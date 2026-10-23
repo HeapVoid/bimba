@@ -12,6 +12,11 @@ function fileUrl(filepath) {
 	return '/' + filepath.replaceAll('\\', '/').replace(/^(?:\.\/|\/)+/, '').split('/').map(encodeURIComponent).join('/')
 }
 
+function within(directory, target) {
+	const local = path.relative(directory, target)
+	return local !== '..' && !local.startsWith('..' + path.sep) && !path.isAbsolute(local)
+}
+
 const sourceExtensions = new Set(['.imba', '.js', '.jsx', '.mjs', '.cjs', '.ts', '.tsx'])
 function resourceType(filepath) {
 	const extension = path.extname(filepath).toLowerCase()
@@ -23,30 +28,39 @@ function resourceType(filepath) {
 // relative to the actual CSS file. Both vendor and local imports use this owner.
 class Resources {
 	roots = new Map()
+	mount(filepath, directory) {
+		directory = realpathSync(directory)
+		const absolute = realpathSync(filepath)
+		if (!statSync(absolute).isFile()) throw new Error('Module must be a file')
+		const local = path.relative(directory, absolute)
+		if (!within(directory, absolute)) throw new Error('Module must belong to its source root')
+		const key = Buffer.from(directory).toString('base64url')
+		this.roots.set(key, directory)
+		return '/__bimba_files__/' + key + fileUrl(local)
+	}
 	url(filepath) {
 		const absolute = path.resolve(filepath)
 		const local = path.relative(process.cwd(), absolute)
-		if (local !== '..' && !local.startsWith('..' + path.sep) && !path.isAbsolute(local)) return fileUrl(local)
+		if (within(process.cwd(), absolute)) return fileUrl(local)
 		// Bun can resolve a symlinked dependency outside the checkout. Mount its
 		// package root so native CSS keeps working relative URLs within that package.
 		const folder = path.dirname(absolute)
 		let directory = folder
 		while (!existsSync(path.join(directory, 'package.json')) && path.dirname(directory) !== directory) directory = path.dirname(directory)
 		if (!existsSync(path.join(directory, 'package.json'))) directory = folder
-		const key = Buffer.from(directory).toString('base64url')
-		this.roots.set(key, directory)
-		return '/__bimba_files__/' + key + fileUrl(path.relative(directory, absolute))
+		return this.mount(absolute, directory)
 	}
 	resolve(pathname) {
 		const [, , key, ...parts] = pathname.split('/')
 		const directory = pathname.startsWith('/__bimba_files__/') && this.roots.get(key)
 		if (!directory) return null
-		const target = path.resolve(directory, ...parts)
-		const local = path.relative(directory, target)
-		return local !== '..' && !local.startsWith('..' + path.sep) && !path.isAbsolute(local) ? resolveFileCandidate(target) : null
+		const target = resolveFileCandidate(path.resolve(directory, ...parts))
+		if (!target) return null
+		const real = realpathSync(target)
+		return within(directory, real) ? real : null
 	}
-	module(filepath) {
-		const url = JSON.stringify(this.url(filepath))
+	module(filepath, address = this.url(filepath)) {
+		const url = JSON.stringify(address)
 		if (resourceType(filepath) !== 'css') return `export default ${url};`
 		return [
 			`const href = ${url};`,
@@ -635,7 +649,7 @@ function rewriteImports(js, filepath) {
 
 	for (const specifier of new Set(imports.map(item => item.path))) {
 		let target
-		if (isBareSpecifier(specifier)) target = vendorUrl(specifier)
+		if (isBareSpecifier(specifier)) target = vendorUrl(specifier, filepath)
 		else if (filepath && specifier.startsWith('.') && existsSync(path.resolve(path.dirname(filepath), specifier))) {
 			target = specifier.split('/').map(encodeURIComponent).join('/') + (resourceType(specifier) ? '?import' : '')
 		} else continue
@@ -727,8 +741,10 @@ function shouldExternalizeImbaForVendor(entrypoint) {
 	return entrypoint !== 'imba' && !entrypoint.startsWith('imba/')
 }
 
-function vendorUrl(specifier) {
-	return '/__bimba_vendor__/' + encodeURIComponent(specifier)
+function vendorUrl(specifier, filepath) {
+	const directory = filepath && path.dirname(path.resolve(filepath))
+	const context = directory && shouldExternalizeImbaForVendor(specifier) ? '?dir=' + encodeURIComponent(directory) : ''
+	return '/__bimba_vendor__/' + encodeURIComponent(specifier) + context
 }
 
 function resolveFileCandidate(filepath) {
@@ -768,17 +784,18 @@ function vendorSpecifierFromPath(pathname) {
 	return specifier || null
 }
 
-async function bundleVendor(entrypoint) {
+async function bundleVendor(entrypoint, directory = process.cwd()) {
+	const key = directory + '\0' + entrypoint
 	try {
 		const stat = path.isAbsolute(entrypoint) && existsSync(entrypoint) ? statSync(entrypoint) : null
 		const mtime = stat?.mtimeMs || 0
-		const cached = _vendorCache.get(entrypoint)
+		const cached = _vendorCache.get(key)
 		if (cached && cached.mtime === mtime) return cached
 
 		// Bun resolves the virtual wrapper from the project and owns package
 		// exports/browser/CommonJS handling without a generated file on disk.
 		const buildEntrypoint = path.isAbsolute(entrypoint) ? entrypoint
-			: path.join(process.cwd(), 'node_modules', '.cache', 'bimba', 'vendor-entry', encodeURIComponent(entrypoint) + '.js')
+			: path.join(directory, 'node_modules', '.cache', 'bimba', 'vendor-entry', encodeURIComponent(entrypoint) + '.js')
 		const specifier = JSON.stringify(entrypoint)
 		const files = path.isAbsolute(entrypoint) ? {} : {
 			[buildEntrypoint]: `export * from ${specifier};\nimport * as mod from ${specifier};\nexport default (mod.default ?? mod);\n`,
@@ -809,7 +826,7 @@ async function bundleVendor(entrypoint) {
 		let code = await output.text()
 		if (externalizeImba) code = rewriteImports(code)
 		const bundled = { mtime, code, inputs: Object.keys(result.metafile.inputs).map(input => path.resolve(input)) }
-		_vendorCache.set(entrypoint, bundled)
+		_vendorCache.set(key, bundled)
 		return bundled
 	} catch (error) {
 		return { mtime: 0, errors: [error?.message || String(error)] }
@@ -852,6 +869,8 @@ export function serve(entrypoint, flags = {}) {
 	const moduleUrls = new Map()
 	const bundledFiles = new Set()
 	const publishedCss = new Map()
+	const sources = new Resources()
+	const sourceWatchers = new Map()
 
 	function rememberModuleUrl(filepath, pathname) {
 		const absolute = path.resolve(filepath)
@@ -1456,7 +1475,9 @@ export function serve(entrypoint, flags = {}) {
 			if (pathname.startsWith('/__bimba_vendor__/')) {
 				const specifier = vendorSpecifierFromPath(pathname)
 				const file = 'vendor:' + (specifier || pathname)
-				const bundled = specifier ? await bundleVendor(specifier) : null
+				const directory = url.searchParams.get('dir') || process.cwd()
+				if (!within(process.cwd(), directory) && ![...sources.roots.values()].some(root => within(root, directory))) return new Response('Not Found', {status:404})
+				const bundled = specifier ? await bundleVendor(specifier, directory) : null
 				if (bundled?.code) {
 					await markSuccess(file)
 					return new Response(bundled.code, { headers: { 'Content-Type': 'application/javascript' } })
@@ -1465,10 +1486,15 @@ export function serve(entrypoint, flags = {}) {
 				return errorResponse(file, bundled?.errors || [`Could not bundle vendor module: ${specifier}`])
 			}
 
-			const resource = resourceType(pathname)
+			const mounted = pathname.startsWith('/__bimba_files__/')
+			const sourceFile = mounted ? sources.resolve(pathname) || resources.resolve(pathname) : null
+			if (mounted && !sourceFile) return new Response('Not Found', {status:404})
+			const localFile = () => sourceFile || resolveFileCandidate(path.join(htmlDir, pathname)) || resolveFileCandidate('.' + pathname)
+			const sourcePath = sourceFile || pathname
+			const resource = resourceType(sourcePath)
 			const moduleRequest = url.searchParams.has('import') || req.headers.get('sec-fetch-dest') === 'script'
-			if (resource && (moduleRequest || !pathname.endsWith('.html'))) {
-				const filepath = resources.resolve(pathname) || resolveFileCandidate(path.join(htmlDir, pathname)) || resolveFileCandidate('.' + pathname)
+			if (resource && (moduleRequest || !sourcePath.endsWith('.html'))) {
+				const filepath = localFile()
 				const file = (resource === 'css' ? 'css:' : 'static:') + normalizeFile(filepath || pathname)
 				if (!filepath) return new Response('Not Found', {status:404})
 				try {
@@ -1476,7 +1502,7 @@ export function serve(entrypoint, flags = {}) {
 					if (resource === 'css' && !publishedCss.has(path.resolve(filepath))) publishedCss.set(path.resolve(filepath), await Bun.file(filepath).text())
 					const response = !moduleRequest ? new Response(Bun.file(filepath), {headers:{'Cache-Control':'no-store'}})
 						: resource === 'json' ? await serveJavaScriptFile(filepath, url.pathname)
-						: new Response(resources.module(filepath), {headers:{'Content-Type':'application/javascript'}})
+						: new Response(resources.module(filepath, mounted ? url.pathname : resources.url(filepath)), {headers:{'Content-Type':'application/javascript'}})
 					await markSuccess(file)
 					return response
 				} catch (error) {
@@ -1489,8 +1515,8 @@ export function serve(entrypoint, flags = {}) {
 			}
 
 			// HTML: index or any .html file
-			if (pathname === '/' || pathname.endsWith('.html')) {
-				const htmlFile = pathname === '/' ? htmlPath : '.' + pathname
+			if (pathname === '/' || sourcePath.endsWith('.html')) {
+				const htmlFile = sourceFile || (pathname === '/' ? htmlPath : '.' + pathname)
 				const file = 'html:' + normalizeFile(htmlFile)
 				try {
 					let html = await Bun.file(htmlFile).text()
@@ -1508,8 +1534,8 @@ export function serve(entrypoint, flags = {}) {
 			}
 
 			// Imba files: compile on demand and serve as JS
-			if (pathname.endsWith('.imba')) {
-				const filepath = '.' + pathname
+			if (sourcePath.endsWith('.imba')) {
+				const filepath = sourceFile || '.' + pathname
 				rememberModuleUrl(filepath, url.pathname)
 				const file = normalizeFile(pathname)
 				try {
@@ -1533,8 +1559,8 @@ export function serve(entrypoint, flags = {}) {
 				}
 			}
 
-			if (!pathname.startsWith('/node_modules/') && /\.(?:js|mjs|cjs)$/.test(pathname)) {
-				const jsFile = resolveFileCandidate(path.join(htmlDir, pathname)) || resolveFileCandidate('.' + pathname)
+			if (!pathname.startsWith('/node_modules/') && /\.(?:js|mjs|cjs)$/.test(sourcePath)) {
+				const jsFile = localFile()
 				if (jsFile) {
 					const file = 'js:' + normalizeFile(jsFile)
 					try {
@@ -1553,8 +1579,8 @@ export function serve(entrypoint, flags = {}) {
 
 			// Local TypeScript modules: strip types and preserve ESM imports so
 			// .imba files can import typed data/configuration during development.
-			if (!pathname.startsWith('/node_modules/') && (pathname.endsWith('.ts') || pathname.endsWith('.tsx'))) {
-				const tsFile = resolveFileCandidate(path.join(htmlDir, pathname)) || resolveFileCandidate('.' + pathname)
+			if (!pathname.startsWith('/node_modules/') && (sourcePath.endsWith('.ts') || sourcePath.endsWith('.tsx'))) {
+				const tsFile = localFile()
 				if (tsFile) {
 					rememberModuleUrl(tsFile, url.pathname)
 					const file = 'ts:' + normalizeFile(tsFile)
@@ -1602,6 +1628,8 @@ export function serve(entrypoint, flags = {}) {
 					return errorResponse(file, bundled?.errors || [`Could not bundle ${pathname}`])
 				}
 			}
+
+			if (mounted) return new Response('Not Found', {status:404})
 
 			// Static files: check htmlDir first (for assets relative to HTML), then root
 			try {
@@ -1699,9 +1727,23 @@ export function serve(entrypoint, flags = {}) {
 		},
 	})
 
+	server.moduleUrl = (filepath, root = process.cwd()) => {
+		const address = sources.mount(filepath, root)
+		const directory = realpathSync(root)
+		if (!within(srcRoot, directory) && !sourceWatchers.has(directory)) {
+			sourceWatchers.set(directory, watch(directory, {recursive:true}, (_event, filename) => {
+				if (filename) scheduleCompile(path.resolve(directory, String(filename)))
+			}))
+		}
+		return address
+	}
+
 	const stop = server.stop.bind(server)
 	server.stop = closeActiveConnections => {
 		watcher.close()
+		for (const watcher of sourceWatchers.values()) watcher.close()
+		sourceWatchers.clear()
+		sources.roots.clear()
 		for (const timer of _debounce.values()) clearTimeout(timer)
 		_debounce.clear()
 		clearTimeout(_statusTimer)

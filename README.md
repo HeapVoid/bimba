@@ -153,7 +153,7 @@ console.log(server.url);
 `serve(entrypoint, options = {})` returns the `Bun.Server`. `port` defaults to
 5200; zero asks Bun for a free port. `hostname` is passed to Bun. `html` retains
 the CLI's automatic discovery when omitted. Filesystem paths and HTTP module
-paths are relative to the process working directory.
+paths are relative to the process working directory unless registered below.
 
 `watchRoot` selects the recursively watched source directory; its default is the
 entrypoint directory. Include any local dependencies that should update in this
@@ -162,6 +162,30 @@ server)` may return a `Response` or a Promise; null/undefined delegates to Bimba
 The host owns its API and project configuration. Bimba owns module compilation,
 vendor conversion, WebSocket updates and frontend watching. `server.stop()` also
 closes Bimba's watcher and cancels pending frontend updates.
+
+### Modules from another source root
+
+`server.moduleUrl(filepath, root = process.cwd())` registers a local source root
+and returns a stable, encoded browser URL for an existing file inside it. Hosts
+can use the returned URLs in generated modules or import maps, including when
+multiple projects contain the same relative filenames. Paths are resolved through
+realpath; a file outside the declared root, including a symlink escape, is rejected.
+Only roots registered on that server can be requested through these source URLs.
+
+```js
+const url = server.moduleUrl('/work/project/examples/plugin.ts', '/work/project');
+// In a generated browser module:
+const source = `export {default} from ${JSON.stringify(url)};`;
+```
+
+Mounted files use the normal Imba, JS/CommonJS, TypeScript and resource loaders.
+Relative imports and CSS URLs stay within their registered root; npm imports use
+the source project's browser exports, while Imba uses the host's shared runtime.
+Registered roots are watched recursively, with the same HMR messages and module
+URLs as local sources. Registration is idempotent; `server.stop()` closes all
+additional watchers and clears source registrations. Hosts own which roots to
+expose and which modules to list. This API carries no project configuration or
+application-specific preview behavior.
 
 ### Resource imports
 
