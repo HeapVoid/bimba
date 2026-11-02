@@ -392,7 +392,8 @@ The TypeScript session timeout defaults to 120 seconds to accommodate larger pro
 TypeScript checks and their resident daemon use the same Bun executable that
 runs Bimba, including the project's pinned Bun version. Node.js is not required
 for these processes. Set `BIMBA_NODE=/absolute/path/to/node` to explicitly use
-Node.js for TypeScript instead; the existing `NODE` override is also supported.
+Node.js for TypeScript instead. The generic `NODE` environment variable injected
+by package-script launchers is ignored; only `BIMBA_NODE` selects an override.
 The selected TypeScript runtime applies to both one-shot and resident checks
 and is part of the warm server's identity, so different runtimes never share a
 type graph. The supervising daemon always uses Bimba's own Bun executable.

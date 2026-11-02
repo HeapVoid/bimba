@@ -11,7 +11,7 @@ const daemonPath = fileURLToPath(new URL('./typecheck-daemon.js', import.meta.ur
 const packagePath = fileURLToPath(new URL('./package.json', import.meta.url));
 
 export function typecheckRuntime() {
-    return process.env.BIMBA_NODE || process.env.NODE || process.execPath;
+    return process.env.BIMBA_NODE || process.execPath;
 }
 
 function connect(socketPath) {

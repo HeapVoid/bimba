@@ -62,6 +62,14 @@ describe('Imba TypeScript diagnostics', () => {
 		expect(result.code).toBe(1)
 		expect(result.output).toContain('TS2551')
 	}, 15000)
+
+	test('ignores a generic NODE inherited from package-script launchers', async () => {
+		const cwd = await fixture()
+		await Bun.write(join(cwd, 'src/probe.imba'), 'const value = 42\nvalue.toFixed!\n')
+		const result = await check(cwd, { BIMBA_NODE: '', NODE: '/usr/bin/false' })
+		expect(result.code).toBe(0)
+		expect(result.output).toContain('No Imba TypeScript diagnostics')
+	}, 15000)
 	test('batch opening checks every selected file and preserves separate project configuration', async () => {
 		const cwd = await fixture()
 		for (let index = 0; index < 64; index++) await Bun.write(join(cwd, `src/file-${index}.imba`), `export const value${index} = 42\n`)
