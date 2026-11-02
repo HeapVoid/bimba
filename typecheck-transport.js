@@ -10,6 +10,10 @@ import { fileURLToPath } from 'node:url';
 const daemonPath = fileURLToPath(new URL('./typecheck-daemon.js', import.meta.url));
 const packagePath = fileURLToPath(new URL('./package.json', import.meta.url));
 
+export function typecheckRuntime() {
+    return process.env.BIMBA_NODE || process.env.NODE || process.execPath;
+}
+
 function connect(socketPath) {
     return new Promise((resolve, reject) => {
         const socket = net.createConnection(socketPath);
@@ -72,7 +76,7 @@ export async function launchDevTypecheckServer(args) {
     try { fs.unlinkSync(socketPath); } catch (error) {
         if (error.code !== 'ENOENT') throw error;
     }
-    const child = spawn('node', [
+    const child = spawn(process.execPath, [
         daemonPath, socketPath, args.tsserver, args.pluginProbe, args.runner, args.cwd, String(process.pid),
     ], { cwd: args.cwd, stdio: 'ignore' });
     process.once('exit', () => child.kill());

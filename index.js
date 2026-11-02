@@ -5,6 +5,7 @@ import { imbaPlugin, createImbaPlugin, stats, cache, setTarget } from './plugin.
 import { IMBA_RUNTIME_DEFINES, theme } from './utils.js';
 import fs from 'fs'
 import path from 'path';
+import { pathToFileURL } from 'node:url';
 import { rmSync } from "node:fs";
 import { serve } from './serve.js';
 import { checkImbaTypes, collectImbaFiles, startDevTypecheckServer } from './typecheck.js';
@@ -33,6 +34,7 @@ try {
             serve: { type: 'boolean' },
             port: { type: 'string' },
             html: { type: 'string' },
+            'spa-fallback': { type: 'string' },
             typecheck: { type: 'boolean' },
             tscheck: { type: 'boolean' },
             check: { type: 'boolean' },
@@ -101,6 +103,7 @@ if(flags.help) {
     console.log("   "+theme.flags('--serve')+"                               Start dev server with Hot Module Replacement");
     console.log("   "+theme.flags('--port <number>')+"                       Port for the dev server (default: 5200)");
     console.log("   "+theme.flags('--html <path>')+"                         Custom HTML file path (auto-detected if omitted)");
+    console.log("   "+theme.flags('--spa-fallback <module>')+"               Module exporting a synchronous SPA path predicate");
     console.log("");
     process.exit(0);
 }
@@ -166,7 +169,9 @@ else if (flags.serve) {
         process.exit(1);
     }
     ensureBunfigPreload();
-    serve(entrypoint, { port: parseInt(flags.port) || 5200, html: flags.html });
+    const fallback = flags['spa-fallback'] ? (await import(pathToFileURL(path.resolve(flags['spa-fallback'])).href)).default : null;
+    if (flags['spa-fallback'] && typeof fallback !== 'function') throw new Error('SPA fallback module must export a function');
+    serve(entrypoint, { port: parseInt(flags.port) || 5200, html: flags.html, fallback });
     (frontendProject ? startFrontendDevelopment(entrypoint) : startDevTypecheckServer(entrypoint)).catch(error => {
         console.error(`TypeScript server unavailable: ${error.message}`);
     });

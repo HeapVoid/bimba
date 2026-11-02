@@ -4,7 +4,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { performance } from 'node:perf_hooks';
-import { connectTypecheckServer, launchDevTypecheckServer } from './typecheck-transport.js';
+import { connectTypecheckServer, launchDevTypecheckServer, typecheckRuntime } from './typecheck-transport.js';
 import { theme } from './utils.js';
 import { CompilerCache } from './compile-cache.js';
 
@@ -152,7 +152,7 @@ export async function startDevTypecheckServer(entrypoint, options = {}) {
     const cwd = options.cwd || process.cwd();
     const tsserver = findTypeScript(cwd);
     const pluginProbe = findPluginProbe(cwd);
-    const runner = process.env.BIMBA_NODE || process.env.NODE || 'node';
+    const runner = typecheckRuntime();
     await launchDevTypecheckServer({ cwd, tsserver, pluginProbe, runner });
     await checkImbaTypes(entrypoint, { cwd });
     console.log(theme.success('TypeScript server ready for checks'));
@@ -178,7 +178,7 @@ export async function checkImbaTypes(entrypoint, options = {}) {
 
     const tsserver = findTypeScript(cwd);
     const pluginProbe = findPluginProbe(cwd);
-    const runner = process.env.BIMBA_NODE || process.env.NODE || 'node';
+    const runner = typecheckRuntime();
     mark('resolve toolchain');
 
     console.log(theme.folder('──────────────────────────────────────────────────────────────────────'));

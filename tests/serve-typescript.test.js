@@ -16,6 +16,37 @@ afterEach(async () => {
 })
 
 describe('dev server TypeScript modules', () => {
+	test('uses explicit SPA routes with dots while preserving modules and missing-file responses', async () => {
+		const fixture = await mkdtemp(join(tmpdir(), 'bimba-spa-'))
+		fixtures.push(fixture)
+		await mkdir(join(fixture, 'src'))
+		await Bun.write(join(fixture, 'index.html'), '<!doctype html><title>SPA fixture</title>')
+		await Bun.write(join(fixture, 'src/app.imba'), 'console.log 42\n')
+		await Bun.write(join(fixture, 'src/config.ts'), 'export const value = 42\n')
+		await Bun.write(join(fixture, 'routes.mjs'), "export default path => path.startsWith('/profile/');\n")
+		const probe = Bun.serve({port:0, fetch:() => new Response('')})
+		const port = probe.port
+		probe.stop(true)
+		const server = Bun.spawn([
+			process.execPath, join(root, 'index.js'), 'src/app.imba', '--serve', '--port', String(port),
+			'--html', 'index.html', '--spa-fallback', 'routes.mjs',
+		], {cwd:fixture, env:{...process.env, BIMBA_NO_TYPECHECK_DAEMON:'1'}, stdout:'ignore', stderr:'ignore'})
+		servers.push(server)
+		await ready(port)
+		for (const path of ['/profile/user.name', '/profile/user.json', '/profile/username']) {
+			const response = await fetch(`http://localhost:${port}${path}`)
+			expect(response.status).toBe(200)
+			expect(response.headers.get('content-type')).toContain('text/html')
+			expect(await response.text()).toContain('SPA fixture')
+		}
+		for (const path of ['/missing.js', '/not-a-route', '/__bimba_files__/unknown']) {
+			expect((await fetch(`http://localhost:${port}${path}`)).status).toBe(404)
+		}
+		const module = await fetch(`http://localhost:${port}/src/config.ts`)
+		expect(module.headers.get('content-type')).toContain('javascript')
+		expect(await module.text()).toContain('export const value = 42')
+	})
+
 	test('transpiles direct and extensionless imports, then reloads on change', async () => {
 		const fixture = await mkdtemp(join(tmpdir(), 'bimba-typescript-'))
 		fixtures.push(fixture)

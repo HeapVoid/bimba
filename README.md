@@ -119,6 +119,12 @@ For a deep dive into how Imba compiles tags, how the render cache works, and how
 
 `--html <path>` — path to your HTML file (auto-detected from `./index.html`, `./public/index.html`, `./src/index.html` if omitted)
 
+`--spa-fallback <module>` — module exporting a synchronous `(pathname) => boolean`
+predicate for application routes. Matching routes receive the entry HTML,
+including names containing dots; unmatched missing paths return 404. Source
+modules and mounted resources retain their normal handlers. Embedded servers
+can supply the same predicate as `serve(entrypoint, {fallback})`.
+
 Static files are resolved relative to the HTML file's directory first, then from the project root (for `node_modules`, `src`, etc.). Extensionless imports are resolved by trying `.imba`, `.ts`, `.tsx`, `.js`, and `.mjs` extensions automatically.
 
 **npm package resolution:** The dev server scans each served JS module and rewrites bare imports such as `imba/runtime`, `@scope/pkg`, and `pkg/subpath` to `__bimba_vendor__/*` URLs. Those vendor URLs are bundled on demand with Bun (`target: "browser"`). Package wrappers use Bun's native in-memory `files` option, so serving packages does not create generated JS files in `node_modules`. Imba source files still compile separately for HMR, while Bun owns dependency resolution, `exports`, `browser` fields, nested `node_modules`, and CommonJS interop.
@@ -382,6 +388,14 @@ This mode requires `typescript` and `imba` in the project, and `typescript-imba-
 The project Imba compiler checks syntax before TypeScript diagnostics. The CLI registers `.imba` before loading projects, waits for project initialization, and reports configuration errors and unexpected server exits directly. A successful result requires syntax, semantic, and suggestion diagnostic responses for every scanned file. If a project refresh interrupts a diagnostic batch, the CLI checks the remaining files within the same timeout. Run `bun test tests/typecheck.test.js` for the real compiler/tsserver regressions.
 
 The TypeScript session timeout defaults to 120 seconds to accommodate larger projects. Set `BIMBA_TYPECHECK_TIMEOUT` (milliseconds) to override it.
+
+TypeScript checks and their resident daemon use the same Bun executable that
+runs Bimba, including the project's pinned Bun version. Node.js is not required
+for these processes. Set `BIMBA_NODE=/absolute/path/to/node` to explicitly use
+Node.js for TypeScript instead; the existing `NODE` override is also supported.
+The selected TypeScript runtime applies to both one-shot and resident checks
+and is part of the warm server's identity, so different runtimes never share a
+type graph. The supervising daemon always uses Bimba's own Bun executable.
 
 When `bimba --serve` is running, Bimba starts and warms a project TypeScript server alongside the dev server. File, directory, and full-project checks reuse its type graph. Bimba synchronizes changed Imba sources before requesting diagnostics and stops the TypeScript server when the dev server exits. Without a dev server, checks use a fresh TypeScript session. Checks in CI always use a fresh session. Set `BIMBA_NO_TYPECHECK_DAEMON=1` to force a fresh session while the dev server is running. Set `BIMBA_PROFILE_TYPECHECK=1` to print timings for each phase. The resident TypeScript server holds the project type graph in memory while the dev server is running.
 

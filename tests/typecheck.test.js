@@ -32,7 +32,36 @@ async function check(cwd, env = {}, paths = ['src']) {
 	return { code, output: (out + err).replace(/\x1b\[[0-9;]*m/g, '') }
 }
 
+async function withoutNode(cwd) {
+	const bin = join(cwd, 'bin')
+	await mkdir(bin)
+	await Bun.write(join(bin, 'node'), '#!/bin/sh\necho "Unexpected Node executable" >&2\nexit 97\n')
+	await chmod(join(bin, 'node'), 0o755)
+	return { BIMBA_NODE: '', NODE: '', PATH: `${bin}:${process.env.PATH}` }
+}
+
 describe('Imba TypeScript diagnostics', () => {
+
+	test('checks Imba types with Bun when Node is unavailable', async () => {
+		const cwd = await fixture()
+		const env = await withoutNode(cwd)
+		const source = join(cwd, 'src/probe.imba')
+		await Bun.write(source, "const value = 'wrong type'\nvalue.toFixed!\n")
+		const invalid = await check(cwd, env)
+		expect(invalid.code).toBe(1)
+		expect(invalid.output).toContain('TS2551')
+		expect(invalid.output).not.toContain('Unexpected Node executable')
+		await Bun.write(source, 'const value = 42\nvalue.toFixed!\n')
+		expect((await check(cwd, env)).code).toBe(0)
+	}, 15000)
+
+	test('preserves an explicit Node runtime override', async () => {
+		const cwd = await fixture()
+		await Bun.write(join(cwd, 'src/probe.imba'), "const value = 'wrong type'\nvalue.toFixed!\n")
+		const result = await check(cwd, { BIMBA_NODE: Bun.which('node') })
+		expect(result.code).toBe(1)
+		expect(result.output).toContain('TS2551')
+	}, 15000)
 	test('batch opening checks every selected file and preserves separate project configuration', async () => {
 		const cwd = await fixture()
 		for (let index = 0; index < 64; index++) await Bun.write(join(cwd, `src/file-${index}.imba`), `export const value${index} = 42\n`)
@@ -56,7 +85,7 @@ describe('Imba TypeScript diagnostics', () => {
 	test('reuses a warm project and reads changed source from disk', async () => {
 		const cwd = await fixture()
 		const source = join(cwd, 'src/probe.imba')
-		const fast = { BIMBA_NO_TYPECHECK_DAEMON: '', CI: '', BIMBA_PROFILE_TYPECHECK: '1' }
+		const fast = { ...await withoutNode(cwd), BIMBA_NO_TYPECHECK_DAEMON: '', CI: '', BIMBA_PROFILE_TYPECHECK: '1' }
 		await Bun.write(source, 'const value = 42\nvalue.toFixed!\n')
 		await Bun.write(join(cwd, 'index.html'), '<!doctype html><html><head></head><body></body></html>')
 		await Bun.write(join(cwd, 'bunfig.toml'), '# Test fixture uses the Imba compiler directly.\n')

@@ -873,6 +873,23 @@ export function serve(entrypoint, flags = {}) {
 	const sources = new Resources()
 	const watchers = new Map()
 
+	async function serveHtml(filepath) {
+		const file = 'html:' + normalizeFile(filepath)
+		try {
+			const html = await Bun.file(filepath).text()
+			await markSuccess(file)
+			return new Response(transformHtml(html, entrypoint, flags.imports), {
+				headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' },
+			})
+		} catch (error) {
+			if (isMissingFileError(error)) {
+				clearError(file)
+				return new Response('Not Found', {status:404})
+			}
+			return errorResponse(file, [error])
+		}
+	}
+
 	function rememberModuleUrl(filepath, pathname) {
 		const absolute = path.resolve(filepath)
 		if (!moduleUrls.has(absolute)) moduleUrls.set(absolute, new Set())
@@ -1506,9 +1523,12 @@ export function serve(entrypoint, flags = {}) {
 			if (mounted && !sourceFile) return new Response('Not Found', {status:404})
 			const localFile = () => sourceFile || resolveFileCandidate(path.join(htmlDir, pathname)) || resolveFileCandidate('.' + pathname)
 			const sourcePath = sourceFile || pathname
+			const lastSegment = pathname.split('/').pop()
+			const fallback = !mounted && (flags.fallback ? flags.fallback(pathname) : !lastSegment.includes('.'))
+			const documentRoute = fallback && lastSegment.includes('.')
 			const resource = resourceType(sourcePath)
 			const moduleRequest = url.searchParams.has('import') || req.headers.get('sec-fetch-dest') === 'script'
-			if (resource && (moduleRequest || !sourcePath.endsWith('.html'))) {
+			if (resource && !documentRoute && (moduleRequest || !sourcePath.endsWith('.html'))) {
 				const filepath = localFile()
 				const file = (resource === 'css' ? 'css:' : 'static:') + normalizeFile(filepath || pathname)
 				if (!filepath) return new Response('Not Found', {status:404})
@@ -1530,22 +1550,8 @@ export function serve(entrypoint, flags = {}) {
 			}
 
 			// HTML: index or any .html file
-			if (pathname === '/' || sourcePath.endsWith('.html')) {
-				const htmlFile = sourceFile || (pathname === '/' ? htmlPath : '.' + pathname)
-				const file = 'html:' + normalizeFile(htmlFile)
-				try {
-					let html = await Bun.file(htmlFile).text()
-					await markSuccess(file)
-					return new Response(transformHtml(html, entrypoint, flags.imports), {
-						headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' },
-					})
-				} catch (error) {
-					if (isMissingFileError(error)) {
-						clearError(file)
-						return new Response('Not Found', { status: 404 })
-					}
-					return errorResponse(file, [error])
-				}
+			if (pathname === '/' || sourcePath.endsWith('.html') || documentRoute) {
+				return serveHtml(sourceFile || (pathname === '/' || documentRoute ? htmlPath : '.' + pathname))
 			}
 
 			// Imba files: compile on demand and serve as JS
@@ -1665,7 +1671,6 @@ export function serve(entrypoint, flags = {}) {
 			}
 
 			// Try extensions for extensionless paths (e.g. node_modules imports)
-			const lastSegment = pathname.split('/').pop()
 			if (!lastSegment.includes('.')) {
 				// Try .imba first (compile on the fly), then TypeScript and JavaScript.
 				const imbaPath = '.' + pathname + '.imba'
@@ -1706,23 +1711,7 @@ export function serve(entrypoint, flags = {}) {
 				}
 			}
 
-			// SPA fallback for extension-less paths
-			if (!lastSegment.includes('.')) {
-				const file = 'html:' + normalizeFile(htmlPath)
-				try {
-					let html = await Bun.file(htmlPath).text()
-					await markSuccess(file)
-					return new Response(transformHtml(html, entrypoint, flags.imports), {
-						headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' },
-					})
-				} catch (error) {
-					if (isMissingFileError(error)) {
-						clearError(file)
-						return new Response('Not Found', { status: 404 })
-					}
-					return errorResponse(file, [error])
-				}
-			}
+			if (fallback) return serveHtml(htmlPath)
 
 			return new Response('Not Found', { status: 404 })
 			} catch (error) {
