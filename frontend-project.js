@@ -176,9 +176,12 @@ export class FrontendProject {
         const reusable = !this.force && process.env.BIMBA_FORCE !== '1' && this.equivalent(previous, before);
         if (!valid || !reusable) fs.rmSync(this.proofFile, { force: true });
         const coverage = new Set(reusable ? previous.coverage : []);
-        const missing = selected.filter(file => !coverage.has(file));
+        // A working session reuses the live type graph, never a diagnostic
+        // receipt. Keep the existing snapshot mode for unnamed workflows.
+        const session = process.env.BIMBA_TYPECHECK_SESSION;
+        const missing = session ? selected : selected.filter(file => !coverage.has(file));
         const observedExternal = {}, observedInputs = {};
-        const passed = valid && (!missing.length || await diagnostics(missing, { cwd: this.cwd, syntaxValidated: true, refreshProject: !reusable,
+        const passed = valid && (!missing.length || await diagnostics(missing, { cwd: this.cwd, syntaxValidated: true, refreshProject: !session && !reusable,
             projectFiles: paths => {
                 Object.assign(observedExternal, this.externalInputs(paths));
                 Object.assign(observedInputs, this.externalInputs(paths, true));

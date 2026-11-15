@@ -15,7 +15,12 @@ const read = (file, encoding = 'utf8') => {
 export class TypecheckProject {
     constructor(cwd, tsserver) {
         this.cwd = cwd;
-        this.ts = createRequire(tsserver)('./typescript.js');
+        const require = createRequire(tsserver);
+        const implementation = require.resolve('./typescript.js');
+        // A new project is created when the negotiated toolchain changes.
+        // Replacing TypeScript at the same path must also refresh its parser.
+        delete require.cache[implementation];
+        this.ts = require(implementation);
         this.known = new Set();
         this.sources = new Map();
         this.configuration = null;

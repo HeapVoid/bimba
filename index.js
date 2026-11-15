@@ -8,7 +8,7 @@ import path from 'path';
 import { pathToFileURL } from 'node:url';
 import { rmSync } from "node:fs";
 import { serve } from './serve.js';
-import { checkImbaTypes, collectImbaFiles, startDevTypecheckServer } from './typecheck.js';
+import { checkImbaTypes, collectImbaFiles, startDevTypecheckServer, typecheckSession } from './typecheck.js';
 import { FrontendProject } from './frontend-project.js';
 import { startFrontendDevelopment } from './frontend-development.js';
 
@@ -37,6 +37,11 @@ try {
             'spa-fallback': { type: 'string' },
             typecheck: { type: 'boolean' },
             tscheck: { type: 'boolean' },
+            'typecheck-session': { type: 'string' },
+            session: { type: 'string' },
+            'session-owner': { type: 'string' },
+            'session-idle': { type: 'string' },
+            wait: { type: 'boolean' },
             check: { type: 'boolean' },
             'frontend-check': { type: 'boolean' },
             frontend: { type: 'boolean' },
@@ -93,6 +98,11 @@ if(flags.help) {
     console.log("   "+theme.flags('--clearcache')+"                          Clear cache on exit, works only when in watch mode");
     console.log("   "+theme.flags('--typecheck')+"                           Check TypeScript diagnostics in .imba files");
     console.log("   "+theme.flags('--tscheck')+"                             Alias for --typecheck");
+    console.log("   --typecheck-session <start|warm|status|stop> Manage an opt-in named worker session");
+    console.log("   --session <name>                         Select a started session (or BIMBA_TYPECHECK_SESSION)");
+    console.log("   --session-owner <pid>                    End the session when its host process exits");
+    console.log("   --session-idle <ms>                      Idle limit at session start (default: 600000)");
+    console.log("   --wait                                   Wait for requested session warmup diagnostics");
     console.log("   "+theme.flags('--check')+"                               Use Bun's native type checker during bundling (Bun 1.4.3+)");
     console.log("");
     console.log("Frontend verification:");
@@ -128,6 +138,26 @@ if (flags['auto-tags']) {
     }
 }
 if (flags.force) process.env.BIMBA_FORCE = '1';
+if (flags.session !== undefined) process.env.BIMBA_TYPECHECK_SESSION = flags.session;
+
+if (flags['typecheck-session']) {
+    try {
+        if (flags.serve || flags.typecheck || flags.tscheck || flags['frontend-check'] || flags.check || flags.outdir || flags.watch) {
+            throw new Error('Use the typecheck session operation separately from serving, bundling or checking.');
+        }
+        const result = await typecheckSession(flags['typecheck-session'], entrypoints, {
+            session: flags.session ?? process.env.BIMBA_TYPECHECK_SESSION,
+            ...(flags['session-owner'] !== undefined ? { ownerPid: Number(flags['session-owner']) } : {}),
+            ...(flags['session-idle'] !== undefined ? { idleMs: Number(flags['session-idle']) } : {}),
+            wait: flags.wait,
+        });
+        console.log(JSON.stringify(result));
+        process.exit(flags.wait && result.lastWarmup?.passed === false ? 1 : 0);
+    } catch (error) {
+        console.error(error.message);
+        process.exit(1);
+    }
+}
 
 if (flags.check) {
     if (flags.serve || flags.typecheck || flags.tscheck || flags['frontend-check']) {

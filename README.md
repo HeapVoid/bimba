@@ -407,6 +407,83 @@ still validated for every file; project-info requests are pipelined without
 inferring coverage from config patterns. The dev daemon tracks batch-opened
 files in the same state used for dependency refresh and deletion.
 
+### Explicit working sessions
+
+A named session is opt-in. Without a session, ordinary checks keep the existing
+one-shot behavior, and `--serve` keeps its parent-owned development server.
+Bimba does not require Manifest or a project-specific session format.
+
+```sh
+export BIMBA_TYPECHECK_SESSION=work-42
+
+# Start and queue a full warmup for the area you expect to check.
+bimba src --typecheck-session start
+
+# Optional: wait until that area has actually been checked.
+bimba src --typecheck-session warm --wait
+
+# Independent CLI processes reuse the live worker, then compute diagnostics again.
+bimba src --typecheck
+bimba src/chat --typecheck
+
+bimba --typecheck-session status
+bimba --typecheck-session stop
+unset BIMBA_TYPECHECK_SESSION
+```
+
+Use `--session work-42` instead of the environment variable when convenient.
+A session is scoped to the real project root, name and TypeScript runtime/options.
+Different projects or names do not share a worker. A named check requires an
+explicitly started session; it never silently creates one after `stop`.
+CI and `BIMBA_NO_TYPECHECK_DAEMON=1` still run checks in a fresh process.
+
+`start` without paths starts only the session. With paths, it queues the same
+complete source-mapped checker used by `--typecheck`; `warm` queues another area.
+Both return promptly unless `--wait` is supplied. A foreground check waits its
+turn if a warmup is in progress. Equal pending warmups coalesce; completed results
+are not reused as diagnostic proof. Status reports `daemonPid`, `workerPid`,
+`warming` and historical `lastWarmup`; `--wait` exits nonzero when that warmup
+found diagnostics. The next check always synchronizes the current files and
+recomputes all diagnostic categories, even if the warmup passed. Bimba also
+requires confirmation that the Imba plugin initialized for each selected project,
+so a broken plugin dependency cannot masquerade as an empty successful check. Named
+`--frontend-check` workflows likewise run fresh diagnostics against that graph
+rather than accepting previous snapshot coverage.
+
+The detached session survives the individual CLI that started it. The host ends
+it with `stop`, which cancels unfinished clients without declaring success.
+Stopping an already ended session is harmless and returns `stopped: false`.
+At `start`, `--session-owner <pid>` optionally binds it to a long-lived host
+(shell, IDE or other supervisor). It also stops after `--session-idle <ms>`
+without work (default 600000 ms / ten minutes, range 1–2147483647 ms); queued/running checks and warmups
+do not count as idle. Set `--session-idle 0` together with `--session-owner`
+to keep the session for the host’s entire lifetime; zero without an owner is
+rejected. Start again after an idle timeout. Runtime selection must
+remain the same when starting, checking and stopping a named session.
+
+Configuration, file membership and dependency changes recreate only the internal
+worker. Updating TypeScript or the Imba plugin also refreshes the negotiated
+worker toolchain, keeping the named session's address. If Bimba itself changes,
+`start` restarts an incompatible session before reusing it. Starting an already
+compatible name is idempotent; its original lifetime settings remain in force.
+
+Project hosts can use the same API:
+
+```js
+import { typecheckSession, checkImbaTypes } from 'bimba-cli/typecheck.js';
+
+const options = { cwd: projectRoot, session: 'work-42', ownerPid: process.pid };
+await typecheckSession('start', ['src'], options); // background warmup
+try {
+    await checkImbaTypes(['src/chat'], options);
+} finally {
+    await typecheckSession('stop', [], options);
+}
+```
+
+Warm the actual upcoming selection when possible: warming one entry builds its
+project graph but does not precompute every other file's semantic diagnostics.
+
 ### Persistent virtual TypeScript
 
 Type checks also reuse successful Imba-to-TypeScript compilations between fresh

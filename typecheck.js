@@ -4,7 +4,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { performance } from 'node:perf_hooks';
-import { connectTypecheckServer, launchDevTypecheckServer, typecheckRuntime } from './typecheck-transport.js';
+import { connectTypecheckServer, launchDevTypecheckServer, typecheckRuntime, typecheckRevisions, TypecheckSession } from './typecheck-transport.js';
 import { theme } from './utils.js';
 import { parseMessages } from './typecheck-protocol.js';
 import { CompilerCache } from './compile-cache.js';
@@ -64,7 +64,7 @@ function findPluginProbe(cwd) {
     throw new Error('Could not find typescript-imba-plugin. Install the Imba VSCode extension or add the plugin to node_modules.');
 }
 
-export function collectImbaFiles(entrypoints, cwd) {
+export function collectImbaFiles(entrypoints, cwd, { canonical = false } = {}) {
     const targets = entrypoints.length ? entrypoints : [fs.existsSync(path.join(cwd, 'src')) ? 'src' : '.'];
     const files = new Set();
 
@@ -87,7 +87,8 @@ export function collectImbaFiles(entrypoints, cwd) {
         else if (stat.isFile() && resolved.endsWith('.imba')) files.add(resolved);
         else throw new Error(`The specified typecheck path is not an Imba file or directory: ${target}`);
     }
-    return { files: [...files].sort(), targets };
+    const selected = canonical ? new Set([...files].map(file => fs.realpathSync(file))) : files;
+    return { files: [...selected].sort(), targets };
 }
 
 
@@ -131,13 +132,45 @@ function send(server, seq, command, args) {
 
 export async function startDevTypecheckServer(entrypoint, options = {}) {
     if (process.env.CI || process.env.BIMBA_NO_TYPECHECK_DAEMON === '1') return;
-    const cwd = options.cwd || process.cwd();
+    const cwd = fs.realpathSync(options.cwd || process.cwd());
     const tsserver = findTypeScript(cwd);
     const pluginProbe = findPluginProbe(cwd);
     const runner = typecheckRuntime();
-    await launchDevTypecheckServer({ cwd, tsserver, pluginProbe, runner });
-    await checkImbaTypes(entrypoint, { cwd });
+    const session = options.session ?? process.env.BIMBA_TYPECHECK_SESSION;
+    if (session) {
+        await typecheckSession('warm', entrypoint, { ...options, cwd, session, wait: true });
+    } else {
+        await launchDevTypecheckServer({ cwd, tsserver, pluginProbe, runner });
+        await checkImbaTypes(entrypoint, { cwd });
+    }
     console.log(theme.success('TypeScript server ready for checks'));
+}
+
+// The CLI and project hosts use the same explicit lifecycle contract. A name
+// selects an already started session; ordinary checks never start one implicitly.
+export async function typecheckSession(action, entrypoint = [], options = {}) {
+    const cwd = fs.realpathSync(options.cwd || process.cwd());
+    const session = options.session ?? process.env.BIMBA_TYPECHECK_SESSION;
+    const args = { cwd, session, runner: typecheckRuntime() };
+    if (!['start', 'warm', 'status', 'stop'].includes(action)) throw new Error('Session action must be start, warm, status or stop');
+    if (action === 'start') Object.assign(args, { tsserver: findTypeScript(cwd), pluginProbe: findPluginProbe(cwd) });
+    const server = new TypecheckSession(args);
+    const paths = Array.isArray(entrypoint) ? entrypoint : (entrypoint ? [entrypoint] : []);
+    const wantsWarmup = action === 'warm' || action === 'start' && paths.length > 0;
+    const files = wantsWarmup ? collectImbaFiles(paths, cwd, { canonical: true }).files : [];
+    if (wantsWarmup && !files.length) throw new Error('No Imba files selected for session warmup');
+    let started;
+    if (action === 'start') {
+        started = await server.start(options);
+        if (!paths.length) return started;
+    } else if (!await server.status()) {
+        if (action === 'stop') return { session, stopped: false };
+        throw new Error(`Typecheck session "${session}" is not running. Start it explicitly first.`);
+    }
+    if (action === 'stop') return server.stop();
+    if (action === 'status') return server.status();
+    const result = await server.warm(files, { wait: !!options.wait });
+    return started ? { ...result, started: started.started } : result;
 }
 
 export async function checkImbaTypes(entrypoint, options = {}) {
@@ -146,10 +179,11 @@ export async function checkImbaTypes(entrypoint, options = {}) {
     const mark = phase => {
         if (profile) console.error(`[bimba typecheck] ${phase}: ${(performance.now() - started).toFixed(1)} ms`);
     };
-    const cwd = options.cwd || process.cwd();
+    const cwd = fs.realpathSync(options.cwd || process.cwd());
+    const session = options.session ?? process.env.BIMBA_TYPECHECK_SESSION;
     const timeout = Number(options.timeout || process.env.BIMBA_TYPECHECK_TIMEOUT || process.env.IMBA_TS_CHECK_TIMEOUT || 120000);
     const entrypoints = Array.isArray(entrypoint) ? entrypoint : (entrypoint ? [entrypoint] : []);
-    const { files, targets } = collectImbaFiles(entrypoints, cwd);
+    const { files, targets } = collectImbaFiles(entrypoints, cwd, { canonical: !!session });
     const selectedByRealPath = new Map(files.map(file => [fs.realpathSync(file), file]));
     mark('collect files');
 
@@ -161,6 +195,7 @@ export async function checkImbaTypes(entrypoint, options = {}) {
     const tsserver = findTypeScript(cwd);
     const pluginProbe = findPluginProbe(cwd);
     const runner = typecheckRuntime();
+    const serverArgs = { cwd, tsserver, pluginProbe, runner, session };
     mark('resolve toolchain');
 
     console.log(theme.folder('──────────────────────────────────────────────────────────────────────'));
@@ -194,8 +229,13 @@ export async function checkImbaTypes(entrypoint, options = {}) {
     mark('compile selected files');
 
     let shared = null;
-    try { shared = await connectTypecheckServer({ cwd, tsserver, pluginProbe, runner }); }
-    catch (error) { console.error(`Bimba typecheck server unavailable; using a one-shot session: ${error.message}`); }
+    if (session && !process.env.CI && process.env.BIMBA_NO_TYPECHECK_DAEMON !== '1') {
+        shared = await connectTypecheckServer(serverArgs);
+        if (!shared) throw new Error(`Typecheck session "${session}" is not running. Start it explicitly first.`);
+    } else {
+        try { shared = await connectTypecheckServer(serverArgs); }
+        catch (error) { console.error(`Bimba typecheck server unavailable; using a one-shot session: ${error.message}`); }
+    }
     const server = shared || startTypecheckWorker({ cwd, tsserver, pluginProbe, runner });
     mark(shared ? 'connect warm tsserver' : 'spawn tsserver');
 
@@ -207,6 +247,10 @@ export async function checkImbaTypes(entrypoint, options = {}) {
         const diagnostics = new Map();
         const pending = new Map();
         const checked = new Set();
+        const pluginProjects = new Set();
+        const rememberPlugin = project => {
+            if (fs.existsSync(project)) pluginProjects.add(fs.realpathSync(project));
+        };
         let geterrSeq = null;
         let retryTimer;
 
@@ -275,6 +319,10 @@ export async function checkImbaTypes(entrypoint, options = {}) {
                 return;
             }
             if (msg.type != 'event') return;
+            if (msg.event === 'bimbaPluginReady') {
+                rememberPlugin(msg.body.project);
+                return;
+            }
             if (msg.event === 'bimbaCacheProfile') {
                 if (profile) console.error('[bimba virtual cache] ' + JSON.stringify(msg.body));
                 return;
@@ -338,10 +386,15 @@ export async function checkImbaTypes(entrypoint, options = {}) {
             });
             mark('configure tsserver');
             if (shared) {
+                const revisions = session ? typecheckRevisions(serverArgs) : null;
                 const sync = await request('bimbaSync', {
                     files: files.map(file => ({ file, content: fs.readFileSync(file, 'utf8') })),
                     refresh: !!options.refreshProject,
+                    ...(revisions ? { engine: revisions.engine, toolchain: {
+                        tsserver, pluginProbe, runner, revision: revisions.worker,
+                    } } : {}),
                 });
+                for (const project of sync.pluginProjects || []) rememberPlugin(project);
                 // Plugin 1.8.x debounces virtual-source edits by up to 250ms
                 // (including clearing a large document). Unchanged/JS checks do not wait.
                 if (sync.imbaChanged && !sync.reset) await new Promise(resolve => setTimeout(resolve, 300));
@@ -359,6 +412,12 @@ export async function checkImbaTypes(entrypoint, options = {}) {
                 if (project.languageServiceDisabled) throw new Error(`TypeScript language service is disabled for ${file}`);
                 if (!project.configFileName || !fs.existsSync(project.configFileName)) {
                     throw new Error(`${file} is not included in a project configuration. Add it to the include/files of tsconfig.json or jsconfig.json.`);
+                }
+                if (!pluginProjects.has(fs.realpathSync(project.configFileName))) {
+                    // A plugin that failed to load is not a healthy graph. Retire
+                    // it so repairing its dependency can recover on the next check.
+                    if (shared) await request('bimbaInvalidate', {});
+                    throw new Error(`Imba language-service plugin did not initialize for ${project.configFileName}. Check the plugin and its dependencies.`);
                 }
                 if ((options.projectFiles || shared) && !inspectedProjects.has(project.configFileName)) {
                     inspectedProjects.add(project.configFileName);

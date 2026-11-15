@@ -27,6 +27,7 @@ module.exports = modules => {
     return {
         create(info) {
             const languageService = service.create(info);
+            info.session?.event({ project: info.project.getProjectName() }, 'bimbaPluginReady');
             if (!process.env.BIMBA_PROFILE_TYPECHECK) return languageService;
             let lastProfile;
             // Read-only profiling after mapped diagnostics. No compiler results,
