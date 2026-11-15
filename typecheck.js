@@ -1,4 +1,4 @@
-import { spawn } from 'child_process';
+import { startTypecheckWorker } from './typecheck-worker.js';
 import { createRequire } from 'module';
 import fs from 'fs';
 import os from 'os';
@@ -6,6 +6,7 @@ import path from 'path';
 import { performance } from 'node:perf_hooks';
 import { connectTypecheckServer, launchDevTypecheckServer, typecheckRuntime } from './typecheck-transport.js';
 import { theme } from './utils.js';
+import { parseMessages } from './typecheck-protocol.js';
 import { CompilerCache } from './compile-cache.js';
 
 const require = createRequire(import.meta.url);
@@ -89,25 +90,6 @@ export function collectImbaFiles(entrypoints, cwd) {
     return { files: [...files].sort(), targets };
 }
 
-function parseMessages(buffer, onMessage) {
-    while (true) {
-        const text = buffer.toString('utf8');
-        const headerEnd = text.indexOf('\r\n\r\n');
-        if (headerEnd < 0) return buffer;
-
-        const match = /Content-Length: (\d+)/i.exec(text.slice(0, headerEnd));
-        if (!match) return buffer;
-
-        const length = Number(match[1]);
-        const bodyStart = Buffer.byteLength(text.slice(0, headerEnd + 4));
-        if (buffer.length < bodyStart + length) return buffer;
-
-        const body = buffer.slice(bodyStart, bodyStart + length).toString('utf8');
-        buffer = buffer.slice(bodyStart + length);
-
-        onMessage(JSON.parse(body));
-    }
-}
 
 function flattenMessage(text) {
     if (typeof text == 'string') return text;
@@ -214,16 +196,11 @@ export async function checkImbaTypes(entrypoint, options = {}) {
     let shared = null;
     try { shared = await connectTypecheckServer({ cwd, tsserver, pluginProbe, runner }); }
     catch (error) { console.error(`Bimba typecheck server unavailable; using a one-shot session: ${error.message}`); }
-    const server = shared || spawn(runner, [
-        tsserver,
-        '--globalPlugins',
-        'typescript-imba-plugin',
-        '--pluginProbeLocations',
-        pluginProbe,
-    ], { cwd });
+    const server = shared || startTypecheckWorker({ cwd, tsserver, pluginProbe, runner });
     mark(shared ? 'connect warm tsserver' : 'spawn tsserver');
 
-    return await new Promise((resolve) => {
+    let recoverable = false;
+    const success = await new Promise((resolve) => {
         let settled = false;
         let buffer = Buffer.alloc(0);
         const seq = { value: 1 };
@@ -231,11 +208,13 @@ export async function checkImbaTypes(entrypoint, options = {}) {
         const pending = new Map();
         const checked = new Set();
         let geterrSeq = null;
+        let retryTimer;
 
         function finish(success) {
             if (settled) return;
             settled = true;
             clearTimeout(timer);
+            clearTimeout(retryTimer);
             server.kill();
             for (const request of pending.values()) request.reject(new Error('TypeScript session ended'));
             pending.clear();
@@ -263,7 +242,9 @@ export async function checkImbaTypes(entrypoint, options = {}) {
 
         function fail(error) {
             if (settled) return;
-            console.log(theme.failure(' Failure ') + ` ${error.message}`);
+            recoverable = !!shared && /^(updateOpen:|TypeScript exited before diagnostics)/.test(error.message);
+            if (recoverable && !options.recovering) console.error(`Bimba shared TypeScript session failed; reconnecting: ${error.message}`);
+            else console.log(theme.failure(' Failure ') + ` ${error.message}`);
             finish(false);
         }
 
@@ -294,12 +275,16 @@ export async function checkImbaTypes(entrypoint, options = {}) {
                 return;
             }
             if (msg.type != 'event') return;
+            if (msg.event === 'bimbaCacheProfile') {
+                if (profile) console.error('[bimba virtual cache] ' + JSON.stringify(msg.body));
+                return;
+            }
 
             if (msg.event == 'requestCompleted' && msg.body?.request_seq == geterrSeq) {
                 mark('diagnostics complete');
                 const missing = files.filter(file => ['syntaxDiag', 'semanticDiag', 'suggestionDiag']
                     .some(kind => !checked.has(`${kind}\0${file}`)));
-                if (missing.length) requestDiagnostics(missing);
+                if (missing.length) retryTimer = setTimeout(() => requestDiagnostics(missing), 25);
                 else finishWithDiagnostics();
                 return;
             }
@@ -357,7 +342,10 @@ export async function checkImbaTypes(entrypoint, options = {}) {
                     files: files.map(file => ({ file, content: fs.readFileSync(file, 'utf8') })),
                     refresh: !!options.refreshProject,
                 });
-                if (sync.changed) await new Promise(resolve => setTimeout(resolve, 100));
+                // Plugin 1.8.x debounces virtual-source edits by up to 250ms
+                // (including clearing a large document). Unchanged/JS checks do not wait.
+                if (sync.imbaChanged && !sync.reset) await new Promise(resolve => setTimeout(resolve, 300));
+                mark(`synchronize tsserver ${sync.workerPid}${sync.reset ? ' reset: ' + sync.reasons.join(', ') : ''}`);
             }
             // One project update lets tsserver build the selected graph once.
             // Use its public batch protocol in both warm and one-shot sessions.
@@ -372,10 +360,10 @@ export async function checkImbaTypes(entrypoint, options = {}) {
                 if (!project.configFileName || !fs.existsSync(project.configFileName)) {
                     throw new Error(`${file} is not included in a project configuration. Add it to the include/files of tsconfig.json or jsconfig.json.`);
                 }
-                if (options.projectFiles && !inspectedProjects.has(project.configFileName)) {
+                if ((options.projectFiles || shared) && !inspectedProjects.has(project.configFileName)) {
                     inspectedProjects.add(project.configFileName);
                     const complete = await request('projectInfo', { file, needFileNameList: true });
-                    options.projectFiles([...(complete.fileNames || []), project.configFileName]);
+                    options.projectFiles?.([...(complete.fileNames || []), project.configFileName]);
                 }
             }));
             mark('project info');
@@ -383,4 +371,11 @@ export async function checkImbaTypes(entrypoint, options = {}) {
         }
         check().catch(fail);
     });
+    const remaining = timeout - (performance.now() - started);
+    if (!success && recoverable && !options.recovering && remaining > 0) {
+        // Disconnect has discarded an interrupted/rejected worker in the daemon.
+        // Retry the same selection once, within the original timeout budget.
+        return checkImbaTypes(entrypoint, { ...options, recovering: true, timeout: remaining });
+    }
+    return success;
 }

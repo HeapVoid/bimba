@@ -398,12 +398,36 @@ The selected TypeScript runtime applies to both one-shot and resident checks
 and is part of the warm server's identity, so different runtimes never share a
 type graph. The supervising daemon always uses Bimba's own Bun executable.
 
-When `bimba --serve` is running, Bimba starts and warms a project TypeScript server alongside the dev server. File, directory, and full-project checks reuse its type graph. Bimba synchronizes changed Imba sources before requesting diagnostics and stops the TypeScript server when the dev server exits. Without a dev server, checks use a fresh TypeScript session. Checks in CI always use a fresh session. Set `BIMBA_NO_TYPECHECK_DAEMON=1` to force a fresh session while the dev server is running. Set `BIMBA_PROFILE_TYPECHECK=1` to print timings for each phase. The resident TypeScript server holds the project type graph in memory while the dev server is running.
+When `bimba --serve` is running, Bimba starts and warms a project TypeScript server alongside the dev server. File, directory, and full-project checks reuse its type graph. Bimba synchronizes changed Imba and imported JS/TS sources before requesting diagnostics; unchanged checks do not reload the project. TypeScript's own config parser tracks includes, excludes, extends and references. Changes to configuration, source membership, package manifests, lockfiles, installed package links or loaded dependency declarations recreate only the daemon's internal TypeScript worker. Ordinary source edits retain the worker. The daemon stops when the dev server exits.
+
+Each client has isolated request identities. An interrupted diagnostic batch or a rejected request retires its worker before the next client is served. Unexpected worker exits and rejected `updateOpen` requests receive one reconnect attempt within the original check timeout. Syntax, semantic and suggestion responses are still required for every selected file; recovery never turns incomplete diagnostics into success. Without a dev server, checks use a fresh TypeScript session. Checks in CI always use a fresh session. Set `BIMBA_NO_TYPECHECK_DAEMON=1` to force a fresh session while the dev server is running. Set `BIMBA_PROFILE_TYPECHECK=1` to print timings for each phase. The resident TypeScript server holds the project type graph in memory while the dev server is running.
 
 Selected files open in one TypeScript `updateOpen` request. Project membership is
 still validated for every file; project-info requests are pipelined without
 inferring coverage from config patterns. The dev daemon tracks batch-opened
 files in the same state used for dependency refresh and deletion.
+
+### Persistent virtual TypeScript
+
+Type checks also reuse successful Imba-to-TypeScript compilations between fresh
+TypeScript workers. Bimba stores generated TypeScript with its original source
+mapping; TypeScript diagnostics themselves are always computed again. Source
+bytes, exact compiler options (including sourceId), compiler/plugin bytes, adapter
+implementation, runtime and compiler environment participate in the key. Each
+source file has one current virtual-output slot; edits replace it. Writes are
+atomic and checksummed, and invalid or incomplete mapping data is recompiled.
+
+The adapter shares the bundled-compiler integration already used by TypeView.
+It currently recognizes the byte-exact typescript-imba-plugin 1.8.3 implementation.
+Unknown plugin builds continue through the real language-service plugin without
+virtual-output caching. Installed packages and project tsconfig are never patched.
+A generated loader in Bimba's cache uses TypeScript's normal plugin discovery.
+
+The existing `BIMBA_CACHE_DIR` and `BIMBA_FORCE=1` controls apply. Set
+`BIMBA_VIRTUAL_CACHE=0` to bypass only this virtual-output cache when comparing
+cold-start performance. `BIMBA_PROFILE_TYPECHECK=1` reports hits, compilations and
+cache/compiler time. A completely empty cache still needs its initial compilation;
+later fresh workers can reuse it without keeping the previous process alive.
 
 ### Reusing frontend work
 

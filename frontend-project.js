@@ -6,7 +6,7 @@ import { TypeView } from './type-view.js';
 import { checkImbaTypes } from './typecheck.js';
 
 const skip = new Set(['.git', '.cache', '.bimba', '.check-build', '.local-run', '.worktrees', 'node_modules', 'public', 'dist', 'build', 'coverage', '__pycache__']);
-const engine = hash(['frontend-project.js', 'compile-cache.js', 'type-view.js', 'typecheck.js', 'typecheck-daemon.js', 'typecheck-transport.js'].map(file => fs.readFileSync(new URL(file, import.meta.url))).join('\0'));
+const engine = hash(['frontend-project.js', 'compile-cache.js', 'compilation-store.cjs', 'plugin-compiler.cjs', 'type-view.js', 'typecheck.js', 'typecheck-daemon.js', 'typecheck-transport.js'].map(file => fs.readFileSync(new URL(file, import.meta.url))).join('\0'));
 
 function walk(root, visit, excluded = skip, ancestors = new Set()) {
     const real = fs.realpathSync(root);

@@ -6,6 +6,7 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { resolveTypecheckPlugin } from './typecheck-worker.js';
 
 const daemonPath = fileURLToPath(new URL('./typecheck-daemon.js', import.meta.url));
 const packagePath = fileURLToPath(new URL('./package.json', import.meta.url));
@@ -43,12 +44,15 @@ function socketFor({ cwd, tsserver, pluginProbe, runner }) {
     const directory = path.join(os.homedir(), '.cache', 'bimba');
     fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
     const version = JSON.parse(fs.readFileSync(packagePath, 'utf8')).version;
-    const revision = fs.statSync(daemonPath).mtimeMs;
     const toolchain = createHash('sha256');
-    for (const file of [tsserver, path.join(path.dirname(tsserver), '_tsserver.js'), path.join(pluginProbe, 'typescript-imba-plugin/dist/index.js')]) {
+    const plugin = resolveTypecheckPlugin(pluginProbe);
+    const implementation = ['typecheck-daemon.js', 'typecheck-project.js', 'typecheck-protocol.js',
+        'typecheck-worker.js', 'compile-cache.js', 'compilation-store.cjs', 'plugin-compiler.cjs',
+        'typecheck-plugin/index.cjs', 'typecheck-plugin/cache.cjs'].map(file => fileURLToPath(new URL(file, import.meta.url)));
+    for (const file of [...implementation, tsserver, path.join(path.dirname(tsserver), '_tsserver.js'), plugin]) {
         if (fs.existsSync(file)) toolchain.update(fs.readFileSync(file));
     }
-    const identity = [fs.realpathSync(cwd), tsserver, pluginProbe, runner, version, revision, toolchain.digest('hex'), process.env.NODE_OPTIONS || '', process.env.NODE_PATH || ''].join('\0');
+    const identity = [fs.realpathSync(cwd), tsserver, pluginProbe, plugin, runner, version, toolchain.digest('hex'), process.env.NODE_OPTIONS || '', process.env.NODE_PATH || ''].join('\0');
     const key = createHash('sha256').update(identity).digest('hex').slice(0, 20);
     return path.join(directory, `${key}.sock`);
 }

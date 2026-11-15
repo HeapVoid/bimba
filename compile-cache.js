@@ -1,38 +1,14 @@
-import { createHash, randomUUID } from 'node:crypto';
 import { createRequire } from 'node:module';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { TagDependencies } from './tag-dependencies.js';
-
-export const hash = value => createHash('sha256').update(value).digest('hex');
-export const counters = { hits: 0, compiled: 0 };
+import { CompilationStore, hash, counters, projectCache, atomicJSON, compilerEnvironment } from './compilation-store.cjs';
+export { hash, counters, projectCache, atomicJSON, compilerEnvironment };
 const require = createRequire(import.meta.url);
 const engine = hash(fs.readFileSync(import.meta.filename));
+const compilerModules = new Map();
 
-export function projectCache(cwd = process.cwd()) {
-    let namespace;
-    try { namespace = JSON.parse(fs.readFileSync(path.join(cwd, 'package.json'), 'utf8')).name; } catch {}
-    namespace ||= fs.realpathSync(cwd);
-    return process.env.BIMBA_CACHE_DIR || path.join(os.homedir(), '.cache', 'bimba', 'projects', hash(namespace).slice(0, 24));
-}
-
-export function atomicJSON(file, value) {
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    const temporary = file + '.' + process.pid + '.' + randomUUID() + '.tmp';
-    try {
-        fs.writeFileSync(temporary, JSON.stringify(value));
-        fs.renameSync(temporary, file);
-    } finally { fs.rmSync(temporary, { force: true }); }
-}
-
-export function compilerEnvironment(sources) {
-    const names = new Set(sources.flatMap(source => [...source.matchAll(/\$(\w+)\$/g)].map(match => match[1].toUpperCase())));
-    return Object.fromEntries([...names].sort().map(name => [name, process.env[name] ?? null]));
-}
-
-// One current result per logical file and compiler variant. The source and
-// toolchain belong to the result key, not its slot: edits replace old history.
+// One current result per logical file and compiler variant.
 export class CompilerCache {
     constructor({ cwd = process.cwd(), directory = projectCache(cwd), force = false } = {}) {
         this.cwd = path.resolve(cwd);
@@ -41,9 +17,15 @@ export class CompilerCache {
         let compilerPath;
         try { compilerPath = createRequire(path.join(this.cwd, 'package.json')).resolve('imba/compiler'); }
         catch { compilerPath = require.resolve('imba/compiler'); }
-        this.compiler = require(compilerPath);
+        compilerPath = fs.realpathSync(compilerPath);
         this.identity = hash(fs.readFileSync(compilerPath));
-        this.stats = { hits: 0, compiled: 0 };
+        const previous = compilerModules.get(compilerPath);
+        // Do not adopt a compiler loaded before its fingerprint was observed.
+        if (previous !== this.identity) delete require.cache[compilerPath];
+        this.compiler = require(compilerPath);
+        compilerModules.set(compilerPath, this.identity);
+        this.store = new CompilationStore(path.join(directory, 'compiled'), force);
+        this.stats = this.store.stats;
     }
     compile(source, options, { kind = 'imba', identity = this.identity, compile = this.compiler.compile } = {}) {
         const normalized = Object.fromEntries(Object.entries(options).sort(([a], [b]) => a.localeCompare(b)));
@@ -56,21 +38,12 @@ export class CompilerCache {
         }
         const slot = hash(JSON.stringify({ kind, options: normalized }));
         const key = hash(JSON.stringify({ engine, identity, options: normalized, environment: compilerEnvironment([source]), source }));
-        const file = path.join(this.directory, 'compiled', slot + '.json');
-        if (!this.force && process.env.BIMBA_FORCE !== '1') {
-            try {
-                const value = JSON.parse(fs.readFileSync(file, 'utf8'));
-                if (value?.format === 1 && value.key === key && typeof value.output?.js === 'string' && value.digest === hash(JSON.stringify(value.output))) {
-                    this.stats.hits++; counters.hits++;
-                    return { ...value.output, errors: [], diagnostics: [] };
-                }
-            } catch (error) { if (!['ENOENT', 'ENOTDIR'].includes(error.code) && !(error instanceof SyntaxError)) throw error; }
-        }
-        this.stats.compiled++; counters.compiled++;
+        const cached = this.store.read(slot, key, value => typeof value?.js === 'string');
+        if (cached) return { ...cached, errors: [], diagnostics: [] };
         const result = compile(source, normalized);
         if (typeof result.js === 'string' && !result.errors?.length && !result.diagnostics?.length) {
             const output = { js: result.js, css: result.css ?? null, sourceId: result.sourceId ?? null };
-            atomicJSON(file, { format: 1, key, output, digest: hash(JSON.stringify(output)) });
+            this.store.write(slot, key, output);
         }
         return result;
     }
