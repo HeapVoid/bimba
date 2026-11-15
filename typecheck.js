@@ -159,15 +159,14 @@ export async function typecheckSession(action, entrypoint = [], options = {}) {
     const wantsWarmup = action === 'warm' || action === 'start' && paths.length > 0;
     const files = wantsWarmup ? collectImbaFiles(paths, cwd, { canonical: true }).files : [];
     if (wantsWarmup && !files.length) throw new Error('No Imba files selected for session warmup');
+    if (action === 'stop') return server.stop();
     let started;
     if (action === 'start') {
         started = await server.start(options);
         if (!paths.length) return started;
     } else if (!await server.status()) {
-        if (action === 'stop') return { session, stopped: false };
         throw new Error(`Typecheck session "${session}" is not running. Start it explicitly first.`);
     }
-    if (action === 'stop') return server.stop();
     if (action === 'status') return server.status();
     const result = await server.warm(files, { wait: !!options.wait });
     return started ? { ...result, started: started.started } : result;

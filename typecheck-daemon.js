@@ -46,6 +46,9 @@ async function control(client, message) {
         const { action, files, wait } = message.arguments;
         if (action === 'status') { reply(status()); return; }
         if (action === 'stop') {
+            // Retire the address before acknowledging shutdown. Otherwise an
+            // immediate repeated stop can connect to this dying listener.
+            unpublish();
             // Flush the control response, then cancel any unfinished work. Its
             // clients receive disconnect, never an incomplete successful result.
             client.end(encodeMessage({ type: 'response', command: 'bimbaSession', request_seq: message.seq,
@@ -148,15 +151,19 @@ function receive(message) {
 function stop() {
     if (closing) return;
     closing = true;
+    unpublish();
     clearInterval(parentTimer);
     clearTimeout(idleTimer);
     active?.destroy();
     for (const client of clients) client.destroy();
     server.close();
     worker?.kill();
-    if (ownsSocket) {
-        try { fs.unlinkSync(socketPath); } catch {}
-    }
+}
+
+function unpublish() {
+    if (!ownsSocket) return;
+    try { fs.unlinkSync(socketPath); } catch {}
+    ownsSocket = false;
 }
 
 function handle(client, line) {

@@ -153,7 +153,7 @@ export class TypecheckSession {
             };
             const timer = setTimeout(() => finish(new Error(`Typecheck session ${action} timed out`)), 130000);
             socket.on('error', error => finish(error));
-            socket.on('close', () => finish(new Error('Typecheck session closed before replying')));
+            socket.on('close', () => finish(Object.assign(new Error('Typecheck session closed before replying'), { code: 'BIMBA_SESSION_CLOSED' })));
             socket.on('data', chunk => {
                 try {
                     buffer = parseMessages(Buffer.concat([buffer, chunk]), message => {
@@ -193,7 +193,7 @@ export class TypecheckSession {
                 const existing = await this.status();
                 if (existing) {
                     if (existing.engine !== engine) {
-                        await this.request('stop');
+                        await this.stop();
                         await new Promise(resolve => setTimeout(resolve, 20));
                         continue;
                     }
@@ -238,6 +238,13 @@ export class TypecheckSession {
         return this.request('warm', { files, wait, engine: typecheckEngine() });
     }
     async stop() {
-        return this.request('stop');
+        try { return await this.request('stop'); }
+        catch (error) {
+            if (error.code === 'ENOENT' || error.code === 'ECONNREFUSED'
+                || error.code === 'BIMBA_SESSION_CLOSED' && !fs.existsSync(this.socket)) {
+                return { session: this.args.session, stopped: false };
+            }
+            throw error;
+        }
     }
 }
