@@ -57,19 +57,29 @@ export class DependencyInventory {
 
 export class FrontendProject {
     constructor({ cwd = process.cwd(), directory = projectCache(cwd), force = false } = {}) {
-        this.cwd = path.resolve(cwd); this.directory = directory; this.force = force;
+        this.requestedRoot = path.resolve(cwd);
+        // The type service may report real paths even when opened through an alias.
+        this.cwd = fs.realpathSync(this.requestedRoot);
+        this.directory = directory; this.force = force;
         this.compiler = null;
         this.dependencies = null;
         this.proofFile = path.join(directory, 'frontend-types.json');
     }
+    inputPath(file) {
+        const absolute = path.resolve(this.cwd, file);
+        if (this.requestedRoot === this.cwd) return absolute;
+        if (absolute === this.requestedRoot) return this.cwd;
+        const prefix = this.requestedRoot + path.sep;
+        return absolute.startsWith(prefix) ? path.join(this.cwd, absolute.slice(prefix.length)) : absolute;
+    }
     inputFiles(externalFiles = [], selected = []) {
-        const inputs = new Set(selected.map(file => path.resolve(this.cwd, file)));
+        const inputs = new Set(selected.map(file => this.inputPath(file)));
         const require = createRequire(path.join(this.cwd, 'package.json'));
         let ts;
         try { ts = require('typescript'); } catch { ts = createRequire(import.meta.url)('typescript'); }
         const configurations = fs.readdirSync(this.cwd).filter(name => /^(?:tsconfig.*|jsconfig)\.json$/.test(name));
         const host = { ...ts.sys, readFile: file => {
-            inputs.add(file);
+            inputs.add(this.inputPath(file));
             return ts.sys.readFile(file);
         }};
         for (const name of configurations) {
@@ -78,18 +88,18 @@ export class FrontendProject {
             if (config.config) {
                 const project = ts.parseJsonConfigFileContent(config.config, host, this.cwd, {}, file, undefined,
                     [{ extension: '.imba', scriptKind: 7, isMixedContent: false }]);
-                for (const input of project.fileNames) inputs.add(input);
+                for (const input of project.fileNames) inputs.add(this.inputPath(input));
             }
         }
         if (!configurations.length && fs.existsSync(path.join(this.cwd, 'src'))) {
             walk(path.join(this.cwd, 'src'), file => inputs.add(file));
         }
-        for (const file of externalFiles) inputs.add(path.resolve(this.cwd, file));
+        for (const file of externalFiles) inputs.add(this.inputPath(file));
         for (const name of ['package.json', 'bun.lock', 'bun.lockb', 'bunfig.toml', '.env', '.env.local', '.env.test']) inputs.add(path.join(this.cwd, name));
         return inputs;
     }
     affected(file) {
-        const absolute = path.resolve(this.cwd, file);
+        const absolute = this.inputPath(file);
         let graph = [];
         try {
             const stat = fs.statSync(this.proofFile);
@@ -126,8 +136,7 @@ export class FrontendProject {
     }
     externalInputs(files, raw = false) {
         const values = {};
-        for (const file of [...new Set(files)].sort()) {
-            const absolute = path.resolve(this.cwd, file);
+        for (const absolute of [...new Set(files.map(file => this.inputPath(file)))].sort()) {
             const relative = path.relative(this.cwd, absolute);
             if (relative === 'node_modules' || relative.startsWith('node_modules/')) continue;
             const key = relative.startsWith('../') || relative === '..' || path.isAbsolute(relative) ? absolute : relative.replaceAll('\\', '/');

@@ -166,13 +166,18 @@ describe('frontend compilation snapshots', () => {
     });
     test('real diagnostics catch a consumer after its imported type changes and recover after repair', async () => {
         const cwd = fixture({ toolchain: true }), cache = directory();
+        const alias = path.join(directory(), 'checkout');
+        fs.symlinkSync(cwd, alias, 'dir');
         write(cwd, 'src/dependency.imba', 'export const value = 42\n');
         write(cwd, 'src/consumer.imba', "import {value} from './dependency.imba'\nvalue.toFixed!\n");
-        const project = new FrontendProject({ cwd, directory: cache });
+        const project = new FrontendProject({ cwd: alias, directory: cache });
+        expect(project.affected(path.join(alias, 'src/consumer.imba'))).toBe(true);
         const previous = process.env.BIMBA_NO_TYPECHECK_DAEMON;
         process.env.BIMBA_NO_TYPECHECK_DAEMON = '1';
         try {
         expect((await project.check()).passed).toBe(true);
+        const proof = JSON.parse(fs.readFileSync(project.proofFile, 'utf8')).proof;
+        expect(Object.keys(proof.external).filter(file => file.endsWith('/src/consumer.imba'))).toEqual([]);
         expect((await project.check()).mode).toBe('snapshot-reused');
         const clone = fixture({ toolchain: true });
         for (const name of ['src/consumer.imba','src/dependency.imba']) write(clone, name, fs.readFileSync(path.join(cwd, name), 'utf8'));
