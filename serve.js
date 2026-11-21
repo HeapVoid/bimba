@@ -503,6 +503,7 @@ ${fileUrl.toString()}
 			const msg = JSON.parse(e.data);
 			if      (msg.type === 'update' || msg.type === 'css') _applyUpdate(msg);
 			else if (msg.type === 'reload')      _applyUpdate(msg);
+			else if (msg.type === 'diagnostics') restoreDiagnostics(msg.items);
 			else if (msg.type === 'error')       showError(msg.file, msg.errors, msg.time);
 			else if (msg.type === 'clear-error') clearError(msg.file);
 		};
@@ -513,6 +514,43 @@ ${fileUrl.toString()}
 	// ── Error overlay ──────────────────────────────────────────────────────────
 
 	const _compileErrors = new Map();
+	const _diagnosticListeners = new Set();
+	let _diagnostics = null;
+
+	function notifyDiagnostics(listener, snapshot) {
+		try { listener(snapshot); }
+		catch (error) { console.error('Bimba diagnostics listener failed:', error); }
+	}
+
+	function onDiagnostics(listener) {
+		if (typeof listener !== 'function') throw new TypeError('Expected a diagnostics listener');
+		const subscription = snapshot => notifyDiagnostics(listener, snapshot);
+		_diagnosticListeners.add(subscription);
+		if (_diagnostics) subscription(_diagnostics);
+		return () => _diagnosticListeners.delete(subscription);
+	}
+
+	function publishDiagnostics() {
+		const snapshot = Object.freeze(Array.from(_compileErrors).flatMap(([file, item]) =>
+			item.errors.map(error => Object.freeze({
+				file, message: error.message,
+				line: Number.isInteger(error.line) ? error.line + 1 : undefined,
+			}))
+		));
+		_diagnostics = snapshot;
+		for (const subscription of Array.from(_diagnosticListeners)) {
+			if (_diagnosticListeners.has(subscription)) subscription(snapshot);
+		}
+	}
+
+	function restoreDiagnostics(items) {
+		_compileErrors.clear();
+		for (const {file, errors, time} of items) {
+			_compileErrors.set(normalizeFile(file), {errors, time});
+		}
+		publishDiagnostics();
+		renderErrors();
+	}
 
 	function normalizeFile(file) {
 		let value = String(file || '').split(String.fromCharCode(92)).join('/');
@@ -539,6 +577,7 @@ ${fileUrl.toString()}
 	}
 
 	function renderErrors() {
+		if (!document.body) return;
 		let overlay = document.getElementById('__bimba_error__');
 
 		if (!_compileErrors.size) {
@@ -591,10 +630,12 @@ ${fileUrl.toString()}
 			errors: Array.isArray(errors) ? errors : [errors],
 			time: time || new Date().toLocaleTimeString(),
 		});
+		publishDiagnostics();
 		renderErrors();
 	}
 
 	function clearError(file) {
+		const count = _compileErrors.size;
 		if (file) {
 			const displayFile = normalizeFile(file);
 			for (const key of Array.from(_compileErrors.keys())) {
@@ -603,9 +644,13 @@ ${fileUrl.toString()}
 		} else {
 			_compileErrors.clear();
 		}
+		if (_compileErrors.size !== count) publishDiagnostics();
 		renderErrors();
 	}
 
+	if (!document.body) document.addEventListener('DOMContentLoaded', renderErrors, {once:true});
+	window.bimba = Object.freeze({onDiagnostics});
+	window.dispatchEvent(new Event('bimba:hmr-ready'));
 	connect();
 })();
 </script>`
@@ -1725,7 +1770,11 @@ export function serve(entrypoint, flags = {}) {
 		},
 
 		websocket: {
-			open:    ws => { sockets.add(ws) },
+			open:    ws => {
+				sockets.add(ws)
+				const items = Array.from(_activeErrors.values(), ({file, time, payload}) => ({file, time, errors:payload}))
+				ws.send(JSON.stringify({type:'diagnostics', items}))
+			},
 			close:   ws => { sockets.delete(ws) },
 			message: () => {},
 		},

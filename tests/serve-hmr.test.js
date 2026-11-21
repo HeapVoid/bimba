@@ -51,9 +51,11 @@ async function client() {
 		}
 		remove() { this.isConnected = false }
 	}
+	let overlay
 	const document = {
-		body: { children: elements },
-		getElementById: () => null,
+		body: { children: elements, appendChild(element) { overlay = element } },
+		createElement: () => ({style:{}, addEventListener() {}, remove() { overlay = undefined }}),
+		getElementById: id => overlay?.id === id ? overlay : null,
 		querySelectorAll: selector => selector === 'script[src],link[rel="stylesheet"][href]' ? linked : selector === 'link[rel="stylesheet"]' ? linked.filter(el => el.rel === 'stylesheet') : elements.flatMap(el => [el, ...el.querySelectorAll()])
 			.filter(el => el.isConnected && (selector === '*' || el.tagName.toLowerCase() === selector)),
 	}
@@ -61,7 +63,11 @@ async function client() {
 		get: name => definitions.get(name),
 		define: (name, cls) => { cls.tagName = name; definitions.set(name, cls) },
 	}
+	const window = new EventTarget()
+	let ready = false
+	window.addEventListener('bimba:hmr-ready', () => { ready = Boolean(window.bimba?.onDiagnostics) })
 	vm.runInNewContext(code, {
+		window, Event,
 		EventTarget: DOMEventTarget, Element, HTMLElement: Element, document, customElements: registry,
 		WebSocket: class { constructor() { socket = this } },
 		location: { host: 'localhost', origin: 'http://localhost', href: 'http://localhost/', protocol: 'http:', reload: () => { reloads++ } },
@@ -75,7 +81,8 @@ async function client() {
 		imba: { commit() {} }, loadModule: url => { imports++; return load(url) },
 	})
 	return {
-		Element, registry, elements, completed, resources, linked,
+		Element, registry, elements, completed, resources, linked, window, ready,
+		get overlay() { return overlay },
 		get reloads() { return reloads },
 		get imports() { return imports },
 		requested(url, initiatorType = 'script') {
@@ -95,6 +102,27 @@ async function client() {
 }
 
 describe('HMR client', () => {
+	test('publishes the initial diagnostics, replays to late subscribers and clears independently of the overlay', async () => {
+		const env = await client()
+		expect(env.ready).toBe(true)
+		const early = [], late = []
+		env.window.bimba.onDiagnostics(items => early.push(items))
+		expect(early).toEqual([])
+		const file = 'src/sidebar.imba'
+		await env.message({type:'diagnostics',items:[{file,errors:[{message:'Invalid syntax',line:0}]}]})
+		const snapshot = [{file,message:'Invalid syntax',line:1}]
+		expect(early).toEqual([snapshot])
+		expect(env.overlay.innerHTML).toContain('Invalid syntax')
+		env.overlay.remove()
+		const unsubscribe = env.window.bimba.onDiagnostics(items => late.push(items))
+		expect(late).toEqual([snapshot])
+		unsubscribe()
+		await env.message({type:'clear-error',file})
+		expect(early).toEqual([snapshot, []])
+		expect(late).toEqual([snapshot])
+		expect(env.overlay).toBeUndefined()
+	})
+
 	test('refreshes a linked stylesheet when one of its nested CSS imports changes', async () => {
 		const env = await client()
 		const link = {rel:'stylesheet',href:'http://localhost/src/theme.css',sheet:{href:'http://localhost/src/theme.css',cssRules:[{styleSheet:{href:'http://localhost/src/nested.css',cssRules:[]}}]}}
@@ -357,6 +385,37 @@ async function server() {
 }
 
 describe('HMR watcher', () => {
+	test('replays known compile errors on a new socket and clears them after a fix', async () => {
+		const env = await server()
+		let late
+		try {
+			const file = join(env.fixture, 'src/sidebar.imba')
+			const url = env.url + '/src/sidebar.imba'
+			await Bun.write(file, "export const = ]\n")
+			expect((await fetch(url)).status).toBe(500)
+			const messages = []
+			late = new WebSocket(env.socket.url)
+			late.onmessage = event => messages.push(JSON.parse(event.data))
+			async function until(find) {
+				for (let i = 0; i < 100; i++) {
+					const result = find()
+					if (result) return result
+					await Bun.sleep(20)
+				}
+				throw new Error('Expected diagnostics message did not arrive')
+			}
+			expect(await until(() => messages[0])).toMatchObject({
+				type:'diagnostics',items:[{file:'src/sidebar.imba',errors:[{message:"unmatched ']'"}]}]
+			})
+			await Bun.write(file, "tag audit-sidebar\n\t<self> 'fixed'\n")
+			expect((await fetch(url)).status).toBe(200)
+			await until(() => messages.find(message => message.type === 'clear-error' && message.file === 'src/sidebar.imba'))
+		} finally {
+			env.socket.close()
+			late?.close()
+		}
+	})
+
 	test('identifies the physical Imba file and extensionless URL even when its first compilation failed', async () => {
 		const env = await server()
 		try {

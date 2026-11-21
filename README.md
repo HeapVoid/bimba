@@ -84,6 +84,19 @@ bunx bimba src/index.imba --serve --port 5200 --html public/index.html
 - Applies updates only in tabs that loaded the changed module; unused files cause no import, render or reload
 - Reloads using tabs when JavaScript in the entrypoint, shared TypeScript/JavaScript, or data-only Imba modules changes
 
+**Browser diagnostics:** On pages served with HMR, use
+`window.bimba.onDiagnostics(listener)` to observe the dev server's active
+compile errors independently of its built-in overlay. The listener receives a
+read-only array of `{file, message, line?}` entries; `line` is one-based. The
+first snapshot comes from the server on connection. Subscribing after that
+invokes the listener immediately with the current snapshot. The method returns
+an unsubscribe function. An empty array means there are no known errors, not
+that all modules have compiled or the page has finished loading.
+
+Integrations running before the injected client can listen once for
+`bimba:hmr-ready` on `window`, then subscribe. Check `window.bimba` first if
+the client may already be present.
+
 **HMR internals:**
 
 Imba compiles JavaScript and CSS separately in development (`hmr: true`, `styles: 'extern'`). The server compares executable JavaScript independently of CSS, comments, formatting and source maps.
@@ -548,8 +561,8 @@ The public APIs are `CompilerCache`, `compileImba` and `ImbaPlugin` from
 
 ### Releasing
 
-The `publish.yml` workflow publishes a `v<package version>` tag from GitHub
-Actions after installing locked dependencies and passing `bun test`. It uses
+Run `bun test` before tagging. The `publish.yml` workflow publishes a
+`v<package version>` tag from GitHub Actions after installing locked dependencies. It uses
 npm Trusted Publishing (OIDC), with no stored npm token. Configure the
 `bimba-cli` trusted publisher on npmjs.com for GitHub repository
 `HeapVoid/bimba`, workflow filename `publish.yml`, and allow direct
